@@ -127,6 +127,107 @@ def simulate_many(
     }
 
 
+def simulate_many_from_state(
+    roster: pd.DataFrame,
+    settings: SimulationSettings,
+    elapsed_minute: float,
+    next_runner_index: int,
+    runner_lap_counts: dict[str, int],
+    official_laps_so_far: int,
+    laps_by_noon_so_far: int,
+    caps_enabled: bool = True,
+) -> dict[str, Any]:
+    """Run relay simulations from a partially completed race state."""
+
+    runners = _prepare_roster(roster)
+    if not runners:
+        raise ValueError("No runners are available to simulate.")
+
+    n = int(settings.n_simulations)
+    rng = np.random.default_rng(settings.random_seed)
+    simulation_rows: list[dict[str, Any]] = []
+    runner_count_rows: list[dict[str, Any]] = []
+    cap_hit_rows: list[dict[str, Any]] = []
+    final_hour_rows: list[dict[str, Any]] = []
+    path_sample_rows: list[dict[str, Any]] = []
+
+    time_grid = np.linspace(0, FINAL_CUTOFF_MINUTE, 61)
+    path_grid = np.zeros((n, len(time_grid)), dtype=float)
+
+    for sim_id in range(n):
+        result = _simulate_one(
+            runners,
+            settings,
+            rng,
+            caps_enabled=caps_enabled,
+            start_elapsed=float(elapsed_minute),
+            start_pointer=int(next_runner_index),
+            initial_runner_lap_counts=runner_lap_counts,
+            initial_official_laps=int(official_laps_so_far),
+            initial_laps_by_noon=int(laps_by_noon_so_far),
+        )
+
+        simulation_rows.append(
+            {
+                "simulation": sim_id + 1,
+                "official_laps": result["official_laps"],
+                "laps_by_noon": result["laps_by_noon"],
+                "final_elapsed_minute": result["final_elapsed_minute"],
+                "final_lap_start_minute": result["final_lap_start_minute"],
+                "final_lap_finish_minute": result["final_lap_finish_minute"],
+                "final_runner": result["final_runner"],
+                "squeezed_final_lap_after_noon": result["squeezed_final_lap_after_noon"],
+                "missed_final_cutoff": result["missed_final_cutoff"],
+                "missed_start_cutoff": result["missed_start_cutoff"],
+                "ran_out_of_eligible_runners": result["ran_out_of_eligible_runners"],
+                "stop_reason": result["stop_reason"],
+            }
+        )
+
+        runner_row = {"simulation": sim_id + 1}
+        runner_row.update(result["runner_lap_counts"])
+        runner_count_rows.append(runner_row)
+
+        cap_row = {"simulation": sim_id + 1}
+        cap_row.update(result["cap_hits"])
+        cap_hit_rows.append(cap_row)
+
+        for runner in result["final_hour_runners"]:
+            final_hour_rows.append({"simulation": sim_id + 1, "runner": runner})
+
+        finish_times = np.array(result["official_finish_times"], dtype=float)
+        path_grid[sim_id, :] = result["initial_official_laps"]
+        if finish_times.size:
+            path_grid[sim_id, :] = int(official_laps_so_far) + np.searchsorted(finish_times, time_grid, side="right")
+        if sim_id < settings.path_sample_size:
+            path_sample_rows.extend(_path_points_to_rows(sim_id + 1, result["path_points"]))
+
+    simulations = pd.DataFrame(simulation_rows)
+    runner_laps = pd.DataFrame(runner_count_rows).fillna(0)
+    cap_hits = pd.DataFrame(cap_hit_rows).fillna(False)
+    final_hour = pd.DataFrame(final_hour_rows, columns=["simulation", "runner"])
+    path_samples = pd.DataFrame(path_sample_rows, columns=["simulation", "time_minute", "completed_laps"])
+    path_quantiles = pd.DataFrame(
+        {
+            "time_minute": time_grid,
+            "p10": np.nanpercentile(path_grid, 10, axis=0),
+            "median": np.nanpercentile(path_grid, 50, axis=0),
+            "p90": np.nanpercentile(path_grid, 90, axis=0),
+        }
+    )
+
+    return {
+        "settings": settings,
+        "caps_enabled": caps_enabled,
+        "simulations": simulations,
+        "runner_laps": runner_laps,
+        "cap_hits": cap_hits,
+        "final_hour": final_hour,
+        "path_samples": path_samples,
+        "path_quantiles": path_quantiles,
+    }
+
+
 def summarize_results(sim_output: dict[str, Any], target_laps: int | None = None) -> dict[str, Any]:
     simulations = sim_output["simulations"]
     runner_laps = sim_output["runner_laps"]
@@ -257,20 +358,39 @@ def _simulate_one(
     settings: SimulationSettings,
     rng: np.random.Generator,
     caps_enabled: bool,
+    start_elapsed: float = 0.0,
+    start_pointer: int = 0,
+    initial_runner_lap_counts: dict[str, int] | None = None,
+    initial_official_laps: int = 0,
+    initial_laps_by_noon: int = 0,
 ) -> dict[str, Any]:
-    elapsed = 0.0
-    pointer = 0
-    official_laps = 0
-    laps_by_noon = 0
+    elapsed = float(start_elapsed)
+    pointer = int(start_pointer) % max(len(runners), 1)
+    official_laps = int(initial_official_laps)
+    laps_by_noon = int(initial_laps_by_noon)
     missed_final_cutoff = False
     missed_start_cutoff = False
     ran_out = False
     stop_reason = "race_window_complete"
 
     runner_lap_counts = {runner["runner"]: 0 for runner in runners}
-    cap_hits = {runner["runner"]: False for runner in runners if _finite_max_laps(runner) is not None}
+    if initial_runner_lap_counts:
+        for runner_name, count in initial_runner_lap_counts.items():
+            if runner_name in runner_lap_counts:
+                runner_lap_counts[runner_name] = int(count)
+    cap_hits = {
+        runner["runner"]: (
+            runner_lap_counts[runner["runner"]] >= _finite_max_laps(runner)
+            if _finite_max_laps(runner) is not None
+            else False
+        )
+        for runner in runners
+        if _finite_max_laps(runner) is not None
+    }
     official_finish_times: list[float] = []
     path_points: list[tuple[float, int]] = [(0.0, 0)]
+    if official_laps > 0 or elapsed > 0:
+        path_points.append((elapsed, official_laps))
     final_hour_runners: set[str] = set()
     final_runner = None
     final_lap_start = np.nan
@@ -347,6 +467,7 @@ def _simulate_one(
         "official_finish_times": official_finish_times,
         "path_points": path_points,
         "final_hour_runners": sorted(final_hour_runners),
+        "initial_official_laps": int(initial_official_laps),
     }
 
 

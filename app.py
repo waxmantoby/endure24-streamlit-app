@@ -10,6 +10,19 @@ import streamlit as st
 
 from data_loader import DEFAULT_DATA_PATH, load_endure_workbook, validate_roster
 from optimizer import optimize_running_orders
+from race_day import (
+    append_manual_lap,
+    empty_race_log,
+    forecast_from_race_log,
+    google_sheets_configured,
+    normalise_race_log,
+    parse_pasted_laps,
+    parse_race_time_to_minute,
+    race_state_from_log,
+    read_race_log_from_google_sheet,
+    validate_race_log,
+    write_race_log_to_google_sheet,
+)
 from simulation_engine import (
     FINAL_CUTOFF_MINUTE,
     LAST_START_MINUTE,
@@ -22,6 +35,55 @@ from simulation_engine import (
 st.set_page_config(page_title="Endure24 Relay Monte Carlo", layout="wide")
 
 ASSUMPTION_VERSION = "zero-fatigue-night-defaults-v1"
+
+
+def inject_app_styles() -> None:
+    st.markdown(
+        """
+        <style>
+        .block-container {
+            padding-top: 1.5rem;
+            padding-bottom: 2rem;
+            max-width: 1240px;
+        }
+        h1, h2, h3 {
+            letter-spacing: 0;
+        }
+        div[data-testid="stMetric"] {
+            background: #f8fafc;
+            border: 1px solid #e3e8ef;
+            border-radius: 8px;
+            padding: 0.85rem 0.9rem;
+        }
+        div[data-testid="stMetric"] label {
+            color: #465467;
+        }
+        .stTabs [data-baseweb="tab-list"] {
+            gap: 0.35rem;
+            border-bottom: 1px solid #dde3ea;
+        }
+        .stTabs [data-baseweb="tab"] {
+            border-radius: 6px 6px 0 0;
+            padding: 0.55rem 0.8rem;
+        }
+        .stButton > button, .stDownloadButton > button {
+            border-radius: 6px;
+            min-height: 2.5rem;
+        }
+        @media (max-width: 760px) {
+            .block-container {
+                padding-left: 0.75rem;
+                padding-right: 0.75rem;
+            }
+            div[data-testid="column"] {
+                width: 100% !important;
+                flex: 1 1 100% !important;
+            }
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 @st.cache_data(show_spinner=False)
@@ -139,13 +201,42 @@ def comparison_final_lap_probability_figure(
     return fig
 
 
+def final_lap_comparison_figure(
+    baseline_distribution: pd.DataFrame,
+    live_distribution: pd.DataFrame,
+    baseline_label: str,
+    live_label: str,
+    title: str,
+) -> go.Figure:
+    baseline = baseline_distribution[["official_laps", "probability"]].copy()
+    baseline["scenario"] = baseline_label
+    live = live_distribution[["official_laps", "probability"]].copy()
+    live["scenario"] = live_label
+    combined = pd.concat([baseline, live], ignore_index=True)
+    fig = px.line(
+        combined,
+        x="official_laps",
+        y="probability",
+        color="scenario",
+        markers=True,
+        title=title,
+    )
+    fig.update_layout(
+        xaxis_title="Final official lap number",
+        yaxis_title="Probability",
+        yaxis_tickformat=".0%",
+        legend_title_text="Forecast",
+    )
+    return fig
+
+
 def edited_roster_table(roster: pd.DataFrame) -> pd.DataFrame:
     display = roster.copy()
     display["max_laps"] = display["max_laps"].astype("Float64")
     return st.data_editor(
         display,
         hide_index=True,
-        use_container_width=True,
+        width="stretch",
         num_rows="dynamic",
         column_config={
             "runner": st.column_config.TextColumn("Runner", required=True),
@@ -238,7 +329,7 @@ def make_settings() -> SimulationSettings:
 
 def show_validation(loaded) -> None:
     st.subheader("Data Upload & Validation")
-    st.dataframe(loaded.sheet_info, use_container_width=True, hide_index=True)
+    st.dataframe(loaded.sheet_info, width="stretch", hide_index=True)
     if loaded.detected_tables:
         for item in loaded.detected_tables:
             st.success(item)
@@ -249,9 +340,9 @@ def show_validation(loaded) -> None:
 
     with st.expander("Cleaned last-year lap preview", expanded=True):
         preview = add_clock_columns(loaded.last_year_laps, ["start_minute", "finish_minute"])
-        st.dataframe(preview.head(50), use_container_width=True, hide_index=True)
+        st.dataframe(preview.head(50), width="stretch", hide_index=True)
     with st.expander("Runner name normalisation"):
-        st.dataframe(loaded.name_map, use_container_width=True, hide_index=True)
+        st.dataframe(loaded.name_map, width="stretch", hide_index=True)
 
 
 def show_last_year_analysis(loaded) -> None:
@@ -267,7 +358,7 @@ def show_last_year_analysis(loaded) -> None:
     c3.metric("Fastest lap", format_minutes(loaded.team_stats["fastest_lap_minutes"]))
     c4.metric("Slowest lap", format_minutes(loaded.team_stats["slowest_lap_minutes"]))
 
-    st.dataframe(stats, use_container_width=True, hide_index=True)
+    st.dataframe(stats, width="stretch", hide_index=True)
 
     laps = loaded.last_year_laps.copy()
     laps = add_clock_columns(laps, ["start_minute", "finish_minute"])
@@ -280,11 +371,11 @@ def show_last_year_analysis(loaded) -> None:
         title="Last-year lap times by runner",
     )
     fig.update_layout(height=430, legend_title_text="Runner")
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
     box = px.box(laps, x="runner", y="lap_time_minutes", points="all", title="Lap time distribution by runner")
     box.update_layout(height=430, xaxis_title="")
-    st.plotly_chart(box, use_container_width=True)
+    st.plotly_chart(box, width="stretch")
 
 
 def show_result_metrics(summary: dict, comparison: pd.DataFrame | None = None) -> None:
@@ -323,7 +414,7 @@ def show_charts(sim_output: dict, summary_bundle: dict, uncapped_summary: dict |
             distribution,
             "Final lap number probability plot",
         )
-        st.plotly_chart(bar, use_container_width=True)
+        st.plotly_chart(bar, width="stretch")
         st.caption("This is a discrete probability mass function for the final official lap count.")
     with c2:
         cumulative = distribution.sort_values("official_laps")
@@ -335,7 +426,7 @@ def show_charts(sim_output: dict, summary_bundle: dict, uncapped_summary: dict |
             title="Probability of at least N laps",
         )
         cum_fig.update_layout(yaxis_tickformat=".0%")
-        st.plotly_chart(cum_fig, use_container_width=True)
+        st.plotly_chart(cum_fig, width="stretch")
 
     st.subheader("Race Path")
     path_fig = go.Figure()
@@ -388,7 +479,7 @@ def show_charts(sim_output: dict, summary_bundle: dict, uncapped_summary: dict |
     path_fig.add_vline(x=FINAL_CUTOFF_MINUTE, line_dash="dot", line_color="firebrick")
     path_fig.update_layout(height=480, yaxis_title="Completed official laps")
     apply_race_clock_axis(path_fig)
-    st.plotly_chart(path_fig, use_container_width=True)
+    st.plotly_chart(path_fig, width="stretch")
 
     c3, c4 = st.columns(2)
     with c3:
@@ -400,7 +491,7 @@ def show_charts(sim_output: dict, summary_bundle: dict, uncapped_summary: dict |
         )
         start_hist.add_vline(x=LAST_START_MINUTE, line_dash="dash", line_color="firebrick")
         apply_race_clock_axis(start_hist, "Final lap start time")
-        st.plotly_chart(start_hist, use_container_width=True)
+        st.plotly_chart(start_hist, width="stretch")
     with c4:
         finish_hist = px.histogram(
             simulations.dropna(subset=["final_lap_finish_minute"]),
@@ -410,7 +501,7 @@ def show_charts(sim_output: dict, summary_bundle: dict, uncapped_summary: dict |
         )
         finish_hist.add_vline(x=FINAL_CUTOFF_MINUTE, line_dash="dash", line_color="firebrick")
         apply_race_clock_axis(finish_hist, "Final lap finish time")
-        st.plotly_chart(finish_hist, use_container_width=True)
+        st.plotly_chart(finish_hist, width="stretch")
 
     c5, c6 = st.columns(2)
     with c5:
@@ -420,7 +511,7 @@ def show_charts(sim_output: dict, summary_bundle: dict, uncapped_summary: dict |
             y="expected_laps",
             title="Expected laps per runner",
         )
-        st.plotly_chart(runner_fig, use_container_width=True)
+        st.plotly_chart(runner_fig, width="stretch")
     with c6:
         cap_fig = px.bar(
             summary_bundle["cap_hit_rates"],
@@ -429,7 +520,7 @@ def show_charts(sim_output: dict, summary_bundle: dict, uncapped_summary: dict |
             title="Probability each capped runner hits their cap",
         )
         cap_fig.update_layout(yaxis_tickformat=".0%")
-        st.plotly_chart(cap_fig, use_container_width=True)
+        st.plotly_chart(cap_fig, width="stretch")
 
     c7, c8 = st.columns(2)
     with c7:
@@ -440,7 +531,7 @@ def show_charts(sim_output: dict, summary_bundle: dict, uncapped_summary: dict |
             title="Likely final-lap runner",
         )
         final_runner_fig.update_layout(yaxis_tickformat=".0%")
-        st.plotly_chart(final_runner_fig, use_container_width=True)
+        st.plotly_chart(final_runner_fig, width="stretch")
     with c8:
         final_hour_fig = px.bar(
             summary_bundle["final_hour_runner_probs"],
@@ -449,7 +540,7 @@ def show_charts(sim_output: dict, summary_bundle: dict, uncapped_summary: dict |
             title="Likely running between Sunday 10:30 and 12:00",
         )
         final_hour_fig.update_layout(yaxis_tickformat=".0%")
-        st.plotly_chart(final_hour_fig, use_container_width=True)
+        st.plotly_chart(final_hour_fig, width="stretch")
 
     if comparison is not None:
         compare_fig = px.bar(
@@ -459,8 +550,8 @@ def show_charts(sim_output: dict, summary_bundle: dict, uncapped_summary: dict |
             color="scenario",
             title="Capped vs uncapped expected laps",
         )
-        st.plotly_chart(compare_fig, use_container_width=True)
-        st.dataframe(comparison, use_container_width=True, hide_index=True)
+        st.plotly_chart(compare_fig, width="stretch")
+        st.dataframe(comparison, width="stretch", hide_index=True)
 
 
 def show_downloads(sim_output: dict, summary_bundle: dict, comparison: pd.DataFrame | None) -> None:
@@ -493,6 +584,299 @@ def show_downloads(sim_output: dict, summary_bundle: dict, comparison: pd.DataFr
             "Download capped comparison CSV",
             comparison.to_csv(index=False),
             file_name="endure24_capped_vs_uncapped.csv",
+            mime="text/csv",
+        )
+
+
+def get_streamlit_secret(*keys: str):
+    for key in keys:
+        try:
+            value = st.secrets.get(key)
+        except Exception:
+            value = None
+        if value:
+            return value
+    return None
+
+
+def format_race_log_for_display(log: pd.DataFrame) -> pd.DataFrame:
+    display = normalise_race_log(log, pd.DataFrame({"runner": []}))
+    display = add_clock_columns(display, ["start_minute", "finish_minute"])
+    columns = [
+        "lap_number",
+        "runner",
+        "start_time",
+        "finish_time",
+        "lap_duration_minutes",
+        "official",
+        "notes",
+    ]
+    return display[[column for column in columns if column in display.columns]]
+
+
+def set_race_log(log: pd.DataFrame, roster: pd.DataFrame) -> pd.DataFrame:
+    clean = normalise_race_log(log, roster)
+    st.session_state["race_log"] = clean
+    st.session_state.pop("race_day_forecast", None)
+    return clean
+
+
+def show_race_day_metrics(state, live_bundle: dict | None, target_laps: int) -> None:
+    live_summary = live_bundle["summary"] if live_bundle else None
+    cols = st.columns(5)
+    cols[0].metric("Official laps", f"{state.current_laps}")
+    cols[1].metric("Target probability", format_probability(live_summary["probability_target_laps"]) if live_summary else "-")
+    cols[2].metric("Projected final laps", format_minutes(live_summary["expected_official_laps"]) if live_summary else "-")
+    cols[3].metric("Elapsed", format_race_clock(state.elapsed_minute))
+    cols[4].metric("Next runner", state.next_runner or "No eligible runner")
+
+    if state.remaining_to_target <= 0:
+        st.success(f"Target of {target_laps} official laps is already logged.")
+    else:
+        parts = [f"Need {state.remaining_to_target} more official laps to reach {target_laps}."]
+        if state.average_needed_to_target is not None:
+            parts.append(f"Average {state.average_needed_to_target:.1f} min/lap or faster by Sunday 13:00.")
+        if state.average_needed_to_start_target_lap is not None:
+            parts.append(
+                f"Average {state.average_needed_to_start_target_lap:.1f} min/lap or faster before Sunday 12:00 "
+                "to start the target lap on time."
+            )
+        st.info(" ".join(parts))
+
+
+def show_google_sheet_controls(log: pd.DataFrame, roster: pd.DataFrame) -> pd.DataFrame:
+    default_sheet_id = get_streamlit_secret("google_sheet_id", "race_log_google_sheet_id") or ""
+    with st.expander("Google Sheets sync", expanded=False):
+        c1, c2 = st.columns([2, 1])
+        sheet_id = c1.text_input("Sheet ID", value=str(default_sheet_id), placeholder="Google Sheet ID")
+        worksheet_name = c2.text_input("Worksheet", value="race_log")
+        configured = google_sheets_configured(st.secrets, sheet_id.strip() or None)
+        if configured:
+            st.success("Google Sheets credentials detected.")
+        else:
+            st.warning("Google Sheets credentials are not configured. CSV backup is available below.")
+
+        load_col, save_col = st.columns(2)
+        if load_col.button("Load from Google Sheet", width="stretch"):
+            try:
+                loaded = read_race_log_from_google_sheet(
+                    st.secrets,
+                    sheet_id=sheet_id.strip() or None,
+                    worksheet_name=worksheet_name.strip() or "race_log",
+                )
+                log = set_race_log(loaded, roster)
+                st.success("Race log loaded from Google Sheets.")
+            except Exception as exc:
+                st.error(f"Could not load Google Sheet: {exc}")
+
+        if save_col.button("Save to Google Sheet", width="stretch"):
+            warnings, errors = validate_race_log(log, roster)
+            if errors:
+                st.error("Fix race-log errors before saving to Google Sheets.")
+            else:
+                try:
+                    write_race_log_to_google_sheet(
+                        log,
+                        st.secrets,
+                        sheet_id=sheet_id.strip() or None,
+                        worksheet_name=worksheet_name.strip() or "race_log",
+                    )
+                    st.success("Race log saved to Google Sheets.")
+                    for warning in warnings:
+                        st.warning(warning)
+                except Exception as exc:
+                    st.error(f"Could not save Google Sheet: {exc}")
+    return log
+
+
+def show_race_log_entry(log: pd.DataFrame, roster: pd.DataFrame) -> pd.DataFrame:
+    state = race_state_from_log(log, roster, target_laps=1)
+    runner_options = roster.sort_values("running_order")["runner"].astype(str).tolist()
+    next_runner_index = runner_options.index(state.next_runner) if state.next_runner in runner_options else 0
+
+    st.markdown("#### Add Lap")
+    with st.form("manual_lap_form", clear_on_submit=True):
+        c1, c2, c3 = st.columns([1.2, 1, 1])
+        runner = c1.selectbox("Runner", runner_options, index=next_runner_index)
+        entry_mode = c2.radio("Time entry", ["Lap duration", "Finish time"], horizontal=True)
+        notes = c3.text_input("Notes", value="")
+
+        if entry_mode == "Lap duration":
+            duration_minutes = st.number_input("Lap duration minutes", min_value=1.0, max_value=180.0, value=40.0, step=0.1)
+            finish_minute = None
+        else:
+            duration_minutes = None
+            finish_text = st.text_input("Finish time", placeholder="Saturday 13:04, Sunday 00:12, or 724")
+            finish_minute = parse_race_time_to_minute(finish_text)
+
+        submitted = st.form_submit_button("Add lap", type="primary")
+
+    if submitted:
+        if entry_mode == "Finish time" and finish_minute is None:
+            st.error("Enter a valid finish time.")
+        else:
+            candidate = append_manual_lap(
+                log,
+                roster,
+                runner=runner,
+                finish_minute=finish_minute,
+                duration_minutes=duration_minutes,
+                notes=notes,
+            )
+            warnings, errors = validate_race_log(candidate, roster)
+            if errors:
+                for error in errors:
+                    st.error(error)
+            else:
+                log = set_race_log(candidate, roster)
+                st.success("Lap added.")
+                for warning in warnings:
+                    st.warning(warning)
+
+    st.markdown("#### Paste Laps")
+    pasted = st.text_area(
+        "Pasted table",
+        height=120,
+        placeholder="runner,finish_time,notes\nToby,Saturday 12:33,clean lap",
+    )
+    paste_col_1, paste_col_2 = st.columns(2)
+    if paste_col_1.button("Append pasted rows", width="stretch"):
+        try:
+            pasted_log = parse_pasted_laps(pasted, roster)
+            if not pasted_log.empty:
+                offset = int(log["lap_number"].max()) if not log.empty else 0
+                pasted_log["lap_number"] = pasted_log["lap_number"] + offset
+            candidate = normalise_race_log(pd.concat([log, pasted_log], ignore_index=True), roster)
+            warnings, errors = validate_race_log(candidate, roster)
+            if errors:
+                for error in errors:
+                    st.error(error)
+            else:
+                log = set_race_log(candidate, roster)
+                st.success("Pasted rows appended.")
+                for warning in warnings:
+                    st.warning(warning)
+        except Exception as exc:
+            st.error(f"Could not import pasted rows: {exc}")
+
+    if paste_col_2.button("Replace with pasted table", width="stretch"):
+        try:
+            candidate = parse_pasted_laps(pasted, roster)
+            warnings, errors = validate_race_log(candidate, roster)
+            if errors:
+                for error in errors:
+                    st.error(error)
+            else:
+                log = set_race_log(candidate, roster)
+                st.success("Race log replaced.")
+                for warning in warnings:
+                    st.warning(warning)
+        except Exception as exc:
+            st.error(f"Could not import pasted table: {exc}")
+
+    return log
+
+
+def show_race_log_backup(log: pd.DataFrame, roster: pd.DataFrame) -> pd.DataFrame:
+    c1, c2, c3 = st.columns(3)
+    uploaded_log = c1.file_uploader("Upload race-log CSV", type=["csv"], key="race_log_csv")
+    if c2.button("Load CSV backup", width="stretch"):
+        if uploaded_log is None:
+            st.warning("Choose a CSV backup first.")
+        else:
+            try:
+                log = set_race_log(pd.read_csv(uploaded_log), roster)
+                st.success("CSV backup loaded.")
+            except Exception as exc:
+                st.error(f"Could not load CSV backup: {exc}")
+
+    c3.download_button(
+        "Download CSV backup",
+        normalise_race_log(log, roster).to_csv(index=False),
+        file_name="endure24_race_log.csv",
+        mime="text/csv",
+        width="stretch",
+    )
+    if st.button("Clear race log"):
+        log = set_race_log(empty_race_log(), roster)
+        st.success("Race log cleared.")
+    return log
+
+
+def show_race_day(roster: pd.DataFrame, settings: SimulationSettings, caps_enabled: bool) -> None:
+    st.subheader("Race Day Command Centre")
+    if "race_log" not in st.session_state:
+        st.session_state["race_log"] = empty_race_log()
+    log = normalise_race_log(st.session_state["race_log"], roster)
+    st.session_state["race_log"] = log
+
+    warnings, errors = validate_race_log(log, roster)
+    state = race_state_from_log(log, roster, settings.target_laps, caps_enabled=caps_enabled)
+    live_bundle = st.session_state.get("race_day_forecast", {}).get("live_bundle")
+    baseline_bundle = st.session_state.get("race_day_forecast", {}).get("baseline_bundle")
+    show_race_day_metrics(state, live_bundle, settings.target_laps)
+
+    forecast_col, sync_col = st.columns([1.2, 1])
+    with forecast_col:
+        if st.button("Update race-day forecast", type="primary", width="stretch"):
+            if errors:
+                st.error("Fix race-log errors before forecasting.")
+            else:
+                with st.spinner("Updating race-day forecast..."):
+                    forecast_settings = replace(settings, path_sample_size=60)
+                    baseline_output = simulate_many(roster, forecast_settings, caps_enabled=caps_enabled)
+                    live_output = forecast_from_race_log(roster, forecast_settings, log, caps_enabled=caps_enabled)
+                    baseline_bundle = summarize_results(baseline_output, settings.target_laps)
+                    live_bundle = summarize_results(live_output, settings.target_laps)
+                    st.session_state["race_day_forecast"] = {
+                        "baseline_bundle": baseline_bundle,
+                        "live_bundle": live_bundle,
+                        "live_output": live_output,
+                    }
+                    st.success("Race-day forecast updated.")
+    with sync_col:
+        log = show_google_sheet_controls(log, roster)
+
+    for warning in warnings:
+        st.warning(warning)
+    for error in errors:
+        st.error(error)
+
+    if baseline_bundle and live_bundle:
+        fig = final_lap_comparison_figure(
+            baseline_bundle["final_lap_distribution"],
+            live_bundle["final_lap_distribution"],
+            "Pre-race forecast",
+            "Actual-adjusted forecast",
+            "Pre-race vs actual-adjusted final lap probability",
+        )
+        st.plotly_chart(fig, width="stretch")
+
+    c1, c2 = st.columns([1, 1])
+    with c1:
+        log = show_race_log_entry(log, roster)
+    with c2:
+        st.markdown("#### Latest Laps")
+        display_log = format_race_log_for_display(log)
+        if display_log.empty:
+            st.info("No race laps logged yet.")
+        else:
+            st.dataframe(display_log.tail(12).sort_values("lap_number", ascending=False), width="stretch", hide_index=True)
+        st.markdown("#### Backup")
+        log = show_race_log_backup(log, roster)
+
+
+def show_exports_tab(sim_output: dict | None, summary_bundle: dict | None, comparison: pd.DataFrame | None) -> None:
+    if sim_output is None or summary_bundle is None:
+        st.info("Run a forecast first to enable simulation exports.")
+    else:
+        show_downloads(sim_output, summary_bundle, comparison)
+
+    if "race_log" in st.session_state:
+        st.download_button(
+            "Download current race log CSV",
+            normalise_race_log(st.session_state["race_log"], pd.DataFrame({"runner": []})).to_csv(index=False),
+            file_name="endure24_current_race_log.csv",
             mime="text/csv",
         )
 
@@ -655,7 +1039,7 @@ def show_optimizer(roster: pd.DataFrame, settings: SimulationSettings) -> None:
     edited_locks = st.data_editor(
         lock_table,
         hide_index=True,
-        use_container_width=True,
+        width="stretch",
         column_config={
             "runner": st.column_config.TextColumn("Runner", disabled=True),
             "locked_position": st.column_config.NumberColumn("Locked position", min_value=1, max_value=len(lock_table), step=1),
@@ -734,7 +1118,7 @@ def show_optimizer(roster: pd.DataFrame, settings: SimulationSettings) -> None:
                     "probability_ran_out_of_eligible_runners": "{:.1%}",
                 }
             ),
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
         show_route_commentary(ranking, roster, ranking_objective, ranking_target_laps)
@@ -749,7 +1133,7 @@ def show_optimizer(roster: pd.DataFrame, settings: SimulationSettings) -> None:
         )
         if ranking_objective == "target_probability":
             fig.update_layout(yaxis_tickformat=".0%")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
         st.download_button(
             "Download optimiser ranking CSV",
             ranking.to_csv(index=False),
@@ -834,7 +1218,7 @@ def show_what_if_pace_override(roster: pd.DataFrame, settings: SimulationSetting
     edited_overrides = st.data_editor(
         override_table[["apply", "runner", "current_mean_minutes", "what_if_mean_minutes"]],
         hide_index=True,
-        use_container_width=True,
+        width="stretch",
         column_config={
             "apply": st.column_config.CheckboxColumn("Apply"),
             "runner": st.column_config.TextColumn("Runner", disabled=True),
@@ -935,7 +1319,7 @@ def show_what_if_pace_override(roster: pd.DataFrame, settings: SimulationSetting
                     "p90_laps": "{:.1f}",
                 }
             ),
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
 
@@ -944,7 +1328,7 @@ def show_what_if_pace_override(roster: pd.DataFrame, settings: SimulationSetting
             result["baseline_bundle"]["final_lap_distribution"],
             result["override_bundle"]["final_lap_distribution"],
         )
-        st.plotly_chart(lap_pdf_fig, use_container_width=True)
+        st.plotly_chart(lap_pdf_fig, width="stretch")
         st.caption("Final lap count is discrete, so this is a PMF/PDF-style probability plot.")
 
         fig = px.bar(
@@ -953,7 +1337,7 @@ def show_what_if_pace_override(roster: pd.DataFrame, settings: SimulationSetting
             y="expected_laps",
             title="What-if expected laps per runner",
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
         target_ranking = result.get("target_ranking")
         if target_ranking is not None and not target_ranking.empty:
@@ -976,13 +1360,14 @@ def show_what_if_pace_override(roster: pd.DataFrame, settings: SimulationSetting
                         "probability_ran_out_of_eligible_runners": "{:.1%}",
                     }
                 ),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
             show_route_commentary(target_ranking, result["adjusted_roster"], "target_probability", settings.target_laps)
 
 
 def main() -> None:
+    inject_app_styles()
     st.title("Endure24 Relay Monte Carlo")
     st.caption("Race rule model: starts through Sunday 12:00 count if the lap finishes by Sunday 13:00.")
 
@@ -996,89 +1381,104 @@ def main() -> None:
 
     loaded = load_data_cached(workbook_bytes, source_label, ASSUMPTION_VERSION)
     settings = make_settings()
+    st.sidebar.subheader("Race Rules")
+    caps_enabled = st.sidebar.checkbox("Apply max-lap caps", value=True)
 
-    show_validation(loaded)
-    show_last_year_analysis(loaded)
-
-    st.subheader("This Year Assumptions")
-    st.info(
-        "Fatigue and night penalties now default to 0.0%. They are editable per runner here if you want "
-        "to add a conservative slowdown assumption. "
-        "Last-year day/night and fatigue stats are shown below where the workbook has enough data, but the app "
-        "does not apply them automatically."
+    setup_tab, forecast_tab, optimiser_tab, race_day_tab, what_if_tab, exports_tab = st.tabs(
+        ["Setup", "Forecast", "Optimiser", "Race Day", "What-if", "Exports"]
     )
-    roster = edited_roster_table(loaded.roster)
-    roster_warnings, roster_errors = validate_roster(roster)
-    for warning in roster_warnings:
-        st.warning(warning)
-    for error in roster_errors:
-        st.error(error)
 
-    with st.expander("Last-year stats beside this-year assumptions", expanded=False):
-        combined = roster.merge(loaded.last_year_stats, on="runner", how="left")
-        st.dataframe(combined, use_container_width=True, hide_index=True)
+    with setup_tab:
+        show_validation(loaded)
+        show_last_year_analysis(loaded)
 
-    st.subheader("Run Simulation")
-    c1, c2 = st.columns(2)
-    caps_enabled = c1.checkbox("Apply max-lap caps", value=True)
-    run_uncapped_comparison = c2.checkbox("Also run uncapped comparison", value=True)
+        st.subheader("This Year Assumptions")
+        st.info(
+            "Fatigue and night penalties now default to 0.0%. They are editable per runner here if you want "
+            "to add a conservative slowdown assumption. "
+            "Last-year day/night and fatigue stats are shown below where the workbook has enough data, but the app "
+            "does not apply them automatically."
+        )
+        roster = edited_roster_table(loaded.roster)
+        roster_warnings, roster_errors = validate_roster(roster)
+        for warning in roster_warnings:
+            st.warning(warning)
+        for error in roster_errors:
+            st.error(error)
 
-    if st.button("Run Monte Carlo simulation", type="primary"):
-        if roster_errors:
-            st.error("Fix roster errors before running the simulation.")
+        with st.expander("Last-year stats beside this-year assumptions", expanded=False):
+            combined = roster.merge(loaded.last_year_stats, on="runner", how="left")
+            st.dataframe(combined, width="stretch", hide_index=True)
+
+    with forecast_tab:
+        st.subheader("Forecast")
+        run_uncapped_comparison = st.checkbox("Also run uncapped comparison", value=True)
+        if st.button("Run Monte Carlo simulation", type="primary"):
+            if roster_errors:
+                st.error("Fix roster errors before running the simulation.")
+            else:
+                with st.spinner("Running simulations..."):
+                    sim_output = simulate_many(roster, settings, caps_enabled=caps_enabled)
+                    summary_bundle = summarize_results(sim_output, settings.target_laps)
+                    uncapped_summary = None
+                    comparison = None
+                    if run_uncapped_comparison:
+                        uncapped_settings = replace(
+                            settings,
+                            random_seed=None if settings.random_seed is None else settings.random_seed + 1,
+                        )
+                        uncapped_output = simulate_many(roster, uncapped_settings, caps_enabled=False)
+                        uncapped_summary = summarize_results(uncapped_output, settings.target_laps)
+                        comparison = pd.DataFrame(
+                            [
+                                {
+                                    "scenario": "Caps enabled" if caps_enabled else "Current run",
+                                    "expected_official_laps": summary_bundle["summary"]["expected_official_laps"],
+                                    "probability_target_laps": summary_bundle["summary"]["probability_target_laps"],
+                                    "probability_ran_out_of_eligible_runners": summary_bundle["summary"][
+                                        "probability_ran_out_of_eligible_runners"
+                                    ],
+                                },
+                                {
+                                    "scenario": "Caps disabled",
+                                    "expected_official_laps": uncapped_summary["summary"]["expected_official_laps"],
+                                    "probability_target_laps": uncapped_summary["summary"]["probability_target_laps"],
+                                    "probability_ran_out_of_eligible_runners": uncapped_summary["summary"][
+                                        "probability_ran_out_of_eligible_runners"
+                                    ],
+                                },
+                            ]
+                        )
+                    st.session_state["sim_output"] = sim_output
+                    st.session_state["summary_bundle"] = summary_bundle
+                    st.session_state["uncapped_summary"] = uncapped_summary
+                    st.session_state["comparison"] = comparison
+
+        if "sim_output" in st.session_state:
+            show_charts(
+                st.session_state["sim_output"],
+                st.session_state["summary_bundle"],
+                st.session_state.get("uncapped_summary"),
+                st.session_state.get("comparison"),
+            )
         else:
-            with st.spinner("Running simulations..."):
-                sim_output = simulate_many(roster, settings, caps_enabled=caps_enabled)
-                summary_bundle = summarize_results(sim_output, settings.target_laps)
-                uncapped_summary = None
-                comparison = None
-                if run_uncapped_comparison:
-                    uncapped_settings = replace(
-                        settings,
-                        random_seed=None if settings.random_seed is None else settings.random_seed + 1,
-                    )
-                    uncapped_output = simulate_many(roster, uncapped_settings, caps_enabled=False)
-                    uncapped_summary = summarize_results(uncapped_output, settings.target_laps)
-                    comparison = pd.DataFrame(
-                        [
-                            {
-                                "scenario": "Caps enabled" if caps_enabled else "Current run",
-                                "expected_official_laps": summary_bundle["summary"]["expected_official_laps"],
-                                "probability_target_laps": summary_bundle["summary"]["probability_target_laps"],
-                                "probability_ran_out_of_eligible_runners": summary_bundle["summary"][
-                                    "probability_ran_out_of_eligible_runners"
-                                ],
-                            },
-                            {
-                                "scenario": "Caps disabled",
-                                "expected_official_laps": uncapped_summary["summary"]["expected_official_laps"],
-                                "probability_target_laps": uncapped_summary["summary"]["probability_target_laps"],
-                                "probability_ran_out_of_eligible_runners": uncapped_summary["summary"][
-                                    "probability_ran_out_of_eligible_runners"
-                                ],
-                            },
-                        ]
-                    )
-                st.session_state["sim_output"] = sim_output
-                st.session_state["summary_bundle"] = summary_bundle
-                st.session_state["uncapped_summary"] = uncapped_summary
-                st.session_state["comparison"] = comparison
+            st.info("Run the Monte Carlo forecast to populate the dashboard.")
 
-    if "sim_output" in st.session_state:
-        show_charts(
-            st.session_state["sim_output"],
-            st.session_state["summary_bundle"],
-            st.session_state.get("uncapped_summary"),
+    with optimiser_tab:
+        show_optimizer(roster, settings)
+
+    with race_day_tab:
+        show_race_day(roster, settings, caps_enabled=caps_enabled)
+
+    with what_if_tab:
+        show_what_if_pace_override(roster, settings)
+
+    with exports_tab:
+        show_exports_tab(
+            st.session_state.get("sim_output"),
+            st.session_state.get("summary_bundle"),
             st.session_state.get("comparison"),
         )
-        show_downloads(
-            st.session_state["sim_output"],
-            st.session_state["summary_bundle"],
-            st.session_state.get("comparison"),
-        )
-
-    show_optimizer(roster, settings)
-    show_what_if_pace_override(roster, settings)
 
 
 if __name__ == "__main__":

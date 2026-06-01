@@ -176,6 +176,48 @@ The final section lets you test one or more runner pace changes without permanen
 - compare expected laps, reference-target probability, and the final lap number probability plot
 - optionally run the target route finder with the overridden paces
 
+## Race-Day Mode
+
+The `Race Day` tab turns the app into a live command centre:
+
+- log actual laps with a manual form
+- paste a lap table for bulk updates
+- compare the pre-race forecast with an actual-adjusted forecast
+- keep the planned order fixed while showing the next eligible runner
+- download or upload a CSV backup
+
+The race log uses these columns:
+
+```text
+lap_number, runner, start_minute, finish_minute, lap_duration_minutes, notes, official
+```
+
+Pasted tables can use race-clock text such as `Saturday 13:04`, `Sunday 00:12`, or elapsed minutes such as `724`.
+
+## Google Sheets Sync
+
+Google Sheets sync is optional. Without credentials, the Race Day tab still works with CSV backup.
+
+Add these Streamlit secrets to enable sync:
+
+```toml
+google_sheet_id = "your-google-sheet-id"
+
+[gcp_service_account]
+type = "service_account"
+project_id = "..."
+private_key_id = "..."
+private_key = "-----BEGIN PRIVATE KEY-----\\n...\\n-----END PRIVATE KEY-----\\n"
+client_email = "..."
+client_id = "..."
+auth_uri = "https://accounts.google.com/o/oauth2/auth"
+token_uri = "https://oauth2.googleapis.com/token"
+auth_provider_x509_cert_url = "https://www.googleapis.com/oauth2/v1/certs"
+client_x509_cert_url = "..."
+```
+
+Share the Google Sheet with the service account `client_email`. The app reads and writes a worksheet named `race_log`.
+
 ## Fatigue and Night Penalty Sources
 
 The default fatigue and night penalties are zero:
