@@ -1,0 +1,1085 @@
+from __future__ import annotations
+
+from dataclasses import replace
+from pathlib import Path
+
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import streamlit as st
+
+from data_loader import DEFAULT_DATA_PATH, load_endure_workbook, validate_roster
+from optimizer import optimize_running_orders
+from simulation_engine import (
+    FINAL_CUTOFF_MINUTE,
+    LAST_START_MINUTE,
+    SimulationSettings,
+    simulate_many,
+    summarize_results,
+)
+
+
+st.set_page_config(page_title="Endure24 Relay Monte Carlo", layout="wide")
+
+ASSUMPTION_VERSION = "zero-fatigue-night-defaults-v1"
+
+
+@st.cache_data(show_spinner=False)
+def load_data_cached(workbook_bytes: bytes, source_label: str, assumption_version: str):
+    return load_endure_workbook(workbook_bytes, source_label)
+
+
+def format_minutes(value: float | int | None) -> str:
+    if value is None or pd.isna(value):
+        return "-"
+    return f"{float(value):.2f}"
+
+
+def format_probability(value: float | int | None) -> str:
+    if value is None or pd.isna(value):
+        return "-"
+    return f"{float(value):.1%}"
+
+
+def format_race_clock(minute: float | int | None) -> str:
+    if minute is None or pd.isna(minute):
+        return "-"
+    total_minutes = int(round(float(minute)))
+    clock_minutes = (12 * 60 + total_minutes) % (24 * 60)
+    day = "Saturday" if total_minutes < 12 * 60 else "Sunday"
+    hour = clock_minutes // 60
+    minute_part = clock_minutes % 60
+    return f"{day} {hour:02d}:{minute_part:02d}"
+
+
+def race_clock_options(step_minutes: int = 15) -> list[int]:
+    return list(range(0, int(FINAL_CUTOFF_MINUTE) + 1, step_minutes))
+
+
+def race_clock_tick_values() -> list[int]:
+    values = set(range(0, int(FINAL_CUTOFF_MINUTE) + 1, 120))
+    values.update({int(LAST_START_MINUTE), int(FINAL_CUTOFF_MINUTE)})
+    return sorted(values)
+
+
+def apply_race_clock_axis(fig: go.Figure, title: str = "Race time") -> go.Figure:
+    ticks = race_clock_tick_values()
+    fig.update_xaxes(
+        tickmode="array",
+        tickvals=ticks,
+        ticktext=[format_race_clock(value) for value in ticks],
+        title_text=title,
+    )
+    return fig
+
+
+def add_clock_columns(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
+    display = df.copy()
+    for column in columns:
+        if column in display.columns:
+            label = column.removesuffix("_minute") + "_time"
+            display[label] = display[column].map(format_race_clock)
+    return display
+
+
+def final_lap_probability_figure(distribution: pd.DataFrame, title: str) -> go.Figure:
+    fig = go.Figure()
+    fig.add_trace(
+        go.Bar(
+            x=distribution["official_laps"],
+            y=distribution["probability"],
+            name="Probability",
+            marker_color="#2f6f8f",
+            hovertemplate="%{x} laps: %{y:.1%}<extra></extra>",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=distribution["official_laps"],
+            y=distribution["probability"],
+            mode="lines+markers",
+            name="PMF line",
+            line={"color": "#17324d", "width": 3},
+            marker={"size": 8},
+            hovertemplate="%{x} laps: %{y:.1%}<extra></extra>",
+        )
+    )
+    fig.update_layout(
+        title=title,
+        xaxis_title="Final official lap number",
+        yaxis_title="Probability",
+        yaxis_tickformat=".0%",
+        bargap=0.25,
+    )
+    return fig
+
+
+def comparison_final_lap_probability_figure(
+    baseline_distribution: pd.DataFrame,
+    override_distribution: pd.DataFrame,
+) -> go.Figure:
+    baseline = baseline_distribution[["official_laps", "probability"]].copy()
+    baseline["scenario"] = "Current assumptions"
+    override = override_distribution[["official_laps", "probability"]].copy()
+    override["scenario"] = "What-if override"
+    combined = pd.concat([baseline, override], ignore_index=True)
+    fig = px.line(
+        combined,
+        x="official_laps",
+        y="probability",
+        color="scenario",
+        markers=True,
+        title="What-if final lap number probability plot",
+    )
+    fig.update_layout(
+        xaxis_title="Final official lap number",
+        yaxis_title="Probability",
+        yaxis_tickformat=".0%",
+    )
+    return fig
+
+
+def edited_roster_table(roster: pd.DataFrame) -> pd.DataFrame:
+    display = roster.copy()
+    display["max_laps"] = display["max_laps"].astype("Float64")
+    return st.data_editor(
+        display,
+        hide_index=True,
+        use_container_width=True,
+        num_rows="dynamic",
+        column_config={
+            "runner": st.column_config.TextColumn("Runner", required=True),
+            "projected_mean_minutes": st.column_config.NumberColumn("Mean minutes", min_value=1.0, step=0.1),
+            "projected_sd_minutes": st.column_config.NumberColumn("SD minutes", min_value=0.1, step=0.1),
+            "running_order": st.column_config.NumberColumn("Order", min_value=1, step=1),
+            "max_laps": st.column_config.NumberColumn("Max laps", min_value=0, step=1, help="Blank means unlimited."),
+            "available": st.column_config.CheckboxColumn("Available"),
+            "fatigue_pct_per_lap": st.column_config.NumberColumn("Fatigue % / lap", step=0.1),
+            "night_penalty_pct": st.column_config.NumberColumn("Night penalty %", step=0.1),
+            "notes": st.column_config.TextColumn("Notes"),
+            "source": st.column_config.TextColumn("Source", disabled=True),
+        },
+    )
+
+
+def make_settings() -> SimulationSettings:
+    st.sidebar.header("Simulation Settings")
+    n_simulations = st.sidebar.number_input("Number of simulations", min_value=100, max_value=100_000, value=10_000, step=1_000)
+    target_laps = st.sidebar.number_input("Reference target laps", min_value=1, max_value=80, value=40, step=1)
+    st.sidebar.caption("Used for probability readouts only. The default optimiser objective is maximum official laps.")
+    random_seed = st.sidebar.number_input("Random seed", min_value=0, max_value=10_000_000, value=42, step=1)
+    distribution = st.sidebar.selectbox("Lap time distribution", ["truncated_normal", "lognormal"], index=0)
+
+    st.sidebar.subheader("Night Window")
+    clock_options = race_clock_options()
+    night_start_minute = st.sidebar.selectbox(
+        "Night starts",
+        clock_options,
+        index=clock_options.index(9 * 60),
+        format_func=format_race_clock,
+    )
+    night_end_minute = st.sidebar.selectbox(
+        "Night ends",
+        clock_options,
+        index=clock_options.index(18 * 60),
+        format_func=format_race_clock,
+    )
+    st.sidebar.caption(
+        f"Night window: {format_race_clock(night_start_minute)} to {format_race_clock(night_end_minute)}."
+    )
+
+    st.sidebar.subheader("Model Toggles")
+    fatigue_enabled = st.sidebar.checkbox("Apply fatigue", value=True)
+    night_penalty_enabled = st.sidebar.checkbox("Apply night penalties", value=True)
+    transition_mistakes_enabled = st.sidebar.checkbox("Model transition mistakes", value=True)
+
+    st.sidebar.subheader("Transitions")
+    base_transition_seconds = st.sidebar.number_input("Base transition seconds", min_value=0.0, value=0.0, step=5.0)
+    transition_mistake_probability_per_lap = st.sidebar.number_input(
+        "Mistake probability per lap",
+        min_value=0.0,
+        max_value=1.0,
+        value=0.01,
+        step=0.005,
+        format="%.3f",
+    )
+    transition_mistake_min_seconds = st.sidebar.number_input("Mistake min seconds", min_value=0.0, value=30.0, step=15.0)
+    transition_mistake_max_seconds = st.sidebar.number_input("Mistake max seconds", min_value=0.0, value=300.0, step=30.0)
+    major_mistake_probability_per_lap = st.sidebar.number_input(
+        "Major mistake probability per lap",
+        min_value=0.0,
+        max_value=1.0,
+        value=0.002,
+        step=0.001,
+        format="%.3f",
+    )
+    major_mistake_min_seconds = st.sidebar.number_input("Major mistake min seconds", min_value=0.0, value=300.0, step=60.0)
+    major_mistake_max_seconds = st.sidebar.number_input("Major mistake max seconds", min_value=0.0, value=900.0, step=60.0)
+
+    return SimulationSettings(
+        n_simulations=int(n_simulations),
+        target_laps=int(target_laps),
+        random_seed=int(random_seed),
+        night_start_minute=float(night_start_minute),
+        night_end_minute=float(night_end_minute),
+        distribution=distribution,
+        fatigue_enabled=fatigue_enabled,
+        night_penalty_enabled=night_penalty_enabled,
+        transition_mistakes_enabled=transition_mistakes_enabled,
+        base_transition_seconds=float(base_transition_seconds),
+        transition_mistake_probability_per_lap=float(transition_mistake_probability_per_lap),
+        transition_mistake_min_seconds=float(transition_mistake_min_seconds),
+        transition_mistake_max_seconds=float(transition_mistake_max_seconds),
+        major_mistake_probability_per_lap=float(major_mistake_probability_per_lap),
+        major_mistake_min_seconds=float(major_mistake_min_seconds),
+        major_mistake_max_seconds=float(major_mistake_max_seconds),
+    )
+
+
+def show_validation(loaded) -> None:
+    st.subheader("Data Upload & Validation")
+    st.dataframe(loaded.sheet_info, use_container_width=True, hide_index=True)
+    if loaded.detected_tables:
+        for item in loaded.detected_tables:
+            st.success(item)
+    for warning in loaded.warnings:
+        st.warning(warning)
+    for error in loaded.errors:
+        st.error(error)
+
+    with st.expander("Cleaned last-year lap preview", expanded=True):
+        preview = add_clock_columns(loaded.last_year_laps, ["start_minute", "finish_minute"])
+        st.dataframe(preview.head(50), use_container_width=True, hide_index=True)
+    with st.expander("Runner name normalisation"):
+        st.dataframe(loaded.name_map, use_container_width=True, hide_index=True)
+
+
+def show_last_year_analysis(loaded) -> None:
+    st.subheader("Last Year Analysis")
+    stats = loaded.last_year_stats.copy()
+    if stats.empty:
+        st.info("No last-year stats are available.")
+        return
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total laps", f"{loaded.team_stats['total_laps']}")
+    c2.metric("Team avg lap", format_minutes(loaded.team_stats["team_mean_minutes"]))
+    c3.metric("Fastest lap", format_minutes(loaded.team_stats["fastest_lap_minutes"]))
+    c4.metric("Slowest lap", format_minutes(loaded.team_stats["slowest_lap_minutes"]))
+
+    st.dataframe(stats, use_container_width=True, hide_index=True)
+
+    laps = loaded.last_year_laps.copy()
+    laps = add_clock_columns(laps, ["start_minute", "finish_minute"])
+    fig = px.line(
+        laps,
+        x="lap",
+        y="lap_time_minutes",
+        color="runner",
+        markers=True,
+        title="Last-year lap times by runner",
+    )
+    fig.update_layout(height=430, legend_title_text="Runner")
+    st.plotly_chart(fig, use_container_width=True)
+
+    box = px.box(laps, x="runner", y="lap_time_minutes", points="all", title="Lap time distribution by runner")
+    box.update_layout(height=430, xaxis_title="")
+    st.plotly_chart(box, use_container_width=True)
+
+
+def show_result_metrics(summary: dict, comparison: pd.DataFrame | None = None) -> None:
+    row1 = st.columns(5)
+    row1[0].metric("Expected laps", format_minutes(summary["expected_official_laps"]))
+    row1[1].metric("Median", format_minutes(summary["median_official_laps"]))
+    row1[2].metric("Mode", f"{summary['mode_official_laps']}")
+    row1[3].metric("P10-P90", f"{summary['p10_official_laps']:.0f} - {summary['p90_official_laps']:.0f}")
+    row1[4].metric("Hit reference target", format_probability(summary["probability_target_laps"]))
+
+    row2 = st.columns(5)
+    row2[0].metric("Hit reference target + 1", format_probability(summary["probability_target_plus_one_laps"]))
+    row2[1].metric("Laps by Sunday 12:00", format_minutes(summary["expected_laps_by_noon"]))
+    row2[2].metric("Final lap after noon", format_probability(summary["probability_squeezed_final_lap_after_noon"]))
+    row2[3].metric("Miss Sunday 13:00 cutoff", format_probability(summary["probability_missed_final_cutoff"]))
+    row2[4].metric("Run out of runners", format_probability(summary["probability_ran_out_of_eligible_runners"]))
+
+    st.caption(f"Average final finish: {format_race_clock(summary['average_final_finish_minute'])}")
+
+    if comparison is not None and not comparison.empty:
+        capped = comparison.loc[comparison["scenario"] == "Caps enabled", "expected_official_laps"].iloc[0]
+        uncapped = comparison.loc[comparison["scenario"] == "Caps disabled", "expected_official_laps"].iloc[0]
+        st.info(f"Caps impact: {capped - uncapped:+.2f} expected laps versus the uncapped simulation.")
+
+
+def show_charts(sim_output: dict, summary_bundle: dict, uncapped_summary: dict | None, comparison: pd.DataFrame | None) -> None:
+    simulations = sim_output["simulations"]
+    distribution = summary_bundle["final_lap_distribution"]
+
+    st.subheader("Results Dashboard")
+    show_result_metrics(summary_bundle["summary"], comparison)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        bar = final_lap_probability_figure(
+            distribution,
+            "Final lap number probability plot",
+        )
+        st.plotly_chart(bar, use_container_width=True)
+        st.caption("This is a discrete probability mass function for the final official lap count.")
+    with c2:
+        cumulative = distribution.sort_values("official_laps")
+        cum_fig = px.line(
+            cumulative,
+            x="official_laps",
+            y="probability_at_least",
+            markers=True,
+            title="Probability of at least N laps",
+        )
+        cum_fig.update_layout(yaxis_tickformat=".0%")
+        st.plotly_chart(cum_fig, use_container_width=True)
+
+    st.subheader("Race Path")
+    path_fig = go.Figure()
+    samples = sim_output["path_samples"]
+    if not samples.empty:
+        for sim_id, group in samples.groupby("simulation"):
+            path_fig.add_trace(
+                go.Scatter(
+                    x=group["time_minute"],
+                    y=group["completed_laps"],
+                    mode="lines",
+                    line={"width": 1, "color": "rgba(90, 110, 130, 0.18)"},
+                    showlegend=False,
+                    hoverinfo="skip",
+                )
+            )
+    quantiles = sim_output["path_quantiles"]
+    path_fig.add_trace(
+        go.Scatter(
+            x=quantiles["time_minute"],
+            y=quantiles["p90"],
+            mode="lines",
+            line={"width": 0},
+            name="90th percentile",
+            hovertemplate="%{y:.0f} laps<extra></extra>",
+        )
+    )
+    path_fig.add_trace(
+        go.Scatter(
+            x=quantiles["time_minute"],
+            y=quantiles["p10"],
+            mode="lines",
+            fill="tonexty",
+            line={"width": 0},
+            fillcolor="rgba(40, 120, 180, 0.18)",
+            name="10th-90th band",
+            hovertemplate="%{y:.0f} laps<extra></extra>",
+        )
+    )
+    path_fig.add_trace(
+        go.Scatter(
+            x=quantiles["time_minute"],
+            y=quantiles["median"],
+            mode="lines",
+            line={"width": 3, "color": "#1f77b4"},
+            name="Median path",
+        )
+    )
+    path_fig.add_vline(x=LAST_START_MINUTE, line_dash="dash", line_color="firebrick")
+    path_fig.add_vline(x=FINAL_CUTOFF_MINUTE, line_dash="dot", line_color="firebrick")
+    path_fig.update_layout(height=480, yaxis_title="Completed official laps")
+    apply_race_clock_axis(path_fig)
+    st.plotly_chart(path_fig, use_container_width=True)
+
+    c3, c4 = st.columns(2)
+    with c3:
+        start_hist = px.histogram(
+            simulations.dropna(subset=["final_lap_start_minute"]),
+            x="final_lap_start_minute",
+            nbins=40,
+            title="Final lap start-time distribution",
+        )
+        start_hist.add_vline(x=LAST_START_MINUTE, line_dash="dash", line_color="firebrick")
+        apply_race_clock_axis(start_hist, "Final lap start time")
+        st.plotly_chart(start_hist, use_container_width=True)
+    with c4:
+        finish_hist = px.histogram(
+            simulations.dropna(subset=["final_lap_finish_minute"]),
+            x="final_lap_finish_minute",
+            nbins=40,
+            title="Final lap finish-time distribution",
+        )
+        finish_hist.add_vline(x=FINAL_CUTOFF_MINUTE, line_dash="dash", line_color="firebrick")
+        apply_race_clock_axis(finish_hist, "Final lap finish time")
+        st.plotly_chart(finish_hist, use_container_width=True)
+
+    c5, c6 = st.columns(2)
+    with c5:
+        runner_fig = px.bar(
+            summary_bundle["expected_runner_laps"],
+            x="runner",
+            y="expected_laps",
+            title="Expected laps per runner",
+        )
+        st.plotly_chart(runner_fig, use_container_width=True)
+    with c6:
+        cap_fig = px.bar(
+            summary_bundle["cap_hit_rates"],
+            x="runner",
+            y="cap_hit_probability",
+            title="Probability each capped runner hits their cap",
+        )
+        cap_fig.update_layout(yaxis_tickformat=".0%")
+        st.plotly_chart(cap_fig, use_container_width=True)
+
+    c7, c8 = st.columns(2)
+    with c7:
+        final_runner_fig = px.bar(
+            summary_bundle["final_runner_probs"],
+            x="runner",
+            y="probability",
+            title="Likely final-lap runner",
+        )
+        final_runner_fig.update_layout(yaxis_tickformat=".0%")
+        st.plotly_chart(final_runner_fig, use_container_width=True)
+    with c8:
+        final_hour_fig = px.bar(
+            summary_bundle["final_hour_runner_probs"],
+            x="runner",
+            y="probability",
+            title="Likely running between Sunday 10:30 and 12:00",
+        )
+        final_hour_fig.update_layout(yaxis_tickformat=".0%")
+        st.plotly_chart(final_hour_fig, use_container_width=True)
+
+    if comparison is not None:
+        compare_fig = px.bar(
+            comparison,
+            x="scenario",
+            y="expected_official_laps",
+            color="scenario",
+            title="Capped vs uncapped expected laps",
+        )
+        st.plotly_chart(compare_fig, use_container_width=True)
+        st.dataframe(comparison, use_container_width=True, hide_index=True)
+
+
+def show_downloads(sim_output: dict, summary_bundle: dict, comparison: pd.DataFrame | None) -> None:
+    st.subheader("Export Results")
+    summary_df = pd.DataFrame([summary_bundle["summary"]])
+    simulation_export = add_clock_columns(
+        sim_output["simulations"],
+        ["final_elapsed_minute", "final_lap_start_minute", "final_lap_finish_minute"],
+    )
+    st.download_button(
+        "Download simulation rows CSV",
+        simulation_export.to_csv(index=False),
+        file_name="endure24_simulation_rows.csv",
+        mime="text/csv",
+    )
+    st.download_button(
+        "Download summary CSV",
+        summary_df.to_csv(index=False),
+        file_name="endure24_summary.csv",
+        mime="text/csv",
+    )
+    st.download_button(
+        "Download runner expected laps CSV",
+        summary_bundle["expected_runner_laps"].to_csv(index=False),
+        file_name="endure24_runner_expected_laps.csv",
+        mime="text/csv",
+    )
+    if comparison is not None:
+        st.download_button(
+            "Download capped comparison CSV",
+            comparison.to_csv(index=False),
+            file_name="endure24_capped_vs_uncapped.csv",
+            mime="text/csv",
+        )
+
+
+def split_order(order: str) -> list[str]:
+    return [part.strip() for part in str(order).replace("→", "->").split("->") if part.strip()]
+
+
+def build_route_commentary(
+    ranking: pd.DataFrame,
+    roster: pd.DataFrame,
+    ranking_objective: str,
+    target_laps: int,
+) -> list[str]:
+    if ranking.empty:
+        return []
+
+    best = ranking.iloc[0]
+    best_order = split_order(best["order"])
+    if not best_order:
+        return []
+
+    clean_roster = roster.copy()
+    clean_roster["projected_mean_minutes"] = pd.to_numeric(clean_roster["projected_mean_minutes"], errors="coerce")
+    clean_roster["projected_sd_minutes"] = pd.to_numeric(clean_roster["projected_sd_minutes"], errors="coerce")
+    clean_roster["running_order"] = pd.to_numeric(clean_roster["running_order"], errors="coerce")
+    clean_roster["max_laps"] = pd.to_numeric(clean_roster["max_laps"], errors="coerce")
+    roster_by_runner = clean_roster.set_index("runner")
+    pace_rank = clean_roster.sort_values("projected_mean_minutes")["runner"].astype(str).tolist()
+    top_routes = [split_order(order) for order in ranking["order"].head(10)]
+
+    lines = []
+    if ranking_objective == "target_probability":
+        lines.append(
+            f"This route was selected because it had the highest simulated chance of reaching {target_laps}+ laps "
+            f"among the tested orders: {best['probability_target_laps']:.1%}, with {best['expected_official_laps']:.2f} expected laps."
+        )
+    else:
+        lines.append(
+            f"This route was selected because it had the highest simulated expected lap total among the tested orders: "
+            f"{best['expected_official_laps']:.2f} expected laps, with {best['probability_target_laps']:.1%} chance of {target_laps}+ laps."
+        )
+
+    lines.append(
+        "The explanation below is an interpretation of the Monte Carlo results. The simulator tests the whole 24-hour rotation, "
+        "so a position can be useful because of late-race timing, caps, and who becomes available near Sunday noon."
+    )
+
+    for position, runner in enumerate(best_order, start=1):
+        if runner not in roster_by_runner.index:
+            lines.append(f"{position}. {runner}: selected in this slot by the simulation.")
+            continue
+
+        row = roster_by_runner.loc[runner]
+        mean = row["projected_mean_minutes"]
+        sd = row["projected_sd_minutes"]
+        cap = row["max_laps"]
+        current_position = row["running_order"]
+        pace_position = pace_rank.index(runner) + 1 if runner in pace_rank else None
+        top_route_same_slot = sum(1 for order in top_routes if len(order) >= position and order[position - 1] == runner)
+        top_route_frequency = top_route_same_slot / max(len(top_routes), 1)
+
+        reasons = []
+        if position == 1:
+            reasons.append("starts the race cleanly with no cutoff pressure")
+        elif position <= 3:
+            reasons.append("is placed early enough to shape the first several rotations")
+        elif position >= len(best_order) - 1:
+            reasons.append("is placed late in the cycle, which affects who is available around the Sunday noon cutoff")
+
+        if pace_position is not None:
+            if pace_position <= 2:
+                reasons.append(f"is one of the two fastest projected runners ({mean:.1f} min mean)")
+            elif pace_position <= 4:
+                reasons.append(f"is in the faster half of the roster ({mean:.1f} min mean)")
+            else:
+                reasons.append(f"has a slower projected mean ({mean:.1f} min), so the route is using timing/cap effects rather than pure pace")
+
+        if pd.notna(sd):
+            reasons.append(f"uses a {sd:.1f} min SD in the simulations")
+
+        if pd.notna(cap) and int(cap) > 0:
+            reasons.append(f"is capped at {int(cap)} laps, so the rotation skips them after that cap is reached")
+        else:
+            reasons.append("is uncapped, so they remain eligible late if capped runners are skipped")
+
+        if pd.notna(current_position) and int(current_position) != position:
+            reasons.append(f"moves from current slot {int(current_position)} to slot {position}")
+        else:
+            reasons.append("stays in the same slot as the current order")
+
+        if top_route_frequency >= 0.5:
+            reasons.append(f"also appears in this exact slot in {top_route_frequency:.0%} of the top tested routes")
+
+        lines.append(f"{position}. {runner}: " + "; ".join(reasons) + ".")
+
+    cap_rows = clean_roster[pd.to_numeric(clean_roster["max_laps"], errors="coerce").fillna(-1).gt(0)]
+    if not cap_rows.empty:
+        capped_names = ", ".join(
+            f"{row.runner} ({int(row.max_laps)})" for row in cap_rows.itertuples(index=False)
+        )
+        lines.append(
+            f"Cap effect: capped runners are {capped_names}. Their placement matters because once they hit the cap, "
+            "the simulator skips them and the later rotation compresses around the uncapped runners."
+        )
+
+    if pd.notna(best.get("likely_final_runner", pd.NA)) and str(best["likely_final_runner"]).strip():
+        lines.append(
+            f"Late-race effect: the most likely final-lap runner for this route is {best['likely_final_runner']}, "
+            "which is part of why the order can differ from simply sorting by fastest mean pace."
+        )
+
+    return lines
+
+
+def show_route_commentary(
+    ranking: pd.DataFrame,
+    roster: pd.DataFrame,
+    ranking_objective: str,
+    target_laps: int,
+) -> None:
+    commentary = build_route_commentary(ranking, roster, ranking_objective, target_laps)
+    if not commentary:
+        return
+    with st.expander("Why this route?", expanded=True):
+        st.markdown(commentary[0])
+        st.markdown(commentary[1])
+        for line in commentary[2:]:
+            st.markdown(f"- {line}")
+
+
+def show_optimizer(roster: pd.DataFrame, settings: SimulationSettings) -> None:
+    st.subheader("Running Order Optimiser")
+    target_route_laps = st.number_input(
+        "Target laps for route finder",
+        min_value=1,
+        max_value=80,
+        value=int(settings.target_laps),
+        step=1,
+    )
+    objective_label = st.selectbox(
+        "Optimiser objective",
+        ["Maximise expected official laps", "Maximise chance of reference target"],
+        index=0,
+    )
+    objective = "target_probability" if objective_label == "Maximise chance of reference target" else "max_expected_laps"
+    st.caption(
+        "The default objective matches the competition goal: complete as many official laps as possible. "
+        "All available runners can move anywhere in the order unless you add locked positions below."
+    )
+
+    c1, c2, c3, c4 = st.columns(4)
+    max_candidates = c1.number_input("Candidate orders", min_value=5, max_value=5_000, value=200, step=25)
+    sims_per_order = c2.number_input("First-pass sims/order", min_value=50, max_value=5_000, value=400, step=50)
+    final_sims = c3.number_input("Final sims/order", min_value=100, max_value=20_000, value=1_500, step=100)
+    brute_force = c4.checkbox("Brute force if feasible", value=False)
+
+    st.caption("Optional locked positions. Leave every position blank for a fully unconstrained order search.")
+    lock_table = pd.DataFrame({"runner": roster.sort_values("running_order")["runner"], "locked_position": pd.NA})
+    edited_locks = st.data_editor(
+        lock_table,
+        hide_index=True,
+        use_container_width=True,
+        column_config={
+            "runner": st.column_config.TextColumn("Runner", disabled=True),
+            "locked_position": st.column_config.NumberColumn("Locked position", min_value=1, max_value=len(lock_table), step=1),
+        },
+        key="locked_positions_editor",
+    )
+    locked_positions = {
+        int(row["locked_position"]): str(row["runner"])
+        for _, row in edited_locks.dropna(subset=["locked_position"]).iterrows()
+    }
+
+    button_col_1, button_col_2 = st.columns(2)
+    optimise_most_laps = button_col_1.button("Optimise for most laps")
+    find_target_route = button_col_2.button("Find route for target")
+    run_selected_objective = st.button("Optimise selected objective")
+
+    if optimise_most_laps or find_target_route or run_selected_objective:
+        objective_to_run = objective
+        if optimise_most_laps:
+            objective_to_run = "max_expected_laps"
+        if find_target_route:
+            objective_to_run = "target_probability"
+
+        with st.spinner("Testing running orders..."):
+            opt_settings = replace(settings, path_sample_size=0)
+            ranking = optimize_running_orders(
+                roster,
+                opt_settings,
+                target_laps=int(target_route_laps),
+                objective=objective_to_run,
+                max_candidates=int(max_candidates),
+                sims_per_order=int(sims_per_order),
+                final_sims=int(final_sims),
+                top_n=10,
+                brute_force_if_feasible=brute_force,
+                locked_positions=locked_positions,
+            )
+        st.session_state["order_ranking"] = ranking
+        st.session_state["order_ranking_context"] = {
+            "objective": objective_to_run,
+            "target_laps": int(target_route_laps),
+        }
+
+    if "order_ranking" in st.session_state:
+        ranking = st.session_state["order_ranking"]
+        context = st.session_state.get(
+            "order_ranking_context",
+            {"objective": objective, "target_laps": int(target_route_laps)},
+        )
+        ranking_objective = context["objective"]
+        ranking_target_laps = int(context["target_laps"])
+        if not ranking.empty:
+            best = ranking.iloc[0]
+            if ranking_objective == "target_probability":
+                st.success(
+                    f"Best route for {ranking_target_laps} laps: {best['order']} "
+                    f"({best['probability_target_laps']:.1%} estimated probability; "
+                    f"{best['expected_official_laps']:.2f} expected laps)."
+                )
+            else:
+                st.success(
+                    f"Best route for maximum laps: {best['order']} "
+                    f"({best['expected_official_laps']:.2f} expected laps; "
+                    f"{best['probability_target_laps']:.1%} chance of {ranking_target_laps}+ laps)."
+                )
+        st.dataframe(
+            ranking.style.format(
+                {
+                    "expected_official_laps": "{:.2f}",
+                    "median_official_laps": "{:.1f}",
+                    "p10_official_laps": "{:.1f}",
+                    "p90_official_laps": "{:.1f}",
+                    "probability_target_laps": "{:.1%}",
+                    "probability_target_plus_one_laps": "{:.1%}",
+                    "probability_missed_final_cutoff": "{:.1%}",
+                    "probability_ran_out_of_eligible_runners": "{:.1%}",
+                }
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+        show_route_commentary(ranking, roster, ranking_objective, ranking_target_laps)
+        fig = px.bar(
+            ranking,
+            x="rank",
+            y="expected_official_laps" if ranking_objective == "max_expected_laps" else "probability_target_laps",
+            hover_data=["order", "expected_official_laps", "probability_target_laps", "likely_final_runner"],
+            title="Top orders by expected official laps"
+            if ranking_objective == "max_expected_laps"
+            else f"Top routes by chance of {ranking_target_laps}+ laps",
+        )
+        if ranking_objective == "target_probability":
+            fig.update_layout(yaxis_tickformat=".0%")
+        st.plotly_chart(fig, use_container_width=True)
+        st.download_button(
+            "Download optimiser ranking CSV",
+            ranking.to_csv(index=False),
+            file_name="endure24_running_order_ranking.csv",
+            mime="text/csv",
+        )
+
+
+def override_runner_mean(roster: pd.DataFrame, runner: str, new_mean_minutes: float) -> pd.DataFrame:
+    adjusted = roster.copy()
+    adjusted.loc[adjusted["runner"].astype(str) == runner, "projected_mean_minutes"] = float(new_mean_minutes)
+    return adjusted
+
+
+def what_if_summary_table(
+    baseline_summary: dict,
+    override_summary: dict,
+    override_label: str,
+) -> pd.DataFrame:
+    rows = [
+        {
+            "scenario": "Current assumptions",
+            "runner_override": "",
+            "expected_laps": baseline_summary["expected_official_laps"],
+            "probability_reference_target": baseline_summary["probability_target_laps"],
+            "median_laps": baseline_summary["median_official_laps"],
+            "p10_laps": baseline_summary["p10_official_laps"],
+            "p90_laps": baseline_summary["p90_official_laps"],
+            "average_final_finish": format_race_clock(baseline_summary["average_final_finish_minute"]),
+        },
+        {
+            "scenario": "What-if override",
+            "runner_override": override_label,
+            "expected_laps": override_summary["expected_official_laps"],
+            "probability_reference_target": override_summary["probability_target_laps"],
+            "median_laps": override_summary["median_official_laps"],
+            "p10_laps": override_summary["p10_official_laps"],
+            "p90_laps": override_summary["p90_official_laps"],
+            "average_final_finish": format_race_clock(override_summary["average_final_finish_minute"]),
+        },
+    ]
+    table = pd.DataFrame(rows)
+    table["expected_lap_delta"] = table["expected_laps"] - table.loc[0, "expected_laps"]
+    table["target_probability_delta"] = (
+        table["probability_reference_target"] - table.loc[0, "probability_reference_target"]
+    )
+    return table
+
+
+def apply_runner_mean_overrides(roster: pd.DataFrame, overrides: pd.DataFrame) -> pd.DataFrame:
+    adjusted = roster.copy()
+    for row in overrides.itertuples(index=False):
+        adjusted.loc[
+            adjusted["runner"].astype(str) == str(row.runner),
+            "projected_mean_minutes",
+        ] = float(row.what_if_mean_minutes)
+    return adjusted
+
+
+def show_what_if_pace_override(roster: pd.DataFrame, settings: SimulationSettings) -> None:
+    st.subheader("What-if Pace Override")
+    st.caption(
+        "Use this for quick questions like: what if one or more runners average 1 minute faster? "
+        "It does not permanently edit the roster above."
+    )
+
+    clean = roster.copy()
+    clean["runner"] = clean["runner"].astype(str)
+    clean["projected_mean_minutes"] = pd.to_numeric(clean["projected_mean_minutes"], errors="coerce")
+    clean = clean.dropna(subset=["runner", "projected_mean_minutes"])
+    if clean.empty:
+        st.info("Add at least one runner with a projected mean before running a what-if.")
+        return
+
+    override_table = (
+        clean.sort_values("running_order")[["runner", "projected_mean_minutes"]]
+        .rename(columns={"projected_mean_minutes": "current_mean_minutes"})
+        .reset_index(drop=True)
+    )
+    override_table["apply"] = False
+    override_table["what_if_mean_minutes"] = override_table["current_mean_minutes"]
+    edited_overrides = st.data_editor(
+        override_table[["apply", "runner", "current_mean_minutes", "what_if_mean_minutes"]],
+        hide_index=True,
+        use_container_width=True,
+        column_config={
+            "apply": st.column_config.CheckboxColumn("Apply"),
+            "runner": st.column_config.TextColumn("Runner", disabled=True),
+            "current_mean_minutes": st.column_config.NumberColumn("Current mean", disabled=True, format="%.1f"),
+            "what_if_mean_minutes": st.column_config.NumberColumn(
+                "What-if mean",
+                min_value=1.0,
+                max_value=120.0,
+                step=0.1,
+                format="%.1f",
+            ),
+        },
+        key="what_if_multi_runner_editor",
+    )
+    run_target_route = st.checkbox("Also find target route", value=False)
+
+    if st.button("Run what-if recalculation"):
+        active_overrides = edited_overrides[
+            edited_overrides["apply"].astype(bool)
+            & pd.to_numeric(edited_overrides["what_if_mean_minutes"], errors="coerce").notna()
+        ].copy()
+        active_overrides["current_mean_minutes"] = pd.to_numeric(
+            active_overrides["current_mean_minutes"],
+            errors="coerce",
+        )
+        active_overrides["what_if_mean_minutes"] = pd.to_numeric(
+            active_overrides["what_if_mean_minutes"],
+            errors="coerce",
+        )
+        if active_overrides.empty:
+            st.warning("Tick Apply for at least one runner and enter a what-if mean time.")
+        else:
+            adjusted_roster = apply_runner_mean_overrides(roster, active_overrides)
+            override_label = "; ".join(
+                f"{row.runner}: {row.current_mean_minutes:.1f} -> {row.what_if_mean_minutes:.1f} min"
+                for row in active_overrides.itertuples(index=False)
+            )
+            with st.spinner("Running what-if comparison..."):
+                baseline_output = simulate_many(roster, settings, caps_enabled=True)
+                override_output = simulate_many(adjusted_roster, settings, caps_enabled=True)
+                baseline_bundle = summarize_results(baseline_output, settings.target_laps)
+                baseline_summary = baseline_bundle["summary"]
+                override_bundle = summarize_results(override_output, settings.target_laps)
+                override_summary = override_bundle["summary"]
+
+                target_ranking = None
+                if run_target_route:
+                    opt_settings = replace(settings, path_sample_size=0)
+                    target_ranking = optimize_running_orders(
+                        adjusted_roster,
+                        opt_settings,
+                        target_laps=settings.target_laps,
+                        objective="target_probability",
+                        max_candidates=200,
+                        sims_per_order=400,
+                        final_sims=1_500,
+                        top_n=10,
+                        brute_force_if_feasible=False,
+                        locked_positions={},
+                    )
+
+            st.session_state["what_if_result"] = {
+                "override_label": override_label,
+                "adjusted_roster": adjusted_roster,
+                "comparison": what_if_summary_table(
+                    baseline_summary,
+                    override_summary,
+                    override_label,
+                ),
+                "baseline_bundle": baseline_bundle,
+                "override_bundle": override_bundle,
+                "target_ranking": target_ranking,
+            }
+
+    if "what_if_result" in st.session_state and "override_label" not in st.session_state["what_if_result"]:
+        del st.session_state["what_if_result"]
+
+    if "what_if_result" in st.session_state:
+        result = st.session_state["what_if_result"]
+        comparison = result["comparison"]
+        override_row = comparison.loc[comparison["scenario"] == "What-if override"].iloc[0]
+        st.success(
+            f"What-if result for {result['override_label']}: "
+            f"{override_row['expected_laps']:.2f} expected laps "
+            f"({override_row['expected_lap_delta']:+.2f} vs current), "
+            f"{override_row['probability_reference_target']:.1%} chance of {settings.target_laps}+ laps "
+            f"({override_row['target_probability_delta']:+.1%})."
+        )
+        st.dataframe(
+            comparison.style.format(
+                {
+                    "expected_laps": "{:.2f}",
+                    "expected_lap_delta": "{:+.2f}",
+                    "probability_reference_target": "{:.1%}",
+                    "target_probability_delta": "{:+.1%}",
+                    "median_laps": "{:.1f}",
+                    "p10_laps": "{:.1f}",
+                    "p90_laps": "{:.1f}",
+                }
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        runner_laps = result["override_bundle"]["expected_runner_laps"]
+        lap_pdf_fig = comparison_final_lap_probability_figure(
+            result["baseline_bundle"]["final_lap_distribution"],
+            result["override_bundle"]["final_lap_distribution"],
+        )
+        st.plotly_chart(lap_pdf_fig, use_container_width=True)
+        st.caption("Final lap count is discrete, so this is a PMF/PDF-style probability plot.")
+
+        fig = px.bar(
+            runner_laps,
+            x="runner",
+            y="expected_laps",
+            title="What-if expected laps per runner",
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+        target_ranking = result.get("target_ranking")
+        if target_ranking is not None and not target_ranking.empty:
+            best = target_ranking.iloc[0]
+            st.success(
+                f"Best target route with this override: {best['order']} "
+                f"({best['probability_target_laps']:.1%} chance of {settings.target_laps}+ laps; "
+                f"{best['expected_official_laps']:.2f} expected laps)."
+            )
+            st.dataframe(
+                target_ranking.style.format(
+                    {
+                        "expected_official_laps": "{:.2f}",
+                        "median_official_laps": "{:.1f}",
+                        "p10_official_laps": "{:.1f}",
+                        "p90_official_laps": "{:.1f}",
+                        "probability_target_laps": "{:.1%}",
+                        "probability_target_plus_one_laps": "{:.1%}",
+                        "probability_missed_final_cutoff": "{:.1%}",
+                        "probability_ran_out_of_eligible_runners": "{:.1%}",
+                    }
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+            show_route_commentary(target_ranking, result["adjusted_roster"], "target_probability", settings.target_laps)
+
+
+def main() -> None:
+    st.title("Endure24 Relay Monte Carlo")
+    st.caption("Race rule model: starts through Sunday 12:00 count if the lap finishes by Sunday 13:00.")
+
+    uploaded = st.file_uploader("Upload Endure24 workbook", type=["xlsx", "xls"])
+    if uploaded is not None:
+        workbook_bytes = uploaded.getvalue()
+        source_label = uploaded.name
+    else:
+        workbook_bytes = DEFAULT_DATA_PATH.read_bytes()
+        source_label = str(DEFAULT_DATA_PATH)
+
+    loaded = load_data_cached(workbook_bytes, source_label, ASSUMPTION_VERSION)
+    settings = make_settings()
+
+    show_validation(loaded)
+    show_last_year_analysis(loaded)
+
+    st.subheader("This Year Assumptions")
+    st.info(
+        "Fatigue and night penalties now default to 0.0%. They are editable per runner here if you want "
+        "to add a conservative slowdown assumption. "
+        "Last-year day/night and fatigue stats are shown below where the workbook has enough data, but the app "
+        "does not apply them automatically."
+    )
+    roster = edited_roster_table(loaded.roster)
+    roster_warnings, roster_errors = validate_roster(roster)
+    for warning in roster_warnings:
+        st.warning(warning)
+    for error in roster_errors:
+        st.error(error)
+
+    with st.expander("Last-year stats beside this-year assumptions", expanded=False):
+        combined = roster.merge(loaded.last_year_stats, on="runner", how="left")
+        st.dataframe(combined, use_container_width=True, hide_index=True)
+
+    st.subheader("Run Simulation")
+    c1, c2 = st.columns(2)
+    caps_enabled = c1.checkbox("Apply max-lap caps", value=True)
+    run_uncapped_comparison = c2.checkbox("Also run uncapped comparison", value=True)
+
+    if st.button("Run Monte Carlo simulation", type="primary"):
+        if roster_errors:
+            st.error("Fix roster errors before running the simulation.")
+        else:
+            with st.spinner("Running simulations..."):
+                sim_output = simulate_many(roster, settings, caps_enabled=caps_enabled)
+                summary_bundle = summarize_results(sim_output, settings.target_laps)
+                uncapped_summary = None
+                comparison = None
+                if run_uncapped_comparison:
+                    uncapped_settings = replace(
+                        settings,
+                        random_seed=None if settings.random_seed is None else settings.random_seed + 1,
+                    )
+                    uncapped_output = simulate_many(roster, uncapped_settings, caps_enabled=False)
+                    uncapped_summary = summarize_results(uncapped_output, settings.target_laps)
+                    comparison = pd.DataFrame(
+                        [
+                            {
+                                "scenario": "Caps enabled" if caps_enabled else "Current run",
+                                "expected_official_laps": summary_bundle["summary"]["expected_official_laps"],
+                                "probability_target_laps": summary_bundle["summary"]["probability_target_laps"],
+                                "probability_ran_out_of_eligible_runners": summary_bundle["summary"][
+                                    "probability_ran_out_of_eligible_runners"
+                                ],
+                            },
+                            {
+                                "scenario": "Caps disabled",
+                                "expected_official_laps": uncapped_summary["summary"]["expected_official_laps"],
+                                "probability_target_laps": uncapped_summary["summary"]["probability_target_laps"],
+                                "probability_ran_out_of_eligible_runners": uncapped_summary["summary"][
+                                    "probability_ran_out_of_eligible_runners"
+                                ],
+                            },
+                        ]
+                    )
+                st.session_state["sim_output"] = sim_output
+                st.session_state["summary_bundle"] = summary_bundle
+                st.session_state["uncapped_summary"] = uncapped_summary
+                st.session_state["comparison"] = comparison
+
+    if "sim_output" in st.session_state:
+        show_charts(
+            st.session_state["sim_output"],
+            st.session_state["summary_bundle"],
+            st.session_state.get("uncapped_summary"),
+            st.session_state.get("comparison"),
+        )
+        show_downloads(
+            st.session_state["sim_output"],
+            st.session_state["summary_bundle"],
+            st.session_state.get("comparison"),
+        )
+
+    show_optimizer(roster, settings)
+    show_what_if_pace_override(roster, settings)
+
+
+if __name__ == "__main__":
+    main()
