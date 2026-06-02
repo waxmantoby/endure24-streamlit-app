@@ -196,7 +196,29 @@ Pasted tables can use race-clock text such as `Saturday 13:04`, `Sunday 00:12`, 
 
 ## Google Sheets Sync
 
-Google Sheets sync is optional. Without credentials, the Race Day tab still works with CSV backup.
+The simplest race-day setup is an editable Google Sheet owned by `waxmantoby@gmail.com`.
+
+1. In the `Race Day` tab, download `Google Sheet template CSV`.
+2. In Google Sheets, create a blank spreadsheet.
+3. Import or paste the template headers.
+4. Share the Sheet so the app can view it, or use `File > Share > Publish to web`.
+5. Paste the Sheet link into `Editable Google Sheet link`.
+6. Click `Load editable Google Sheet` whenever you want to refresh the app from the Sheet.
+
+Use these columns:
+
+```text
+lap_number, runner, finish_time, lap_duration_minutes, notes
+```
+
+Fill either `finish_time` or `lap_duration_minutes` for each lap:
+
+- `finish_time`: `Saturday 13:04`, `Sunday 00:12`, or elapsed minutes such as `724`
+- `lap_duration_minutes`: `33.5`, `41.2`, etc.
+
+This editable-Sheet mode is read-only from the app: you edit the Google Sheet, then reload it in Streamlit.
+
+Google Sheets write-back is optional. Without credentials, the Race Day tab still works with editable-Sheet import and CSV backup.
 
 Add these Streamlit secrets to enable sync:
 

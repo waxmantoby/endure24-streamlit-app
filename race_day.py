@@ -7,6 +7,7 @@ from io import StringIO
 import json
 import re
 from typing import Any, Mapping
+from urllib.parse import parse_qs, urlparse
 
 import numpy as np
 import pandas as pd
@@ -27,6 +28,14 @@ RACE_LOG_COLUMNS = [
     "lap_duration_minutes",
     "notes",
     "official",
+]
+
+GOOGLE_SHEET_TEMPLATE_COLUMNS = [
+    "lap_number",
+    "runner",
+    "finish_time",
+    "lap_duration_minutes",
+    "notes",
 ]
 
 
@@ -334,6 +343,36 @@ def write_race_log_to_google_sheet(
     sheet.clear()
     if values:
         sheet.update(values)
+
+
+def google_sheet_url_to_csv_url(url: str) -> str:
+    text = str(url or "").strip()
+    if not text:
+        return ""
+    if "output=csv" in text or "format=csv" in text:
+        return text
+
+    parsed = urlparse(text)
+    if "docs.google.com" not in parsed.netloc or "/spreadsheets/d/" not in parsed.path:
+        return text
+
+    match = re.search(r"/spreadsheets/d/([^/]+)", parsed.path)
+    if not match:
+        return text
+
+    query_gid = parse_qs(parsed.query).get("gid")
+    fragment_gid = parse_qs(parsed.fragment).get("gid")
+    gid = (query_gid or fragment_gid or ["0"])[0]
+    sheet_id = match.group(1)
+    return f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
+
+
+def read_race_log_from_google_sheet_url(url: str, roster: pd.DataFrame) -> pd.DataFrame:
+    csv_url = google_sheet_url_to_csv_url(url)
+    if not csv_url:
+        return empty_race_log()
+    raw = pd.read_csv(csv_url)
+    return normalise_race_log(raw, roster)
 
 
 def parse_race_time_to_minute(value: Any) -> float | None:

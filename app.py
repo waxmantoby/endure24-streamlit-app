@@ -11,6 +11,7 @@ import streamlit as st
 from data_loader import DEFAULT_DATA_PATH, load_endure_workbook, validate_roster
 from optimizer import optimize_running_orders
 from race_day import (
+    GOOGLE_SHEET_TEMPLATE_COLUMNS,
     append_manual_lap,
     empty_race_log,
     forecast_from_race_log,
@@ -19,6 +20,7 @@ from race_day import (
     parse_pasted_laps,
     parse_race_time_to_minute,
     race_state_from_log,
+    read_race_log_from_google_sheet_url,
     read_race_log_from_google_sheet,
     validate_race_log,
     write_race_log_to_google_sheet,
@@ -646,7 +648,47 @@ def show_race_day_metrics(state, live_bundle: dict | None, target_laps: int) -> 
 
 def show_google_sheet_controls(log: pd.DataFrame, roster: pd.DataFrame) -> pd.DataFrame:
     default_sheet_id = get_streamlit_secret("google_sheet_id", "race_log_google_sheet_id") or ""
-    with st.expander("Google Sheets sync", expanded=True):
+    with st.expander("Google Sheet tracking", expanded=True):
+        st.markdown("#### Editable Google Sheet")
+        st.caption(
+            "Use this when you want to update a normal Google Sheet during the race. "
+            "Share or publish the Sheet so the app can view it, paste the Sheet link below, then reload it here."
+        )
+        template = pd.DataFrame(columns=GOOGLE_SHEET_TEMPLATE_COLUMNS)
+        st.download_button(
+            "Download Google Sheet template CSV",
+            template.to_csv(index=False),
+            file_name="endure24_google_sheet_race_log_template.csv",
+            mime="text/csv",
+            width="stretch",
+        )
+        sheet_url = st.text_input(
+            "Editable Google Sheet link",
+            value=st.session_state.get("editable_google_sheet_url", ""),
+            placeholder="https://docs.google.com/spreadsheets/d/.../edit#gid=0",
+        )
+        st.session_state["editable_google_sheet_url"] = sheet_url
+        if st.button("Load editable Google Sheet", width="stretch"):
+            try:
+                loaded = read_race_log_from_google_sheet_url(sheet_url, roster)
+                warnings, errors = validate_race_log(loaded, roster)
+                if errors:
+                    for error in errors:
+                        st.error(error)
+                else:
+                    log = set_race_log(loaded, roster)
+                    st.success("Race log loaded from editable Google Sheet.")
+                    for warning in warnings:
+                        st.warning(warning)
+            except Exception as exc:
+                st.error(
+                    "Could not load the Google Sheet. Make sure the link is shared so the app can view it, "
+                    f"or use File > Share > Publish to web. Details: {exc}"
+                )
+
+        st.divider()
+        st.markdown("#### App write-back with service account")
+        st.caption("Optional advanced mode: lets the app save directly into Google Sheets using Streamlit secrets.")
         c1, c2 = st.columns([2, 1])
         sheet_id = c1.text_input("Sheet ID", value=str(default_sheet_id), placeholder="Google Sheet ID")
         worksheet_name = c2.text_input("Worksheet", value="race_log")
