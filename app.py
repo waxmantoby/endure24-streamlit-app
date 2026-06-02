@@ -934,27 +934,28 @@ def show_race_control_dashboard(
         width="stretch",
     )
 
-    queue = build_runner_queue(log, roster, caps_enabled=caps_enabled, queue_size=3)
-    st.markdown("#### Runner Queue")
-    if queue.empty:
-        st.info("No available runners in the current setup.")
-    else:
-        st.dataframe(
-            format_runner_queue_for_display(queue),
-            width="stretch",
-            hide_index=True,
-            column_config={
-                "role": "Slot",
-                "runner": "Runner",
-                "completed_laps": st.column_config.NumberColumn("Laps", format="%d"),
-                "cap_remaining": "Cap left",
-                "last_lap": "Last",
-                "rest": "Rest",
-                "order_status": "Order",
-            },
-        )
+    with st.expander("Fixed-order queue and runner status", expanded=False):
+        queue = build_runner_queue(log, roster, caps_enabled=caps_enabled, queue_size=5)
+        st.markdown("#### Fixed Order Queue")
+        if queue.empty:
+            st.info("No available runners in the current setup.")
+        else:
+            st.dataframe(
+                format_runner_queue_for_display(queue),
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    "role": "Slot",
+                    "runner": "Runner",
+                    "completed_laps": st.column_config.NumberColumn("Laps", format="%d"),
+                    "cap_remaining": "Cap left",
+                    "last_lap": "Last",
+                    "rest": "Rest",
+                    "order_status": "Order",
+                },
+            )
 
-    with st.expander("All runner status", expanded=False):
+        st.markdown("#### All Runner Status")
         status = build_runner_status_table(log, roster, caps_enabled=caps_enabled)
         st.dataframe(
             format_runner_queue_for_display(status),
@@ -992,6 +993,7 @@ def show_race_day_plan_assistant(
     caps_enabled: bool,
 ) -> None:
     st.markdown("### Plan Assistant")
+    st.caption("Use this as the race-day handover view. It keeps completed laps fixed and preserves a fair live rotation.")
     fixed_queue = build_runner_queue(log, roster, caps_enabled=caps_enabled, queue_size=5)
     fair_queue = build_live_fair_queue(log, roster, caps_enabled=caps_enabled, queue_size=5)
     fixed_next = queue_next_runner(fixed_queue) or state.next_runner or ""
@@ -1000,22 +1002,19 @@ def show_race_day_plan_assistant(
     cols = st.columns(3)
     cols[0].metric("Recommended next", fair_next or "No eligible runner")
     cols[1].metric("Fixed order next", fixed_next or "No eligible runner")
-    cols[2].metric("Plan rule", "Fair live rotation")
+    cols[2].metric("Decision rule", "Fair live rotation")
 
     if fair_next and fixed_next and fair_next != fixed_next:
         st.warning(
             f"Live fair rotation recommends {fair_next}; the fixed pre-race order expects {fixed_next}. "
-            "Completed laps stay fixed either way."
+            "Use the recommendation if the team has already changed the order on the day."
         )
     elif fair_next:
         st.caption("Live fair rotation agrees with the fixed order for the next runner.")
     else:
         st.info("No eligible runner is available under the current roster and cap settings.")
 
-    st.caption(
-        "The live queue learns the order used on the day, then moves whoever ran most recently to the back. "
-        "That keeps the rotation fair after any manual order change."
-    )
+    st.caption("The queue learns the order used on the day, then moves whoever ran most recently to the back.")
     if fair_queue.empty:
         st.info("The live fair queue is empty.")
     else:
@@ -1044,7 +1043,7 @@ def show_race_day_plan_assistant(
                 settings,
                 caps_enabled=caps_enabled,
             )
-    compare_cols[1].caption("Comparison uses maximum expected official laps, with target probability shown.")
+    compare_cols[1].caption("Optional. Compares fixed order against the live fair queue from the current race state.")
 
     ranking = st.session_state.get("race_day_plan_ranking")
     if isinstance(ranking, pd.DataFrame) and not ranking.empty:
@@ -1066,15 +1065,18 @@ def show_race_day_plan_assistant(
         )
 
 
-def show_race_day_sync_status() -> None:
-    live_reload = "On" if st.session_state.get("race_day_live_sheet_enabled") else "Off"
+def show_race_day_sync_status(sync: Mapping[str, Any]) -> None:
+    configured = bool(sync.get("configured"))
+    live_reload = "On" if st.session_state.get("race_day_live_sheet_enabled", configured) else "Off"
+    sync_state = "Ready" if configured else "Not configured"
     last_load = st.session_state.get("editable_google_sheet_last_loaded", "-")
     last_save = st.session_state.get("race_day_sheet_last_saved", "-")
     with st.container(border=True):
-        cols = st.columns(3)
-        cols[0].metric("Sheet live reload", live_reload)
-        cols[1].metric("Last Sheet load", str(last_load))
-        cols[2].metric("Last Sheet save", str(last_save))
+        cols = st.columns(4)
+        cols[0].metric("Google Sheet", sync_state)
+        cols[1].metric("Live reload", live_reload)
+        cols[2].metric("Last load", str(last_load))
+        cols[3].metric("Last save", str(last_save))
 
 
 def race_mini_card(label: str, value: str, help_text: str) -> None:
@@ -1366,7 +1368,7 @@ def show_race_log_entry(
 
     next_runner_index = runner_options.index(state.next_runner) if state.next_runner in runner_options else 0
 
-    st.markdown("#### Log Lap")
+    st.markdown("#### Add Race Entry")
     with st.form("manual_lap_form", clear_on_submit=True):
         action_options = ["Add completed lap", "Record start only"]
         if state.current_lap_in_progress:
@@ -1647,9 +1649,10 @@ def show_race_day(roster: pd.DataFrame, settings: SimulationSettings, caps_enabl
         caps_enabled,
     )
     show_race_day_plan_assistant(log, roster, settings, state, caps_enabled)
-    show_race_day_sync_status()
+    show_race_day_sync_status(race_sync)
     show_race_day_alerts(warnings, errors)
 
+    st.markdown("### Lap Desk")
     c1, c2 = st.columns([1, 1])
     with c1:
         log = show_race_log_entry(log, roster, caps_enabled, race_sync)
@@ -1674,13 +1677,13 @@ def show_race_day(roster: pd.DataFrame, settings: SimulationSettings, caps_enabl
                     "notes": "Notes",
                 },
             )
-        with st.expander("Backup", expanded=False):
+        with st.expander("Backup and undo", expanded=False):
             log = show_race_log_backup(log, roster, caps_enabled, race_sync)
 
-    st.markdown("#### Live Sync")
-    log = show_google_sheet_controls(log, roster, caps_enabled, race_sync)
+    with st.expander("Live Sheet controls", expanded=False):
+        log = show_google_sheet_controls(log, roster, caps_enabled, race_sync)
 
-    with st.expander("Forecast plot", expanded=bool(baseline_bundle and live_bundle)):
+    with st.expander("Forecast controls and probability plot", expanded=bool(baseline_bundle and live_bundle)):
         forecast_col, auto_col = st.columns([1.2, 1])
         with forecast_col:
             if st.button("Update race-day forecast", type="primary", width="stretch"):
