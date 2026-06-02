@@ -1078,7 +1078,7 @@ def prioritize_alerts(messages: list[str]) -> list[str]:
     return sorted(messages, key=key)
 
 
-def show_google_sheet_controls(log: pd.DataFrame, roster: pd.DataFrame, caps_enabled: bool) -> pd.DataFrame:
+def race_day_sheet_context() -> dict[str, Any]:
     default_sheet_id = get_streamlit_secret("google_sheet_id", "race_log_google_sheet_id") or ""
     st.session_state.setdefault("race_day_sheet_id", str(default_sheet_id))
     st.session_state.setdefault("race_day_worksheet_name", "race_log")
@@ -1087,27 +1087,73 @@ def show_google_sheet_controls(log: pd.DataFrame, roster: pd.DataFrame, caps_ena
     sheet_id = str(st.session_state.get("race_day_sheet_id") or default_sheet_id).strip()
     worksheet_name = str(st.session_state.get("race_day_worksheet_name") or "race_log").strip() or "race_log"
     sheet_url = str(st.session_state.get("editable_google_sheet_url") or "").strip()
-    configured = google_sheets_configured(st.secrets, sheet_id or None)
+    return {
+        "sheet_id": sheet_id,
+        "worksheet_name": worksheet_name,
+        "sheet_url": sheet_url,
+        "configured": google_sheets_configured(st.secrets, sheet_id or None),
+    }
+
+
+def save_race_log_live(
+    log: pd.DataFrame,
+    roster: pd.DataFrame,
+    caps_enabled: bool,
+    sync: Mapping[str, Any],
+    notice: str | None = None,
+) -> pd.DataFrame:
+    warnings, errors = validate_race_log(log, roster, caps_enabled=caps_enabled)
+    if errors:
+        raise ValueError("; ".join(errors[:3]))
+
+    clean = set_race_log(log, roster)
+    if sync.get("configured"):
+        write_race_log_to_google_sheet(
+            clean,
+            st.secrets,
+            sheet_id=sync.get("sheet_id") or None,
+            worksheet_name=str(sync.get("worksheet_name") or "race_log"),
+        )
+        saved_at = pd.Timestamp.now().strftime("%H:%M:%S")
+        st.session_state["race_day_sheet_last_saved"] = saved_at
+        st.session_state["race_day_notice"] = notice or f"Race log saved to Google Sheet at {saved_at}."
+    else:
+        st.session_state["race_day_notice"] = "Race log saved locally. Google Sheets write access is not configured."
+    if warnings:
+        st.session_state["race_day_warnings_after_save"] = warnings
+    return clean
+
+
+def show_google_sheet_controls(
+    log: pd.DataFrame,
+    roster: pd.DataFrame,
+    caps_enabled: bool,
+    sync: Mapping[str, Any],
+) -> pd.DataFrame:
+    sheet_id = str(sync["sheet_id"])
+    worksheet_name = str(sync["worksheet_name"])
+    sheet_url = str(sync["sheet_url"])
+    configured = bool(sync["configured"])
 
     with st.container(border=True):
         top_cols = st.columns([1.5, 1, 1])
         with top_cols[0]:
             st.markdown("#### Live Sheet")
             if configured:
-                st.caption("Connected. Load pulls the latest race log; Save writes the app log back to the Sheet.")
+                st.caption("Live sync is on. Portal lap changes save to the Sheet; Sheet changes reload here.")
             else:
                 st.caption("Write access is not configured. Public-link loading and CSV backup are still available.")
 
         live_reload = top_cols[1].checkbox(
             "Auto reload",
-            value=st.session_state.get("race_day_live_sheet_enabled", False),
+            value=st.session_state.get("race_day_live_sheet_enabled", configured),
             help="Reloads the Sheet while this Race Day tab is open.",
         )
         refresh_seconds = top_cols[2].number_input(
             "Every seconds",
             min_value=10,
             max_value=300,
-            value=int(st.session_state.get("race_day_live_refresh_seconds", 30)),
+            value=int(st.session_state.get("race_day_live_refresh_seconds", 15)),
             step=5,
         )
         st.session_state["race_day_live_sheet_enabled"] = live_reload
@@ -1161,24 +1207,20 @@ def show_google_sheet_controls(log: pd.DataFrame, roster: pd.DataFrame, caps_ena
                 )
         if st.session_state.get("editable_google_sheet_last_loaded"):
             st.caption(f"Last load: {st.session_state['editable_google_sheet_last_loaded']}.")
+        if st.session_state.get("race_day_sheet_last_saved"):
+            st.caption(f"Last save: {st.session_state['race_day_sheet_last_saved']}.")
 
         if save_now:
-            warnings, errors = validate_race_log(log, roster, caps_enabled=caps_enabled)
-            if errors:
+            try:
+                log = save_race_log_live(log, roster, caps_enabled, sync, "Race log saved to the Sheet.")
+                st.success("Race log saved to the Sheet.")
+                if st.session_state.get("race_day_warnings_after_save"):
+                    show_race_day_alerts(st.session_state.pop("race_day_warnings_after_save"), [])
+            except ValueError:
+                warnings, errors = validate_race_log(log, roster, caps_enabled=caps_enabled)
                 show_race_day_alerts(warnings, errors)
-            else:
-                try:
-                    write_race_log_to_google_sheet(
-                        log,
-                        st.secrets,
-                        sheet_id=sheet_id or None,
-                        worksheet_name=worksheet_name,
-                    )
-                    st.success("Race log saved to the Sheet.")
-                    if warnings:
-                        show_race_day_alerts(warnings, [])
-                except Exception as exc:
-                    st.error(f"Could not save the Sheet: {exc}")
+            except Exception as exc:
+                st.error(f"Could not save the Sheet: {exc}")
 
         with st.expander("Sheet settings", expanded=False):
             settings_cols = st.columns([2, 1])
@@ -1200,7 +1242,12 @@ def show_google_sheet_controls(log: pd.DataFrame, roster: pd.DataFrame, caps_ena
     return log
 
 
-def show_race_log_entry(log: pd.DataFrame, roster: pd.DataFrame, caps_enabled: bool) -> pd.DataFrame:
+def show_race_log_entry(
+    log: pd.DataFrame,
+    roster: pd.DataFrame,
+    caps_enabled: bool,
+    sync: Mapping[str, Any],
+) -> pd.DataFrame:
     state = race_state_from_log(log, roster, target_laps=1, caps_enabled=caps_enabled)
     runner_options = roster.sort_values("running_order")["runner"].astype(str).tolist()
     if not runner_options:
@@ -1329,9 +1376,11 @@ def show_race_log_entry(log: pd.DataFrame, roster: pd.DataFrame, caps_enabled: b
             if errors:
                 show_race_day_alerts(warnings, errors)
             else:
-                log = set_race_log(candidate, roster)
-                st.session_state["race_day_notice"] = "Race log updated."
-                st.rerun()
+                try:
+                    log = save_race_log_live(candidate, roster, caps_enabled, sync, "Race log updated and saved.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Race log was valid, but could not save to the Sheet: {exc}")
 
     with st.expander("Bulk paste", expanded=False):
         pasted = st.text_area(
@@ -1351,9 +1400,11 @@ def show_race_log_entry(log: pd.DataFrame, roster: pd.DataFrame, caps_enabled: b
                 if errors:
                     show_race_day_alerts(warnings, errors)
                 else:
-                    log = set_race_log(candidate, roster)
-                    st.session_state["race_day_notice"] = "Pasted rows appended."
-                    st.rerun()
+                    try:
+                        log = save_race_log_live(candidate, roster, caps_enabled, sync, "Pasted rows appended and saved.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"Pasted rows were valid, but could not save to the Sheet: {exc}")
             except Exception as exc:
                 st.error(f"Could not import pasted rows: {exc}")
 
@@ -1364,16 +1415,23 @@ def show_race_log_entry(log: pd.DataFrame, roster: pd.DataFrame, caps_enabled: b
                 if errors:
                     show_race_day_alerts(warnings, errors)
                 else:
-                    log = set_race_log(candidate, roster)
-                    st.session_state["race_day_notice"] = "Race log replaced."
-                    st.rerun()
+                    try:
+                        log = save_race_log_live(candidate, roster, caps_enabled, sync, "Race log replaced and saved.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"Pasted table was valid, but could not save to the Sheet: {exc}")
             except Exception as exc:
                 st.error(f"Could not import pasted table: {exc}")
 
     return log
 
 
-def show_race_log_backup(log: pd.DataFrame, roster: pd.DataFrame) -> pd.DataFrame:
+def show_race_log_backup(
+    log: pd.DataFrame,
+    roster: pd.DataFrame,
+    caps_enabled: bool,
+    sync: Mapping[str, Any],
+) -> pd.DataFrame:
     c1, c2, c3, c4 = st.columns(4)
     uploaded_log = c1.file_uploader("Upload race-log CSV", type=["csv"], key="race_log_csv")
     if c2.button("Load CSV backup", width="stretch"):
@@ -1381,11 +1439,16 @@ def show_race_log_backup(log: pd.DataFrame, roster: pd.DataFrame) -> pd.DataFram
             st.warning("Choose a CSV backup first.")
         else:
             try:
-                log = set_race_log(pd.read_csv(uploaded_log), roster)
-                st.session_state["race_day_notice"] = "CSV backup loaded."
+                log = save_race_log_live(
+                    pd.read_csv(uploaded_log),
+                    roster,
+                    caps_enabled,
+                    sync,
+                    "CSV backup loaded and saved.",
+                )
                 st.rerun()
             except Exception as exc:
-                st.error(f"Could not load CSV backup: {exc}")
+                st.error(f"Could not load and save CSV backup: {exc}")
 
     c3.download_button(
         "Download CSV backup",
@@ -1401,14 +1464,24 @@ def show_race_log_backup(log: pd.DataFrame, roster: pd.DataFrame) -> pd.DataFram
             st.warning("There is no race-log entry to undo.")
         else:
             last_lap = int(clean["lap_number"].max())
-            log = set_race_log(clean[clean["lap_number"].astype(int) != last_lap], roster)
-            st.session_state["race_day_notice"] = f"Removed lap {last_lap}."
-            st.rerun()
+            try:
+                log = save_race_log_live(
+                    clean[clean["lap_number"].astype(int) != last_lap],
+                    roster,
+                    caps_enabled,
+                    sync,
+                    f"Removed lap {last_lap} and saved.",
+                )
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Could not save undo to the Sheet: {exc}")
 
     if st.button("Clear race log"):
-        log = set_race_log(empty_race_log(), roster)
-        st.session_state["race_day_notice"] = "Race log cleared."
-        st.rerun()
+        try:
+            log = save_race_log_live(empty_race_log(), roster, caps_enabled, sync, "Race log cleared and saved.")
+            st.rerun()
+        except Exception as exc:
+            st.error(f"Could not clear and save the race log: {exc}")
     return log
 
 
@@ -1441,6 +1514,7 @@ def show_race_day(roster: pd.DataFrame, settings: SimulationSettings, caps_enabl
         st.session_state["race_log"] = empty_race_log()
     log = normalise_race_log(st.session_state["race_log"], roster)
     st.session_state["race_log"] = log
+    race_sync = race_day_sheet_context()
 
     warnings, errors = validate_race_log(log, roster, caps_enabled=caps_enabled)
     state = race_state_from_log(log, roster, settings.target_laps, caps_enabled=caps_enabled)
@@ -1466,7 +1540,7 @@ def show_race_day(roster: pd.DataFrame, settings: SimulationSettings, caps_enabl
 
     c1, c2 = st.columns([1, 1])
     with c1:
-        log = show_race_log_entry(log, roster, caps_enabled)
+        log = show_race_log_entry(log, roster, caps_enabled, race_sync)
     with c2:
         st.markdown("#### Latest Laps")
         display_log = format_race_log_for_display(log, roster, caps_enabled)
@@ -1489,10 +1563,10 @@ def show_race_day(roster: pd.DataFrame, settings: SimulationSettings, caps_enabl
                 },
             )
         with st.expander("Backup", expanded=False):
-            log = show_race_log_backup(log, roster)
+            log = show_race_log_backup(log, roster, caps_enabled, race_sync)
 
     st.markdown("#### Live Sync")
-    log = show_google_sheet_controls(log, roster, caps_enabled)
+    log = show_google_sheet_controls(log, roster, caps_enabled, race_sync)
 
     with st.expander("Forecast plot", expanded=bool(baseline_bundle and live_bundle)):
         forecast_col, auto_col = st.columns([1.2, 1])

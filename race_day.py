@@ -660,6 +660,26 @@ def google_sheets_configured(secrets: Mapping[str, Any], sheet_id: str | None = 
     return bool((sheet_id or _secret_value(secrets, "google_sheet_id", "race_log_google_sheet_id")) and _service_account_info(secrets))
 
 
+def _format_sheet_race_clock(minute: float | int | None) -> str:
+    if minute is None or pd.isna(minute):
+        return ""
+    total_minutes = int(round(float(minute)))
+    clock_minutes = (12 * 60 + total_minutes) % (24 * 60)
+    day = "Saturday" if total_minutes < 12 * 60 else "Sunday"
+    hour = clock_minutes // 60
+    minute_part = clock_minutes % 60
+    return f"{day} {hour:02d}:{minute_part:02d}"
+
+
+def _format_sheet_number(value: float | int | None) -> str:
+    if value is None or pd.isna(value):
+        return ""
+    rounded = round(float(value), 2)
+    if rounded.is_integer():
+        return str(int(rounded))
+    return f"{rounded:.2f}"
+
+
 def read_race_log_from_google_sheet(
     secrets: Mapping[str, Any],
     sheet_id: str | None = None,
@@ -678,8 +698,18 @@ def write_race_log_to_google_sheet(
 ) -> None:
     sheet = _open_sheet(secrets, sheet_id, worksheet_name)
     clean = log.copy()
-    clean = clean[RACE_LOG_COLUMNS]
-    values = [clean.columns.tolist()] + clean.replace({np.nan: ""}).astype(str).values.tolist()
+    clean = normalise_race_log(clean, pd.DataFrame({"runner": clean.get("runner", pd.Series(dtype=str))}))
+    export = pd.DataFrame(
+        {
+            "lap_number": clean["lap_number"].astype("Int64").astype(str),
+            "runner": clean["runner"].astype(str),
+            "start_time": clean["start_minute"].map(_format_sheet_race_clock),
+            "finish_time": clean["finish_minute"].map(_format_sheet_race_clock),
+            "lap_duration_minutes": clean["lap_duration_minutes"].map(_format_sheet_number),
+            "notes": clean["notes"].fillna("").astype(str),
+        }
+    )
+    values = [GOOGLE_SHEET_TEMPLATE_COLUMNS] + export[GOOGLE_SHEET_TEMPLATE_COLUMNS].values.tolist()
     sheet.clear()
     if values:
         sheet.update(values)
