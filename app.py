@@ -23,6 +23,7 @@ from race_day import (
     GOOGLE_SHEET_TEMPLATE_COLUMNS,
     append_manual_lap,
     build_progress_actuals,
+    build_live_fair_queue,
     build_runner_queue,
     build_runner_status_table,
     complete_in_progress_lap,
@@ -35,6 +36,7 @@ from race_day import (
     parse_race_time_to_minute,
     race_order_review,
     race_state_from_log,
+    rank_live_next_runner_options,
     read_race_log_from_google_sheet_url,
     read_race_log_from_google_sheet,
     target_pace_series,
@@ -52,7 +54,7 @@ from simulation_engine import (
 
 st.set_page_config(page_title="Endure24 Relay Monte Carlo", layout="wide")
 
-ASSUMPTION_VERSION = "zero-fatigue-night-defaults-v1"
+ASSUMPTION_VERSION = "zero-fatigue-midnight-night-defaults-v2"
 DEFAULT_EDITABLE_GOOGLE_SHEET_URL = (
     "https://docs.google.com/spreadsheets/d/1dKvzME6TL4EJ8u_f0-l2p7ZENBwj7TUZLt0cW0T7QHo/edit?usp=sharing"
 )
@@ -452,7 +454,7 @@ def make_settings() -> SimulationSettings:
     night_start_minute = st.sidebar.selectbox(
         "Night starts",
         clock_options,
-        index=clock_options.index(9 * 60),
+        index=clock_options.index(12 * 60),
         format_func=format_race_clock,
     )
     night_end_minute = st.sidebar.selectbox(
@@ -467,7 +469,8 @@ def make_settings() -> SimulationSettings:
 
     st.sidebar.subheader("Model Toggles")
     fatigue_enabled = st.sidebar.checkbox("Apply fatigue", value=True)
-    night_penalty_enabled = st.sidebar.checkbox("Apply night penalties", value=True)
+    night_penalty_enabled = st.sidebar.checkbox("Apply night penalties", value=False)
+    st.sidebar.caption("Night penalties only affect simulations when this toggle is on.")
     transition_mistakes_enabled = st.sidebar.checkbox("Model transition mistakes", value=True)
 
     st.sidebar.subheader("Transitions")
@@ -832,6 +835,7 @@ def set_race_log(log: pd.DataFrame, roster: pd.DataFrame) -> pd.DataFrame:
     st.session_state["race_log_changed"] = changed
     if changed:
         st.session_state.pop("race_day_forecast", None)
+        st.session_state.pop("race_day_plan_ranking", None)
     return clean
 
 
@@ -967,6 +971,112 @@ def show_race_control_dashboard(
         )
 
 
+def queue_next_runner(queue: pd.DataFrame) -> str:
+    if queue.empty or "runner" not in queue:
+        return ""
+    if "role" in queue:
+        next_rows = queue[queue["role"].astype(str).eq("Next")]
+        if not next_rows.empty:
+            return str(next_rows.iloc[0]["runner"])
+        non_current = queue[~queue["role"].astype(str).eq("Current")]
+        if not non_current.empty:
+            return str(non_current.iloc[0]["runner"])
+    return str(queue.iloc[0]["runner"])
+
+
+def show_race_day_plan_assistant(
+    log: pd.DataFrame,
+    roster: pd.DataFrame,
+    settings: SimulationSettings,
+    state,
+    caps_enabled: bool,
+) -> None:
+    st.markdown("### Plan Assistant")
+    fixed_queue = build_runner_queue(log, roster, caps_enabled=caps_enabled, queue_size=5)
+    fair_queue = build_live_fair_queue(log, roster, caps_enabled=caps_enabled, queue_size=5)
+    fixed_next = queue_next_runner(fixed_queue) or state.next_runner or ""
+    fair_next = queue_next_runner(fair_queue)
+
+    cols = st.columns(3)
+    cols[0].metric("Recommended next", fair_next or "No eligible runner")
+    cols[1].metric("Fixed order next", fixed_next or "No eligible runner")
+    cols[2].metric("Plan rule", "Fair live rotation")
+
+    if fair_next and fixed_next and fair_next != fixed_next:
+        st.warning(
+            f"Live fair rotation recommends {fair_next}; the fixed pre-race order expects {fixed_next}. "
+            "Completed laps stay fixed either way."
+        )
+    elif fair_next:
+        st.caption("Live fair rotation agrees with the fixed order for the next runner.")
+    else:
+        st.info("No eligible runner is available under the current roster and cap settings.")
+
+    st.caption(
+        "The live queue learns the order used on the day, then moves whoever ran most recently to the back. "
+        "That keeps the rotation fair after any manual order change."
+    )
+    if fair_queue.empty:
+        st.info("The live fair queue is empty.")
+    else:
+        st.dataframe(
+            format_runner_queue_for_display(fair_queue),
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "role": "Slot",
+                "runner": "Runner",
+                "completed_laps": st.column_config.NumberColumn("Laps", format="%d"),
+                "cap_remaining": "Cap left",
+                "last_lap": "Last",
+                "rest": "Rest",
+                "order_status": "Basis",
+                "reason": "Why",
+            },
+        )
+
+    compare_cols = st.columns([1, 1.4])
+    if compare_cols[0].button("Compare race-day plans", width="stretch"):
+        with st.spinner("Comparing fixed order vs live fair queue..."):
+            st.session_state["race_day_plan_ranking"] = rank_live_next_runner_options(
+                log,
+                roster,
+                settings,
+                caps_enabled=caps_enabled,
+            )
+    compare_cols[1].caption("Comparison uses maximum expected official laps, with target probability shown.")
+
+    ranking = st.session_state.get("race_day_plan_ranking")
+    if isinstance(ranking, pd.DataFrame) and not ranking.empty:
+        st.dataframe(
+            ranking.style.format(
+                {
+                    "expected_official_laps": "{:.2f}",
+                    "median_official_laps": "{:.1f}",
+                    "p10_official_laps": "{:.1f}",
+                    "p90_official_laps": "{:.1f}",
+                    "probability_target_laps": "{:.1%}",
+                    "probability_target_plus_one_laps": "{:.1%}",
+                    "probability_missed_final_cutoff": "{:.1%}",
+                    "probability_ran_out_of_eligible_runners": "{:.1%}",
+                }
+            ),
+            width="stretch",
+            hide_index=True,
+        )
+
+
+def show_race_day_sync_status() -> None:
+    live_reload = "On" if st.session_state.get("race_day_live_sheet_enabled") else "Off"
+    last_load = st.session_state.get("editable_google_sheet_last_loaded", "-")
+    last_save = st.session_state.get("race_day_sheet_last_saved", "-")
+    with st.container(border=True):
+        cols = st.columns(3)
+        cols[0].metric("Sheet live reload", live_reload)
+        cols[1].metric("Last Sheet load", str(last_load))
+        cols[2].metric("Last Sheet save", str(last_save))
+
+
 def race_mini_card(label: str, value: str, help_text: str) -> None:
     st.markdown(
         f"""
@@ -1017,7 +1127,7 @@ def format_runner_queue_for_display(queue: pd.DataFrame) -> pd.DataFrame:
     display = queue.copy()
     display["last_lap"] = display["last_lap_minutes"].map(lambda value: "-" if pd.isna(value) else f"{float(value):.1f}m")
     display["rest"] = display["rest_minutes"].map(lambda value: "-" if pd.isna(value) else f"{float(value):.0f}m")
-    columns = ["role", "runner", "completed_laps", "cap_remaining", "last_lap", "rest", "order_status"]
+    columns = ["role", "runner", "completed_laps", "cap_remaining", "last_lap", "rest", "order_status", "reason"]
     return display[[column for column in columns if column in display.columns]]
 
 
@@ -1536,6 +1646,8 @@ def show_race_day(roster: pd.DataFrame, settings: SimulationSettings, caps_enabl
         errors,
         caps_enabled,
     )
+    show_race_day_plan_assistant(log, roster, settings, state, caps_enabled)
+    show_race_day_sync_status()
     show_race_day_alerts(warnings, errors)
 
     c1, c2 = st.columns([1, 1])
@@ -2571,8 +2683,8 @@ def main() -> None:
 
         st.subheader("This Year Assumptions")
         st.info(
-            "Fatigue and night penalties now default to 0.0%. They are editable per runner here if you want "
-            "to add a conservative slowdown assumption. "
+            "Per-runner fatigue and night penalty values default to 0.0%. Night penalties are also toggled off "
+            "in the sidebar by default. You can edit these if you want to add a conservative slowdown assumption. "
             "Last-year day/night and fatigue stats are shown below where the workbook has enough data, but the app "
             "does not apply them automatically."
         )

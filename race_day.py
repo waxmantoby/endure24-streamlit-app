@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from io import StringIO
 import json
 import re
@@ -17,6 +17,7 @@ from simulation_engine import (
     LAST_START_MINUTE,
     SimulationSettings,
     simulate_many_from_state,
+    summarize_results,
 )
 
 
@@ -507,6 +508,147 @@ def build_runner_queue(
     return pd.DataFrame(rows, columns=columns)
 
 
+def build_live_fair_order(log: pd.DataFrame, roster: pd.DataFrame, caps_enabled: bool = True) -> list[str]:
+    order = _available_order(roster)
+    if not order:
+        return []
+
+    clean = normalise_race_log(log, roster)
+    learned_order = _learned_live_order(clean, order)
+    learned_lookup = {runner: index for index, runner in enumerate(learned_order)}
+    last_seen = {runner: -1 for runner in order}
+    for sequence, row in enumerate(clean.sort_values("lap_number").itertuples(index=False)):
+        runner = str(row.runner).strip()
+        if runner in last_seen:
+            last_seen[runner] = sequence
+
+    return sorted(order, key=lambda runner: (last_seen.get(runner, -1), learned_lookup.get(runner, len(order))))
+
+
+def build_live_fair_queue(
+    log: pd.DataFrame,
+    roster: pd.DataFrame,
+    caps_enabled: bool = True,
+    queue_size: int = 5,
+) -> pd.DataFrame:
+    clean = normalise_race_log(log, roster)
+    state = race_state_from_log(clean, roster, target_laps=1, caps_enabled=caps_enabled)
+    fair_order = build_live_fair_order(clean, roster, caps_enabled=caps_enabled)
+    columns = [
+        "role",
+        "runner",
+        "completed_laps",
+        "cap_remaining",
+        "last_lap_minutes",
+        "rest_minutes",
+        "order_status",
+        "reason",
+    ]
+    if not fair_order:
+        return pd.DataFrame(columns=columns)
+
+    roster_lookup = _roster_lookup(roster)
+    completed = clean.dropna(subset=["finish_minute", "lap_duration_minutes"]).copy()
+    eligible = [
+        runner
+        for runner in fair_order
+        if _runner_has_capacity(runner, roster_lookup, state.runner_lap_counts, caps_enabled)
+    ]
+    if state.current_lap_in_progress and state.in_progress_runner in eligible and len(eligible) > 1:
+        eligible = [runner for runner in eligible if runner != state.in_progress_runner]
+
+    rows: list[dict[str, Any]] = []
+    if state.current_lap_in_progress and state.in_progress_runner in fair_order:
+        current = _runner_queue_row(
+            role="Current",
+            runner=str(state.in_progress_runner),
+            state=state,
+            completed=completed,
+            roster_lookup=roster_lookup,
+            caps_enabled=caps_enabled,
+            order_status="Running",
+        )
+        current["reason"] = "In progress"
+        rows.append(current)
+
+    for index, runner in enumerate(eligible[: int(queue_size)]):
+        row = _runner_queue_row(
+            role="Next" if index == 0 else f"+{index + 1}",
+            runner=runner,
+            state=state,
+            completed=completed,
+            roster_lookup=roster_lookup,
+            caps_enabled=caps_enabled,
+            order_status="Live fair",
+        )
+        row["reason"] = "Least recent eligible runner" if index == 0 else "Fair rotation"
+        rows.append(row)
+
+    return pd.DataFrame(rows, columns=columns)
+
+
+def rank_live_next_runner_options(
+    log: pd.DataFrame,
+    roster: pd.DataFrame,
+    settings: SimulationSettings,
+    caps_enabled: bool = True,
+) -> pd.DataFrame:
+    clean = normalise_race_log(log, roster)
+    state = race_state_from_log(clean, roster, settings.target_laps, caps_enabled=caps_enabled)
+    fair_order = build_live_fair_order(clean, roster, caps_enabled=caps_enabled)
+    fixed_order = _available_order(roster)
+    if not fixed_order:
+        return pd.DataFrame()
+
+    rows: list[dict[str, Any]] = []
+    eval_settings = replace(
+        settings,
+        n_simulations=max(300, min(int(settings.n_simulations), 1_000)),
+        path_sample_size=0,
+    )
+
+    rows.append(
+        _evaluate_live_continuation(
+            label="Fixed roster order",
+            roster=roster,
+            order=fixed_order,
+            start_pointer=state.next_runner_index,
+            state=state,
+            settings=eval_settings,
+            caps_enabled=caps_enabled,
+            target_laps=settings.target_laps,
+        )
+    )
+
+    fair_sim_order = _simulation_order_for_live_fair(fair_order, state)
+    if fair_sim_order:
+        rows.append(
+            _evaluate_live_continuation(
+                label="Live fair queue",
+                roster=roster,
+                order=fair_sim_order,
+                start_pointer=0,
+                state=state,
+                settings=replace(
+                    eval_settings,
+                    random_seed=None if eval_settings.random_seed is None else int(eval_settings.random_seed) + 991,
+                ),
+                caps_enabled=caps_enabled,
+                target_laps=settings.target_laps,
+            )
+        )
+
+    ranking = pd.DataFrame(rows)
+    if ranking.empty:
+        return ranking
+    ranking = ranking.sort_values(
+        ["expected_official_laps", "probability_target_laps", "p10_official_laps"],
+        ascending=[False, False, False],
+    ).reset_index(drop=True)
+    ranking.insert(0, "rank", np.arange(1, len(ranking) + 1))
+    return ranking
+
+
 def build_runner_status_table(
     log: pd.DataFrame,
     roster: pd.DataFrame,
@@ -886,6 +1028,111 @@ def _number_or_default(value: Any, default: int) -> int:
     if pd.isna(number):
         return int(default)
     return int(number)
+
+
+def _learned_live_order(clean: pd.DataFrame, base_order: list[str]) -> list[str]:
+    seen: list[str] = []
+    for runner in clean.sort_values("lap_number")["runner"].astype(str).str.strip():
+        if runner in base_order and runner not in seen:
+            seen.append(runner)
+    return seen + [runner for runner in base_order if runner not in seen]
+
+
+def _runner_has_capacity(
+    runner: str,
+    roster_lookup: dict[str, dict[str, Any]],
+    runner_lap_counts: dict[str, int],
+    caps_enabled: bool,
+) -> bool:
+    if not caps_enabled:
+        return True
+    cap = pd.to_numeric(roster_lookup.get(str(runner), {}).get("max_laps"), errors="coerce")
+    if pd.isna(cap):
+        return True
+    return int(runner_lap_counts.get(str(runner), 0)) < int(cap)
+
+
+def _apply_live_order_to_roster(roster: pd.DataFrame, order: list[str]) -> pd.DataFrame:
+    ordered = roster.copy()
+    order_lookup = {runner: index + 1 for index, runner in enumerate(order)}
+    max_order = len(order_lookup)
+
+    def live_order(row: pd.Series) -> float:
+        runner = str(row.get("runner", "")).strip()
+        if runner in order_lookup:
+            return float(order_lookup[runner])
+        fallback = pd.to_numeric(row.get("running_order"), errors="coerce")
+        return float(max_order + 1 if pd.isna(fallback) else max_order + fallback)
+
+    ordered["running_order"] = ordered.apply(live_order, axis=1)
+    return ordered.sort_values(["running_order", "runner"]).reset_index(drop=True)
+
+
+def _simulation_order_for_live_fair(fair_order: list[str], state: RaceState) -> list[str]:
+    if state.current_lap_in_progress and state.in_progress_runner in fair_order:
+        current = str(state.in_progress_runner)
+        return [current] + [runner for runner in fair_order if runner != current]
+    return list(fair_order)
+
+
+def _visible_next_runner(
+    order: list[str],
+    state: RaceState,
+    roster_lookup: dict[str, dict[str, Any]],
+    caps_enabled: bool,
+) -> str:
+    if not order:
+        return ""
+    start = 0
+    if state.current_lap_in_progress and state.in_progress_runner in order:
+        start = (order.index(str(state.in_progress_runner)) + 1) % len(order)
+    elif state.next_runner in order:
+        start = order.index(str(state.next_runner))
+
+    for offset in range(len(order)):
+        runner = order[(start + offset) % len(order)]
+        if _runner_has_capacity(runner, roster_lookup, state.runner_lap_counts, caps_enabled):
+            return runner
+    return ""
+
+
+def _evaluate_live_continuation(
+    label: str,
+    roster: pd.DataFrame,
+    order: list[str],
+    start_pointer: int,
+    state: RaceState,
+    settings: SimulationSettings,
+    caps_enabled: bool,
+    target_laps: int,
+) -> dict[str, Any]:
+    ordered_roster = _apply_live_order_to_roster(roster, order)
+    sim_output = simulate_many_from_state(
+        ordered_roster,
+        settings,
+        elapsed_minute=state.elapsed_minute,
+        next_runner_index=int(start_pointer),
+        runner_lap_counts=state.runner_lap_counts,
+        official_laps_so_far=state.current_laps,
+        laps_by_noon_so_far=state.laps_by_noon,
+        caps_enabled=caps_enabled,
+        first_transition_already_applied=state.current_lap_in_progress,
+    )
+    summary = summarize_results(sim_output, target_laps)["summary"]
+    next_runner = _visible_next_runner(order, state, _roster_lookup(roster), caps_enabled)
+    return {
+        "scenario": label,
+        "recommended_next": next_runner,
+        "order_preview": " -> ".join(order[:5]) + (" ..." if len(order) > 5 else ""),
+        "expected_official_laps": summary["expected_official_laps"],
+        "median_official_laps": summary["median_official_laps"],
+        "p10_official_laps": summary["p10_official_laps"],
+        "p90_official_laps": summary["p90_official_laps"],
+        "probability_target_laps": summary["probability_target_laps"],
+        "probability_target_plus_one_laps": summary["probability_target_plus_one_laps"],
+        "probability_missed_final_cutoff": summary["probability_missed_final_cutoff"],
+        "probability_ran_out_of_eligible_runners": summary["probability_ran_out_of_eligible_runners"],
+    }
 
 
 def _roster_lookup(roster: pd.DataFrame) -> dict[str, dict[str, Any]]:

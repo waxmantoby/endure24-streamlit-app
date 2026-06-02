@@ -25,11 +25,11 @@ class SimulationSettings:
     n_simulations: int = 10_000
     target_laps: int = 40
     random_seed: int | None = 42
-    night_start_minute: float = 9 * 60
+    night_start_minute: float = 12 * 60
     night_end_minute: float = 18 * 60
     distribution: str = "truncated_normal"
     fatigue_enabled: bool = True
-    night_penalty_enabled: bool = True
+    night_penalty_enabled: bool = False
     transition_mistakes_enabled: bool = True
     base_transition_seconds: float = 0.0
     transition_mistake_probability_per_lap: float = 0.01
