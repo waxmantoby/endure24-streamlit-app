@@ -224,22 +224,23 @@ Google Sheets write-back is optional. Without credentials, the Race Day tab stil
 Add these Streamlit secrets to enable sync:
 
 ```toml
-google_sheet_id = "your-google-sheet-id"
+google_sheet_id = "1dKvzME6TL4EJ8u_f0-l2p7ZENBwj7TUZLt0cW0T7QHo"
 
-[gcp_service_account]
-type = "service_account"
-project_id = "..."
-private_key_id = "..."
-private_key = "-----BEGIN PRIVATE KEY-----\\n...\\n-----END PRIVATE KEY-----\\n"
-client_email = "..."
-client_id = "..."
-auth_uri = "https://accounts.google.com/o/oauth2/auth"
-token_uri = "https://oauth2.googleapis.com/token"
-auth_provider_x509_cert_url = "https://www.googleapis.com/oauth2/v1/certs"
-client_x509_cert_url = "..."
+gcp_service_account_json = """
+PASTE THE FULL SERVICE ACCOUNT JSON KEY HERE
+"""
 ```
 
-Share the Google Sheet with the service account `client_email`. The app reads and writes a worksheet named `race_log`.
+Service-account setup:
+
+1. Create a Google Cloud project, or use an existing one.
+2. Enable the Google Sheets API.
+3. Create a service account.
+4. Create and download a JSON key for that service account.
+5. Share the Google Sheet with the service account `client_email` as Editor.
+6. Copy `.streamlit/secrets.toml.example` into Streamlit Community Cloud secrets and replace the JSON placeholder with the downloaded key.
+
+The app reads and writes a worksheet named `race_log`.
 
 ## Fatigue and Night Penalty Sources
 

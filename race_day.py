@@ -470,7 +470,13 @@ def _secret_value(secrets: Mapping[str, Any], *keys: str) -> Any:
 
 
 def _service_account_info(secrets: Mapping[str, Any]) -> dict[str, Any] | None:
-    value = _secret_value(secrets, "gcp_service_account", "google_service_account")
+    value = _secret_value(
+        secrets,
+        "gcp_service_account",
+        "google_service_account",
+        "gcp_service_account_json",
+        "google_service_account_json",
+    )
     if not value:
         return None
     if isinstance(value, str):
