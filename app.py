@@ -1387,7 +1387,9 @@ def show_race_log_entry(
         st.warning("Add at least one available runner before logging race laps.")
         return log
 
-    next_runner_index = runner_options.index(state.next_runner) if state.next_runner in runner_options else 0
+    fair_queue = build_live_fair_queue(log, roster, caps_enabled=caps_enabled, queue_size=1)
+    recommended_runner = queue_next_runner(fair_queue) or state.next_runner
+    next_runner_index = runner_options.index(recommended_runner) if recommended_runner in runner_options else 0
 
     st.markdown("#### Add Race Entry")
     with st.form("manual_lap_form", clear_on_submit=True):
@@ -1409,10 +1411,17 @@ def show_race_log_entry(
                 f"Completing lap {int(state.latest_lap['lap_number'])}, started {format_race_clock(state.in_progress_start_minute)}."
             )
         notes = top_cols[2].text_input("Notes", value="")
-        if action != "Complete current lap" and state.next_runner and runner != state.next_runner:
+        if action != "Complete current lap" and recommended_runner and runner != recommended_runner:
             st.warning(
-                f"Fixed order expects {state.next_runner}. Saving {runner} is allowed and will be marked as an order exception."
+                f"Plan Assistant recommends {recommended_runner}. Saving {runner} is allowed if the team has changed the plan."
             )
+        elif action != "Complete current lap" and state.next_runner and runner != state.next_runner:
+            st.info(
+                f"Live plan uses {runner}; fixed pre-race order expected {state.next_runner}. "
+                "The lap will be saved and tracked as an order exception."
+            )
+        elif action != "Complete current lap" and recommended_runner:
+            top_cols[1].caption(f"Recommended by Plan Assistant: {recommended_runner}")
 
         start_minute = None
         finish_minute = None
