@@ -646,7 +646,7 @@ def show_race_day_metrics(state, live_bundle: dict | None, target_laps: int) -> 
 
 def show_google_sheet_controls(log: pd.DataFrame, roster: pd.DataFrame) -> pd.DataFrame:
     default_sheet_id = get_streamlit_secret("google_sheet_id", "race_log_google_sheet_id") or ""
-    with st.expander("Google Sheets sync", expanded=False):
+    with st.expander("Google Sheets sync", expanded=True):
         c1, c2 = st.columns([2, 1])
         sheet_id = c1.text_input("Sheet ID", value=str(default_sheet_id), placeholder="Google Sheet ID")
         worksheet_name = c2.text_input("Worksheet", value="race_log")
