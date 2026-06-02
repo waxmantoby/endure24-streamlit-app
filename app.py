@@ -1065,18 +1065,39 @@ def show_race_day_plan_assistant(
         )
 
 
-def show_race_day_sync_status(sync: Mapping[str, Any]) -> None:
-    configured = bool(sync.get("configured"))
-    live_reload = "On" if st.session_state.get("race_day_live_sheet_enabled", configured) else "Off"
-    sync_state = "Ready" if configured else "Not configured"
+def show_race_day_sync_status() -> None:
     last_load = st.session_state.get("editable_google_sheet_last_loaded", "-")
     last_save = st.session_state.get("race_day_sheet_last_saved", "-")
     with st.container(border=True):
+        st.markdown("#### Sheet Activity")
+        cols = st.columns(2)
+        cols[0].metric("Last load", str(last_load))
+        cols[1].metric("Last save", str(last_save))
+
+
+def show_race_day_readiness(
+    sync: Mapping[str, Any],
+    warnings: list[str],
+    errors: list[str],
+    live_bundle: dict | None,
+) -> None:
+    sheet_state = "Ready" if sync.get("configured") else "Check setup"
+    live_state = "On" if st.session_state.get("race_day_live_sheet_enabled", bool(sync.get("configured"))) else "Off"
+    if errors:
+        log_state = f"{len(errors)} fix"
+    elif warnings:
+        log_state = f"{len(warnings)} watch"
+    else:
+        log_state = "Clean"
+    forecast_state = "Live" if live_bundle else "Run forecast"
+
+    with st.container(border=True):
+        st.markdown("#### Race-Day Checklist")
         cols = st.columns(4)
-        cols[0].metric("Google Sheet", sync_state)
-        cols[1].metric("Live reload", live_reload)
-        cols[2].metric("Last load", str(last_load))
-        cols[3].metric("Last save", str(last_save))
+        cols[0].metric("Google Sheet", sheet_state)
+        cols[1].metric("Auto reload", live_state)
+        cols[2].metric("Race log", log_state)
+        cols[3].metric("Forecast", forecast_state)
 
 
 def race_mini_card(label: str, value: str, help_text: str) -> None:
@@ -1649,7 +1670,8 @@ def show_race_day(roster: pd.DataFrame, settings: SimulationSettings, caps_enabl
         caps_enabled,
     )
     show_race_day_plan_assistant(log, roster, settings, state, caps_enabled)
-    show_race_day_sync_status(race_sync)
+    show_race_day_readiness(race_sync, warnings, errors, live_bundle)
+    show_race_day_sync_status()
     show_race_day_alerts(warnings, errors)
 
     st.markdown("### Lap Desk")
@@ -2660,24 +2682,27 @@ def show_drinks_tab(roster: pd.DataFrame) -> None:
 
 def main() -> None:
     inject_app_styles()
-    st.title("Endure24 Relay Monte Carlo")
-    st.caption("Race rule model: starts through Sunday 12:00 count if the lap finishes by Sunday 13:00.")
+    st.title("Endure24 Race Control")
+    st.caption("Race-day monitoring, live Sheet logging, forecast, optimiser, and team tracking.")
 
-    uploaded = st.file_uploader("Upload Endure24 workbook", type=["xlsx", "xls"])
-    if uploaded is not None:
-        workbook_bytes = uploaded.getvalue()
-        source_label = uploaded.name
-    else:
-        workbook_bytes = DEFAULT_DATA_PATH.read_bytes()
-        source_label = str(DEFAULT_DATA_PATH)
+    with st.expander("Admin setup", expanded=False):
+        st.caption("Race rule model: starts through Sunday 12:00 count if the lap finishes by Sunday 13:00.")
+        uploaded = st.file_uploader("Upload Endure24 workbook", type=["xlsx", "xls"])
+        if uploaded is not None:
+            workbook_bytes = uploaded.getvalue()
+            source_label = uploaded.name
+        else:
+            workbook_bytes = DEFAULT_DATA_PATH.read_bytes()
+            source_label = str(DEFAULT_DATA_PATH)
+        st.caption(f"Workbook source: {source_label}")
 
     loaded = load_data_cached(workbook_bytes, source_label, ASSUMPTION_VERSION)
     settings = make_settings()
     st.sidebar.subheader("Race Rules")
     caps_enabled = st.sidebar.checkbox("Apply max-lap caps", value=True)
 
-    setup_tab, forecast_tab, optimiser_tab, race_day_tab, drinks_tab, what_if_tab, exports_tab = st.tabs(
-        ["Setup", "Forecast", "Optimiser", "Race Day", "Drinks", "What-if", "Exports"]
+    race_day_tab, forecast_tab, optimiser_tab, drinks_tab, what_if_tab, exports_tab, setup_tab = st.tabs(
+        ["Race Day", "Forecast", "Optimiser", "Drinks", "What-if", "Exports", "Setup"]
     )
 
     with setup_tab:
