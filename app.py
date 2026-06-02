@@ -1080,6 +1080,10 @@ def show_race_day_readiness(
     warnings: list[str],
     errors: list[str],
     live_bundle: dict | None,
+    roster: pd.DataFrame,
+    settings: SimulationSettings,
+    log: pd.DataFrame,
+    caps_enabled: bool,
 ) -> None:
     sheet_state = "Ready" if sync.get("configured") else "Check setup"
     live_state = "On" if st.session_state.get("race_day_live_sheet_enabled", bool(sync.get("configured"))) else "Off"
@@ -1098,6 +1102,23 @@ def show_race_day_readiness(
         cols[1].metric("Auto reload", live_state)
         cols[2].metric("Race log", log_state)
         cols[3].metric("Forecast", forecast_state)
+
+        action_cols = st.columns([1, 2])
+        forecast_disabled = bool(errors)
+        if action_cols[0].button(
+            "Refresh live forecast",
+            type="primary",
+            width="stretch",
+            disabled=forecast_disabled,
+        ):
+            with st.spinner("Refreshing live forecast..."):
+                update_race_day_forecast(roster, settings, log, caps_enabled)
+                st.session_state["race_day_notice"] = "Live forecast refreshed."
+                st.rerun()
+        if forecast_disabled:
+            action_cols[1].caption("Fix race-log errors before refreshing the forecast.")
+        else:
+            action_cols[1].caption("Updates target chance, projected final laps, and the Race Control plot.")
 
 
 def race_mini_card(label: str, value: str, help_text: str) -> None:
@@ -1679,7 +1700,7 @@ def show_race_day(roster: pd.DataFrame, settings: SimulationSettings, caps_enabl
         caps_enabled,
     )
     show_race_day_plan_assistant(log, roster, settings, state, caps_enabled)
-    show_race_day_readiness(race_sync, warnings, errors, live_bundle)
+    show_race_day_readiness(race_sync, warnings, errors, live_bundle, roster, settings, log, caps_enabled)
     show_race_day_sync_status()
     show_race_day_alerts(warnings, errors)
 
