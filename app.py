@@ -2188,7 +2188,7 @@ def drinks_digest(table: pd.DataFrame) -> str:
     return hashlib.sha256(table[["runner", "count", "notes"]].to_csv(index=False).encode("utf-8")).hexdigest()
 
 
-def show_drinks_sheet_controls(table: pd.DataFrame, roster: pd.DataFrame) -> pd.DataFrame:
+def drinks_sheet_context() -> dict[str, Any]:
     default_sheet_id = get_streamlit_secret("google_sheet_id", "race_log_google_sheet_id") or ""
     default_sheet_id = st.session_state.get("race_day_sheet_id", default_sheet_id)
     st.session_state.setdefault("drinks_sheet_id", str(default_sheet_id))
@@ -2196,27 +2196,56 @@ def show_drinks_sheet_controls(table: pd.DataFrame, roster: pd.DataFrame) -> pd.
 
     sheet_id = str(st.session_state.get("drinks_sheet_id") or default_sheet_id).strip()
     worksheet_name = str(st.session_state.get("drinks_worksheet_name") or "drinks").strip() or "drinks"
-    configured = google_sheets_configured(st.secrets, sheet_id or None)
+    return {
+        "sheet_id": sheet_id,
+        "worksheet_name": worksheet_name,
+        "configured": google_sheets_configured(st.secrets, sheet_id or None),
+    }
+
+
+def save_drinks_live(table: pd.DataFrame, sync: Mapping[str, Any], notice: str | None = None) -> pd.DataFrame:
+    clean = set_drinks_state(table)
+    if not sync.get("configured"):
+        st.session_state["drinks_sheet_notice"] = "Saved locally. Google Sheets is not configured."
+        return clean
+
+    write_drinks_to_google_sheet(
+        drinks_sheet_payload(clean),
+        st.secrets,
+        sheet_id=sync.get("sheet_id") or None,
+        worksheet_name=str(sync.get("worksheet_name") or "drinks"),
+    )
+    saved_at = pd.Timestamp.now().strftime("%H:%M:%S")
+    st.session_state["drinks_sheet_last_saved"] = saved_at
+    st.session_state["drinks_sheet_notice"] = notice or f"Drinks saved to Google Sheet at {saved_at}."
+    return clean
+
+
+def show_drinks_sheet_controls(table: pd.DataFrame, roster: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any]]:
+    sync = drinks_sheet_context()
+    sheet_id = str(sync["sheet_id"])
+    worksheet_name = str(sync["worksheet_name"])
+    configured = bool(sync["configured"])
 
     with st.container(border=True):
         top_cols = st.columns([1.5, 1, 1])
         with top_cols[0]:
             st.markdown("#### Drinks Sheet")
             if configured:
-                st.caption("Connected to the same Google Sheet using a separate drinks worksheet.")
+                st.caption("Live sync is on. Website changes save to the drinks worksheet; Sheet changes reload here.")
             else:
                 st.caption("Google sync is not configured. Local tracking and CSV download still work.")
 
         live_reload = top_cols[1].checkbox(
             "Auto reload",
-            value=st.session_state.get("drinks_live_sheet_enabled", False),
+            value=st.session_state.get("drinks_live_sheet_enabled", configured),
             help="Reloads the drinks worksheet while this tab is open.",
         )
         refresh_seconds = top_cols[2].number_input(
             "Every seconds",
             min_value=10,
             max_value=300,
-            value=int(st.session_state.get("drinks_live_refresh_seconds", 30)),
+            value=int(st.session_state.get("drinks_live_refresh_seconds", 15)),
             step=5,
             key="drinks_refresh_seconds_input",
         )
@@ -2259,15 +2288,14 @@ def show_drinks_sheet_controls(table: pd.DataFrame, roster: pd.DataFrame) -> pd.
 
         if st.session_state.get("drinks_sheet_last_loaded"):
             st.caption(f"Last drinks load: {st.session_state['drinks_sheet_last_loaded']}.")
+        if st.session_state.get("drinks_sheet_last_saved"):
+            st.caption(f"Last drinks save: {st.session_state['drinks_sheet_last_saved']}.")
+        if st.session_state.get("drinks_sheet_notice"):
+            st.success(st.session_state.pop("drinks_sheet_notice"))
 
         if save_now and configured:
             try:
-                write_drinks_to_google_sheet(
-                    drinks_sheet_payload(table),
-                    st.secrets,
-                    sheet_id=sheet_id or None,
-                    worksheet_name=worksheet_name,
-                )
+                table = save_drinks_live(table, sync, "Drinks saved to Google Sheet.")
                 st.success("Drinks saved to Google Sheet.")
             except Exception as exc:
                 st.error(f"Could not save drinks worksheet: {exc}")
@@ -2277,7 +2305,7 @@ def show_drinks_sheet_controls(table: pd.DataFrame, roster: pd.DataFrame) -> pd.
             settings_cols[0].text_input("Sheet ID", key="drinks_sheet_id", placeholder="Google Sheet ID")
             settings_cols[1].text_input("Worksheet", key="drinks_worksheet_name")
 
-    return drinks_state_table(roster)
+    return drinks_state_table(roster), sync
 
 
 def show_drinks_tab(roster: pd.DataFrame) -> None:
@@ -2286,7 +2314,7 @@ def show_drinks_tab(roster: pd.DataFrame) -> None:
     st.session_state["current_roster_for_drinks"] = roster.copy()
 
     table = drinks_state_table(roster)
-    table = show_drinks_sheet_controls(table, roster)
+    table, drinks_sync = show_drinks_sheet_controls(table, roster)
     if table.empty:
         st.info("Add runners in Setup before tracking drinks.")
         return
@@ -2313,7 +2341,15 @@ def show_drinks_tab(roster: pd.DataFrame) -> None:
             ):
                 updated = table.copy()
                 updated.loc[updated["runner"].astype(str) == str(row.runner), "count"] += 1
-                set_drinks_state(updated)
+                try:
+                    save_drinks_live(
+                        updated,
+                        drinks_sync,
+                        f"Added 1 for {row.runner} and saved to Google Sheet.",
+                    )
+                except Exception as exc:
+                    set_drinks_state(updated)
+                    st.session_state["drinks_sheet_notice"] = f"Updated locally, but could not save to Sheet: {exc}"
                 st.rerun()
 
     edited = st.data_editor(
@@ -2326,17 +2362,38 @@ def show_drinks_tab(roster: pd.DataFrame) -> None:
             "unit": st.column_config.TextColumn("Unit", disabled=True),
             "notes": st.column_config.TextColumn("Notes"),
         },
-        key="drinks_tracker_editor",
+        key=f"drinks_tracker_editor_{drinks_digest(table)[:12]}",
     )
+    edited_clean = normalise_drinks_table(edited, roster)
+    if drinks_digest(edited_clean) != drinks_digest(table):
+        try:
+            save_drinks_live(edited_clean, drinks_sync, "Drink table edit saved to Google Sheet.")
+        except Exception as exc:
+            set_drinks_state(edited_clean)
+            st.session_state["drinks_sheet_notice"] = f"Updated locally, but could not save to Sheet: {exc}"
+        st.rerun()
+
     action_cols = st.columns(3)
-    if action_cols[0].button("Save drink table", type="primary", width="stretch"):
-        saved = set_drinks_state(edited)
-        st.success(f"Saved {int(saved['count'].sum())} total logged items.")
+    if action_cols[0].button(
+        "Force save to Sheet",
+        type="primary",
+        width="stretch",
+        disabled=not drinks_sync.get("configured"),
+    ):
+        try:
+            saved = save_drinks_live(edited, drinks_sync, "Drinks forced saved to Google Sheet.")
+            st.success(f"Saved {int(saved['count'].sum())} total logged items.")
+        except Exception as exc:
+            st.error(f"Could not save drinks worksheet: {exc}")
     if action_cols[1].button("Reset drinks", width="stretch"):
         reset = table.copy()
         reset["count"] = 0
         reset["notes"] = ""
-        set_drinks_state(reset)
+        try:
+            save_drinks_live(reset, drinks_sync, "Drinks reset and saved to Google Sheet.")
+        except Exception as exc:
+            set_drinks_state(reset)
+            st.session_state["drinks_sheet_notice"] = f"Reset locally, but could not save to Sheet: {exc}"
         st.rerun()
     action_cols[2].download_button(
         "Download drinks CSV",
