@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import hashlib
 from pathlib import Path
 
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+
+try:
+    from streamlit_autorefresh import st_autorefresh
+except Exception:  # pragma: no cover - optional dependency for live Sheet refresh.
+    st_autorefresh = None
 
 from data_loader import DEFAULT_DATA_PATH, load_endure_workbook, validate_roster
 from optimizer import optimize_running_orders
@@ -37,6 +43,9 @@ from simulation_engine import (
 st.set_page_config(page_title="Endure24 Relay Monte Carlo", layout="wide")
 
 ASSUMPTION_VERSION = "zero-fatigue-night-defaults-v1"
+DEFAULT_EDITABLE_GOOGLE_SHEET_URL = (
+    "https://docs.google.com/spreadsheets/d/1dKvzME6TL4EJ8u_f0-l2p7ZENBwj7TUZLt0cW0T7QHo/edit?usp=sharing"
+)
 
 
 def inject_app_styles() -> None:
@@ -616,10 +625,20 @@ def format_race_log_for_display(log: pd.DataFrame) -> pd.DataFrame:
     return display[[column for column in columns if column in display.columns]]
 
 
+def race_log_digest(log: pd.DataFrame) -> str:
+    clean = log.copy()
+    return hashlib.sha256(clean.to_csv(index=False).encode("utf-8")).hexdigest()
+
+
 def set_race_log(log: pd.DataFrame, roster: pd.DataFrame) -> pd.DataFrame:
     clean = normalise_race_log(log, roster)
+    digest = race_log_digest(clean)
+    changed = digest != st.session_state.get("race_log_digest")
     st.session_state["race_log"] = clean
-    st.session_state.pop("race_day_forecast", None)
+    st.session_state["race_log_digest"] = digest
+    st.session_state["race_log_changed"] = changed
+    if changed:
+        st.session_state.pop("race_day_forecast", None)
     return clean
 
 
@@ -664,11 +683,36 @@ def show_google_sheet_controls(log: pd.DataFrame, roster: pd.DataFrame) -> pd.Da
         )
         sheet_url = st.text_input(
             "Editable Google Sheet link",
-            value=st.session_state.get("editable_google_sheet_url", ""),
+            value=st.session_state.get("editable_google_sheet_url", DEFAULT_EDITABLE_GOOGLE_SHEET_URL),
             placeholder="https://docs.google.com/spreadsheets/d/.../edit#gid=0",
         )
         st.session_state["editable_google_sheet_url"] = sheet_url
-        if st.button("Load editable Google Sheet", width="stretch"):
+        c1, c2 = st.columns([1, 1])
+        live_reload = c1.checkbox(
+            "Live reload from this Sheet",
+            value=st.session_state.get("race_day_live_sheet_enabled", False),
+            help="When enabled, the app reloads the Google Sheet automatically while this tab is open.",
+        )
+        refresh_seconds = c2.number_input(
+            "Refresh seconds",
+            min_value=10,
+            max_value=300,
+            value=int(st.session_state.get("race_day_live_refresh_seconds", 30)),
+            step=5,
+        )
+        st.session_state["race_day_live_sheet_enabled"] = live_reload
+        st.session_state["race_day_live_refresh_seconds"] = int(refresh_seconds)
+
+        if live_reload and st_autorefresh is not None:
+            st_autorefresh(
+                interval=int(refresh_seconds) * 1000,
+                key="race_day_live_sheet_autorefresh",
+            )
+        elif live_reload and st_autorefresh is None:
+            st.warning("Live reload needs the streamlit-autorefresh package. Manual loading still works.")
+
+        should_load_sheet = st.button("Load editable Google Sheet now", width="stretch") or live_reload
+        if should_load_sheet:
             try:
                 loaded = read_race_log_from_google_sheet_url(sheet_url, roster)
                 warnings, errors = validate_race_log(loaded, roster)
@@ -677,7 +721,12 @@ def show_google_sheet_controls(log: pd.DataFrame, roster: pd.DataFrame) -> pd.Da
                         st.error(error)
                 else:
                     log = set_race_log(loaded, roster)
-                    st.success("Race log loaded from editable Google Sheet.")
+                    loaded_at = pd.Timestamp.now().strftime("%H:%M:%S")
+                    st.session_state["editable_google_sheet_last_loaded"] = loaded_at
+                    if st.session_state.get("race_log_changed"):
+                        st.success(f"Race log loaded from editable Google Sheet at {loaded_at}.")
+                    else:
+                        st.caption(f"Sheet checked at {loaded_at}; no race-log changes found.")
                     for warning in warnings:
                         st.warning(warning)
             except Exception as exc:
@@ -685,6 +734,8 @@ def show_google_sheet_controls(log: pd.DataFrame, roster: pd.DataFrame) -> pd.Da
                     "Could not load the Google Sheet. Make sure the link is shared so the app can view it, "
                     f"or use File > Share > Publish to web. Details: {exc}"
                 )
+        if st.session_state.get("editable_google_sheet_last_loaded"):
+            st.caption(f"Last successful Sheet load: {st.session_state['editable_google_sheet_last_loaded']}.")
 
         st.divider()
         st.markdown("#### App write-back with service account")
@@ -845,6 +896,26 @@ def show_race_log_backup(log: pd.DataFrame, roster: pd.DataFrame) -> pd.DataFram
     return log
 
 
+def update_race_day_forecast(
+    roster: pd.DataFrame,
+    settings: SimulationSettings,
+    log: pd.DataFrame,
+    caps_enabled: bool,
+) -> tuple[dict, dict]:
+    forecast_settings = replace(settings, path_sample_size=60)
+    baseline_output = simulate_many(roster, forecast_settings, caps_enabled=caps_enabled)
+    live_output = forecast_from_race_log(roster, forecast_settings, log, caps_enabled=caps_enabled)
+    baseline_bundle = summarize_results(baseline_output, settings.target_laps)
+    live_bundle = summarize_results(live_output, settings.target_laps)
+    st.session_state["race_day_forecast"] = {
+        "baseline_bundle": baseline_bundle,
+        "live_bundle": live_bundle,
+        "live_output": live_output,
+    }
+    st.session_state["race_log_changed"] = False
+    return baseline_bundle, live_bundle
+
+
 def show_race_day(roster: pd.DataFrame, settings: SimulationSettings, caps_enabled: bool) -> None:
     st.subheader("Race Day Command Centre")
     if "race_log" not in st.session_state:
@@ -852,7 +923,20 @@ def show_race_day(roster: pd.DataFrame, settings: SimulationSettings, caps_enabl
     log = normalise_race_log(st.session_state["race_log"], roster)
     st.session_state["race_log"] = log
 
+    log = show_google_sheet_controls(log, roster)
     warnings, errors = validate_race_log(log, roster)
+
+    auto_forecast = st.checkbox(
+        "Auto-update forecast when the live Sheet changes",
+        value=st.session_state.get("race_day_live_auto_forecast", True),
+        help="Keeps the forecast current when live Sheet reload detects a changed race log.",
+    )
+    st.session_state["race_day_live_auto_forecast"] = auto_forecast
+    if auto_forecast and st.session_state.get("race_log_changed") and not errors:
+        with st.spinner("Live Sheet changed; updating race-day forecast..."):
+            update_race_day_forecast(roster, settings, log, caps_enabled)
+            st.success("Live Sheet changed; race-day forecast updated.")
+
     state = race_state_from_log(log, roster, settings.target_laps, caps_enabled=caps_enabled)
     live_bundle = st.session_state.get("race_day_forecast", {}).get("live_bundle")
     baseline_bundle = st.session_state.get("race_day_forecast", {}).get("baseline_bundle")
@@ -865,19 +949,13 @@ def show_race_day(roster: pd.DataFrame, settings: SimulationSettings, caps_enabl
                 st.error("Fix race-log errors before forecasting.")
             else:
                 with st.spinner("Updating race-day forecast..."):
-                    forecast_settings = replace(settings, path_sample_size=60)
-                    baseline_output = simulate_many(roster, forecast_settings, caps_enabled=caps_enabled)
-                    live_output = forecast_from_race_log(roster, forecast_settings, log, caps_enabled=caps_enabled)
-                    baseline_bundle = summarize_results(baseline_output, settings.target_laps)
-                    live_bundle = summarize_results(live_output, settings.target_laps)
-                    st.session_state["race_day_forecast"] = {
-                        "baseline_bundle": baseline_bundle,
-                        "live_bundle": live_bundle,
-                        "live_output": live_output,
-                    }
+                    baseline_bundle, live_bundle = update_race_day_forecast(roster, settings, log, caps_enabled)
                     st.success("Race-day forecast updated.")
     with sync_col:
-        log = show_google_sheet_controls(log, roster)
+        if st.session_state.get("race_day_live_sheet_enabled"):
+            st.info("Live Sheet reload is on.")
+        else:
+            st.info("Live Sheet reload is off.")
 
     for warning in warnings:
         st.warning(warning)

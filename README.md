@@ -203,7 +203,8 @@ The simplest race-day setup is an editable Google Sheet owned by `waxmantoby@gma
 3. Import or paste the template headers.
 4. Share the Sheet so the app can view it, or use `File > Share > Publish to web`.
 5. Paste the Sheet link into `Editable Google Sheet link`.
-6. Click `Load editable Google Sheet` whenever you want to refresh the app from the Sheet.
+6. Leave `Live reload from this Sheet` on to refresh automatically while the `Race Day` tab is open.
+7. Leave `Auto-update forecast when the live Sheet changes` on to recalculate the forecast when new laps appear.
 
 Use these columns:
 
@@ -216,7 +217,7 @@ Fill either `finish_time` or `lap_duration_minutes` for each lap:
 - `finish_time`: `Saturday 13:04`, `Sunday 00:12`, or elapsed minutes such as `724`
 - `lap_duration_minutes`: `33.5`, `41.2`, etc.
 
-This editable-Sheet mode is read-only from the app: you edit the Google Sheet, then reload it in Streamlit.
+This editable-Sheet mode is read-only from the app: you edit the Google Sheet, and Streamlit pulls the latest rows on the selected refresh interval.
 
 Google Sheets write-back is optional. Without credentials, the Race Day tab still works with editable-Sheet import and CSV backup.
 
