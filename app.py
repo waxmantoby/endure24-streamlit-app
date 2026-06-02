@@ -2038,6 +2038,185 @@ def show_what_if_pace_override(roster: pd.DataFrame, settings: SimulationSetting
             show_route_commentary(target_ranking, result["adjusted_roster"], "target_probability", settings.target_laps)
 
 
+def runner_drink_unit(runner: str) -> str:
+    return "Rubicons consumed" if str(runner).strip().lower() == "jared" else "Drinks"
+
+
+def drinks_state_table(roster: pd.DataFrame) -> pd.DataFrame:
+    runners = roster.sort_values("running_order")["runner"].astype(str).str.strip()
+    runners = runners[runners.ne("")].drop_duplicates().tolist()
+    if "drinks_tracker" not in st.session_state:
+        st.session_state["drinks_tracker"] = pd.DataFrame(
+            {"runner": runners, "count": [0 for _ in runners], "notes": ["" for _ in runners]}
+        )
+
+    current = st.session_state["drinks_tracker"].copy()
+    current["runner"] = current["runner"].astype(str).str.strip()
+    current["count"] = pd.to_numeric(current["count"], errors="coerce").fillna(0).clip(lower=0).round().astype(int)
+    if "notes" not in current:
+        current["notes"] = ""
+    current["notes"] = current["notes"].fillna("").astype(str)
+
+    existing = set(current["runner"].astype(str))
+    missing = [runner for runner in runners if runner not in existing]
+    if missing:
+        current = pd.concat(
+            [
+                current,
+                pd.DataFrame({"runner": missing, "count": [0 for _ in missing], "notes": ["" for _ in missing]}),
+            ],
+            ignore_index=True,
+        )
+
+    current = current[current["runner"].isin(runners)].copy()
+    order_lookup = {runner: index for index, runner in enumerate(runners)}
+    current["_order"] = current["runner"].map(order_lookup)
+    current = current.sort_values(["_order", "runner"]).drop(columns="_order").reset_index(drop=True)
+    current["unit"] = current["runner"].map(runner_drink_unit)
+    st.session_state["drinks_tracker"] = current[["runner", "count", "notes"]].copy()
+    return current
+
+
+def set_drinks_state(table: pd.DataFrame) -> pd.DataFrame:
+    clean = table.copy()
+    clean["count"] = pd.to_numeric(clean["count"], errors="coerce").fillna(0).clip(lower=0).round().astype(int)
+    if "notes" not in clean:
+        clean["notes"] = ""
+    clean["notes"] = clean["notes"].fillna("").astype(str)
+    st.session_state["drinks_tracker"] = clean[["runner", "count", "notes"]].copy()
+    return clean
+
+
+def show_drinks_tab(roster: pd.DataFrame) -> None:
+    st.subheader("Drinks")
+    st.caption("For morale monitoring only. This does not affect race forecasts, runner order, or pacing assumptions.")
+
+    table = drinks_state_table(roster)
+    if table.empty:
+        st.info("Add runners in Setup before tracking drinks.")
+        return
+
+    total = int(table["count"].sum())
+    leader = table.sort_values(["count", "runner"], ascending=[False, True]).iloc[0]
+    jared_rows = table[table["runner"].astype(str).str.lower().eq("jared")]
+    jared_count = int(jared_rows.iloc[0]["count"]) if not jared_rows.empty else 0
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Total logged", f"{total}")
+    c2.metric("Current leader", f"{leader['runner']} ({int(leader['count'])})")
+    c3.metric("Jared", f"{jared_count} Rubicons")
+
+    st.markdown("#### Quick Add")
+    for start in range(0, len(table), 4):
+        cols = st.columns(4)
+        for col, row in zip(cols, table.iloc[start : start + 4].itertuples(index=False)):
+            if col.button(
+                f"+1 {row.runner}",
+                key=f"drink_plus_{row.runner}",
+                help=runner_drink_unit(row.runner),
+                width="stretch",
+            ):
+                updated = table.copy()
+                updated.loc[updated["runner"].astype(str) == str(row.runner), "count"] += 1
+                set_drinks_state(updated)
+                st.rerun()
+
+    edited = st.data_editor(
+        table[["runner", "count", "unit", "notes"]],
+        hide_index=True,
+        width="stretch",
+        column_config={
+            "runner": st.column_config.TextColumn("Runner", disabled=True),
+            "count": st.column_config.NumberColumn("Count", min_value=0, max_value=200, step=1),
+            "unit": st.column_config.TextColumn("Unit", disabled=True),
+            "notes": st.column_config.TextColumn("Notes"),
+        },
+        key="drinks_tracker_editor",
+    )
+    action_cols = st.columns(3)
+    if action_cols[0].button("Save drink table", type="primary", width="stretch"):
+        saved = set_drinks_state(edited)
+        st.success(f"Saved {int(saved['count'].sum())} total logged items.")
+    if action_cols[1].button("Reset drinks", width="stretch"):
+        reset = table.copy()
+        reset["count"] = 0
+        reset["notes"] = ""
+        set_drinks_state(reset)
+        st.rerun()
+    action_cols[2].download_button(
+        "Download drinks CSV",
+        drinks_state_table(roster).to_csv(index=False),
+        file_name="endure24_drinks_tracker.csv",
+        mime="text/csv",
+        width="stretch",
+    )
+
+    st.markdown("#### Silly Graphs")
+    chart_table = drinks_state_table(roster)
+    bar = px.bar(
+        chart_table.sort_values("count", ascending=False),
+        x="runner",
+        y="count",
+        color="runner",
+        text="count",
+        title="Questionable Refreshment Leaderboard",
+    )
+    bar.update_layout(showlegend=False, yaxis_title="Logged items", xaxis_title="")
+    st.plotly_chart(bar, width="stretch")
+
+    left, right = st.columns(2)
+    with left:
+        donut = px.pie(
+            chart_table,
+            values="count",
+            names="runner",
+            hole=0.55,
+            title="Share of the Nonsense",
+        )
+        st.plotly_chart(donut, width="stretch")
+
+    with right:
+        jared_max = max(5, jared_count + 2, int(chart_table["count"].max()) + 1)
+        gauge = go.Figure(
+            go.Indicator(
+                mode="gauge+number",
+                value=jared_count,
+                title={"text": "Jared Rubicons consumed"},
+                gauge={
+                    "axis": {"range": [0, jared_max]},
+                    "bar": {"color": "#2f6f8f"},
+                    "steps": [
+                        {"range": [0, max(1, jared_max * 0.4)], "color": "#e9f5ee"},
+                        {"range": [max(1, jared_max * 0.4), max(2, jared_max * 0.75)], "color": "#fff4d6"},
+                        {"range": [max(2, jared_max * 0.75), jared_max], "color": "#ffe2e2"},
+                    ],
+                },
+            )
+        )
+        gauge.update_layout(height=320, margin={"l": 20, "r": 20, "t": 50, "b": 20})
+        st.plotly_chart(gauge, width="stretch")
+
+    matrix = chart_table.copy()
+    order_lookup = (
+        roster.assign(runner=roster["runner"].astype(str).str.strip())
+        .set_index("runner")["running_order"]
+        .to_dict()
+    )
+    matrix["running_order"] = matrix["runner"].map(order_lookup)
+    matrix["bubble_size"] = matrix["count"].clip(lower=1)
+    scatter = px.scatter(
+        matrix,
+        x="running_order",
+        y="count",
+        size="bubble_size",
+        color="runner",
+        hover_data=["unit", "notes"],
+        title="Pit Stop Philosophy Matrix",
+    )
+    scatter.update_layout(xaxis_title="Running order", yaxis_title="Logged items", showlegend=False)
+    st.plotly_chart(scatter, width="stretch")
+
+
 def main() -> None:
     inject_app_styles()
     st.title("Endure24 Relay Monte Carlo")
@@ -2056,8 +2235,8 @@ def main() -> None:
     st.sidebar.subheader("Race Rules")
     caps_enabled = st.sidebar.checkbox("Apply max-lap caps", value=True)
 
-    setup_tab, forecast_tab, optimiser_tab, race_day_tab, what_if_tab, exports_tab = st.tabs(
-        ["Setup", "Forecast", "Optimiser", "Race Day", "What-if", "Exports"]
+    setup_tab, forecast_tab, optimiser_tab, race_day_tab, drinks_tab, what_if_tab, exports_tab = st.tabs(
+        ["Setup", "Forecast", "Optimiser", "Race Day", "Drinks", "What-if", "Exports"]
     )
 
     with setup_tab:
@@ -2141,6 +2320,9 @@ def main() -> None:
 
     with race_day_tab:
         show_race_day(roster, settings, caps_enabled=caps_enabled)
+
+    with drinks_tab:
+        show_drinks_tab(roster)
 
     with what_if_tab:
         show_what_if_pace_override(roster, settings)
