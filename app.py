@@ -1065,14 +1065,18 @@ def show_race_day_plan_assistant(
         )
 
 
-def show_race_day_sync_status() -> None:
+def show_race_day_sync_status(sync: Mapping[str, Any]) -> None:
     last_load = st.session_state.get("editable_google_sheet_last_loaded", "-")
     last_save = st.session_state.get("race_day_sheet_last_saved", "-")
+    live_reload = st.session_state.get("race_day_live_sheet_enabled", bool(sync.get("configured")))
+    refresh_seconds = st.session_state.get("race_day_live_refresh_seconds", 15)
     with st.container(border=True):
         st.markdown("#### Sheet Activity")
-        cols = st.columns(2)
-        cols[0].metric("Last load", str(last_load))
-        cols[1].metric("Last save", str(last_save))
+        cols = st.columns(4)
+        cols[0].metric("Write access", "Ready" if sync.get("configured") else "Off")
+        cols[1].metric("Auto reload", f"On ({refresh_seconds}s)" if live_reload else "Off")
+        cols[2].metric("Last load", str(last_load))
+        cols[3].metric("Last save", str(last_save))
 
 
 def show_race_day_readiness(
@@ -1160,6 +1164,108 @@ def show_lap_handover_strip(
     for col, card in zip(cols, cards):
         with col:
             race_mini_card(*card)
+
+
+def build_team_brief(
+    log: pd.DataFrame,
+    roster: pd.DataFrame,
+    settings: SimulationSettings,
+    state,
+    live_bundle: dict | None,
+    warnings: list[str],
+    errors: list[str],
+    caps_enabled: bool,
+    sync: Mapping[str, Any],
+) -> str:
+    latest_completed = latest_completed_lap(log, roster)
+    fair_queue = build_live_fair_queue(log, roster, caps_enabled=caps_enabled, queue_size=1)
+    recommended_next = queue_next_runner(fair_queue) or state.next_runner or "No eligible runner"
+    live_summary = live_bundle["summary"] if live_bundle else None
+
+    if errors:
+        status = f"Fix now: {len(errors)} issue(s)"
+    elif warnings:
+        status = f"Watch: {len(warnings)} item(s)"
+    else:
+        status = "Clean"
+
+    if state.current_lap_in_progress:
+        runner_line = (
+            f"On course: {state.in_progress_runner or '-'} "
+            f"since {format_race_clock(state.in_progress_start_minute)}"
+        )
+    else:
+        runner_line = f"Next up: {recommended_next}"
+
+    if latest_completed is None:
+        last_line = "Last lap: none logged"
+    else:
+        last_line = (
+            f"Last lap: {latest_completed['runner']} "
+            f"{float(latest_completed['lap_duration_minutes']):.1f}m, "
+            f"finished {format_race_clock(latest_completed['finish_minute'])}"
+        )
+
+    if live_summary:
+        forecast_line = (
+            "Forecast: "
+            f"{float(live_summary['expected_official_laps']):.2f} projected laps, "
+            f"{format_probability(live_summary['probability_target_laps'])} chance of {settings.target_laps}"
+        )
+    else:
+        forecast_line = "Forecast: refresh pending"
+
+    pace_needed = state.average_needed_to_start_target_lap or state.average_needed_to_target
+    if state.remaining_to_target <= 0:
+        pace_line = f"Pace needed: target {settings.target_laps} already logged"
+    elif pace_needed is None:
+        pace_line = "Pace needed: not available"
+    else:
+        pace_line = f"Pace needed: {pace_needed:.1f} min/lap"
+
+    sheet_line = (
+        "Sheet: "
+        f"{'write ready' if sync.get('configured') else 'read/local only'}, "
+        f"auto reload {'on' if st.session_state.get('race_day_live_sheet_enabled', bool(sync.get('configured'))) else 'off'}, "
+        f"load {st.session_state.get('editable_google_sheet_last_loaded', '-')}, "
+        f"save {st.session_state.get('race_day_sheet_last_saved', '-')}"
+    )
+
+    return "\n".join(
+        [
+            f"Endure24 update: {state.current_laps}/{settings.target_laps} official laps - {status}",
+            runner_line,
+            f"Recommended next: {recommended_next}",
+            last_line,
+            forecast_line,
+            pace_line,
+            sheet_line,
+        ]
+    )
+
+
+def show_team_brief(
+    log: pd.DataFrame,
+    roster: pd.DataFrame,
+    settings: SimulationSettings,
+    state,
+    live_bundle: dict | None,
+    warnings: list[str],
+    errors: list[str],
+    caps_enabled: bool,
+    sync: Mapping[str, Any],
+) -> None:
+    brief = build_team_brief(log, roster, settings, state, live_bundle, warnings, errors, caps_enabled, sync)
+    with st.container(border=True):
+        st.markdown("#### Team Brief")
+        st.code(brief, language="text")
+        st.download_button(
+            "Download brief",
+            brief,
+            file_name="endure24_team_brief.txt",
+            mime="text/plain",
+            width="stretch",
+        )
 
 
 def race_mini_card(label: str, value: str, help_text: str) -> None:
@@ -1742,8 +1848,9 @@ def show_race_day(roster: pd.DataFrame, settings: SimulationSettings, caps_enabl
     )
     show_race_day_plan_assistant(log, roster, settings, state, caps_enabled)
     show_race_day_readiness(race_sync, warnings, errors, live_bundle, roster, settings, log, caps_enabled)
-    show_race_day_sync_status()
+    show_race_day_sync_status(race_sync)
     show_race_day_alerts(warnings, errors)
+    show_team_brief(log, roster, settings, state, live_bundle, warnings, errors, caps_enabled, race_sync)
 
     st.markdown("### Lap Desk")
     show_lap_handover_strip(log, roster, state, caps_enabled)
