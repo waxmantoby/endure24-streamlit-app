@@ -3,7 +3,9 @@ from __future__ import annotations
 from dataclasses import replace
 import hashlib
 import html
+import json
 from pathlib import Path
+from typing import Any, Mapping
 
 import pandas as pd
 import plotly.express as px
@@ -35,10 +37,8 @@ from race_day import (
     race_state_from_log,
     read_race_log_from_google_sheet_url,
     read_race_log_from_google_sheet,
-    read_drinks_from_google_sheet,
     target_pace_series,
     validate_race_log,
-    write_drinks_to_google_sheet,
     write_race_log_to_google_sheet,
 )
 from simulation_engine import (
@@ -2042,6 +2042,83 @@ def show_what_if_pace_override(roster: pd.DataFrame, settings: SimulationSetting
 
 def runner_drink_unit(runner: str) -> str:
     return "Rubicons consumed" if str(runner).strip().lower() == "jared" else "Drinks"
+
+
+DRINKS_SHEET_COLUMNS = ["runner", "count", "unit", "notes"]
+
+
+def _drinks_secret_value(secrets: Mapping[str, Any], *keys: str) -> Any:
+    for key in keys:
+        try:
+            value = secrets.get(key)
+        except Exception:
+            value = None
+        if value:
+            return value
+    return None
+
+
+def _drinks_service_account_info(secrets: Mapping[str, Any]) -> dict[str, Any] | None:
+    value = _drinks_secret_value(
+        secrets,
+        "gcp_service_account",
+        "google_service_account",
+        "gcp_service_account_json",
+        "google_service_account_json",
+    )
+    if not value:
+        return None
+    if isinstance(value, str):
+        return json.loads(value)
+    return dict(value)
+
+
+def _open_drinks_sheet(secrets: Mapping[str, Any], sheet_id: str | None, worksheet_name: str):
+    try:
+        import gspread
+        from google.oauth2.service_account import Credentials
+    except Exception as exc:  # pragma: no cover - depends on cloud packages.
+        raise RuntimeError("Install gspread and google-auth to use Google Sheets sync.") from exc
+
+    service_account = _drinks_service_account_info(secrets)
+    resolved_sheet_id = sheet_id or _drinks_secret_value(secrets, "google_sheet_id", "race_log_google_sheet_id")
+    if not service_account or not resolved_sheet_id:
+        raise RuntimeError("Google Sheets sync needs google_sheet_id and gcp_service_account in Streamlit secrets.")
+
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+    credentials = Credentials.from_service_account_info(service_account, scopes=scopes)
+    client = gspread.authorize(credentials)
+    spreadsheet = client.open_by_key(str(resolved_sheet_id))
+    try:
+        return spreadsheet.worksheet(worksheet_name)
+    except Exception:
+        return spreadsheet.add_worksheet(title=worksheet_name, rows=200, cols=len(DRINKS_SHEET_COLUMNS))
+
+
+def read_drinks_from_google_sheet(
+    secrets: Mapping[str, Any],
+    sheet_id: str | None = None,
+    worksheet_name: str = "drinks",
+) -> pd.DataFrame:
+    sheet = _open_drinks_sheet(secrets, sheet_id, worksheet_name)
+    return pd.DataFrame(sheet.get_all_records())
+
+
+def write_drinks_to_google_sheet(
+    drinks: pd.DataFrame,
+    secrets: Mapping[str, Any],
+    sheet_id: str | None = None,
+    worksheet_name: str = "drinks",
+) -> None:
+    sheet = _open_drinks_sheet(secrets, sheet_id, worksheet_name)
+    clean = drinks.copy()
+    for column in DRINKS_SHEET_COLUMNS:
+        if column not in clean:
+            clean[column] = ""
+    clean = clean[DRINKS_SHEET_COLUMNS]
+    values = [DRINKS_SHEET_COLUMNS] + clean.fillna("").astype(str).values.tolist()
+    sheet.clear()
+    sheet.update(values)
 
 
 def normalise_drinks_table(raw: pd.DataFrame, roster: pd.DataFrame) -> pd.DataFrame:
