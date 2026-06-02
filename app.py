@@ -1121,6 +1121,47 @@ def show_race_day_readiness(
             action_cols[1].caption("Updates target chance, projected final laps, and the Race Control plot.")
 
 
+def show_lap_handover_strip(
+    log: pd.DataFrame,
+    roster: pd.DataFrame,
+    state,
+    caps_enabled: bool,
+) -> None:
+    latest_completed = latest_completed_lap(log, roster)
+    if latest_completed is None:
+        last_value = "None logged"
+        last_help = "Use Add Race Entry when the first lap comes in."
+    else:
+        last_value = f"{latest_completed['runner']} {float(latest_completed['lap_duration_minutes']):.1f}m"
+        last_help = f"Finished {format_race_clock(latest_completed['finish_minute'])}"
+
+    if state.current_lap_in_progress:
+        on_course_value = str(state.in_progress_runner or "-")
+        on_course_help = f"Started {format_race_clock(state.in_progress_start_minute)}"
+        action_value = "Complete lap"
+        action_help = "Enter finish time or lap duration."
+    else:
+        on_course_value = "None recorded"
+        on_course_help = "Record a start only if you want to track an in-progress lap."
+        action_value = "Log lap"
+        action_help = "Add completed lap, or record the next start."
+
+    fair_queue = build_live_fair_queue(log, roster, caps_enabled=caps_enabled, queue_size=2)
+    recommended_next = queue_next_runner(fair_queue) or state.next_runner or "No eligible runner"
+
+    st.markdown("#### Handover")
+    cols = st.columns(4)
+    cards = [
+        ("Last completed", last_value, last_help),
+        ("On course", on_course_value, on_course_help),
+        ("Recommended next", recommended_next, "Used as the default runner below."),
+        ("Logger action", action_value, action_help),
+    ]
+    for col, card in zip(cols, cards):
+        with col:
+            race_mini_card(*card)
+
+
 def race_mini_card(label: str, value: str, help_text: str) -> None:
     st.markdown(
         f"""
@@ -1705,6 +1746,7 @@ def show_race_day(roster: pd.DataFrame, settings: SimulationSettings, caps_enabl
     show_race_day_alerts(warnings, errors)
 
     st.markdown("### Lap Desk")
+    show_lap_handover_strip(log, roster, state, caps_enabled)
     c1, c2 = st.columns([1, 1])
     with c1:
         log = show_race_log_entry(log, roster, caps_enabled, race_sync)
