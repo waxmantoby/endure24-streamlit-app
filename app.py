@@ -35,8 +35,10 @@ from race_day import (
     race_state_from_log,
     read_race_log_from_google_sheet_url,
     read_race_log_from_google_sheet,
+    read_drinks_from_google_sheet,
     target_pace_series,
     validate_race_log,
+    write_drinks_to_google_sheet,
     write_race_log_to_google_sheet,
 )
 from simulation_engine import (
@@ -2042,20 +2044,21 @@ def runner_drink_unit(runner: str) -> str:
     return "Rubicons consumed" if str(runner).strip().lower() == "jared" else "Drinks"
 
 
-def drinks_state_table(roster: pd.DataFrame) -> pd.DataFrame:
+def normalise_drinks_table(raw: pd.DataFrame, roster: pd.DataFrame) -> pd.DataFrame:
     runners = roster.sort_values("running_order")["runner"].astype(str).str.strip()
     runners = runners[runners.ne("")].drop_duplicates().tolist()
-    if "drinks_tracker" not in st.session_state:
-        st.session_state["drinks_tracker"] = pd.DataFrame(
-            {"runner": runners, "count": [0 for _ in runners], "notes": ["" for _ in runners]}
-        )
-
-    current = st.session_state["drinks_tracker"].copy()
-    current["runner"] = current["runner"].astype(str).str.strip()
-    current["count"] = pd.to_numeric(current["count"], errors="coerce").fillna(0).clip(lower=0).round().astype(int)
+    current = raw.copy() if raw is not None and not raw.empty else pd.DataFrame(columns=["runner", "count", "notes"])
+    current.columns = [str(column).strip().lower() for column in current.columns]
+    if "runner" not in current:
+        current["runner"] = ""
+    if "count" not in current:
+        current["count"] = 0
     if "notes" not in current:
         current["notes"] = ""
+    current["runner"] = current["runner"].astype(str).str.strip()
+    current["count"] = pd.to_numeric(current["count"], errors="coerce").fillna(0).clip(lower=0).round().astype(int)
     current["notes"] = current["notes"].fillna("").astype(str)
+    current = current[current["runner"].ne("")].drop_duplicates("runner", keep="last")
 
     existing = set(current["runner"].astype(str))
     missing = [runner for runner in runners if runner not in existing]
@@ -2073,25 +2076,140 @@ def drinks_state_table(roster: pd.DataFrame) -> pd.DataFrame:
     current["_order"] = current["runner"].map(order_lookup)
     current = current.sort_values(["_order", "runner"]).drop(columns="_order").reset_index(drop=True)
     current["unit"] = current["runner"].map(runner_drink_unit)
+    return current
+
+
+def drinks_state_table(roster: pd.DataFrame) -> pd.DataFrame:
+    if "drinks_tracker" not in st.session_state:
+        st.session_state["drinks_tracker"] = pd.DataFrame(columns=["runner", "count", "notes"])
+    current = normalise_drinks_table(st.session_state["drinks_tracker"], roster)
     st.session_state["drinks_tracker"] = current[["runner", "count", "notes"]].copy()
     return current
 
 
 def set_drinks_state(table: pd.DataFrame) -> pd.DataFrame:
-    clean = table.copy()
-    clean["count"] = pd.to_numeric(clean["count"], errors="coerce").fillna(0).clip(lower=0).round().astype(int)
-    if "notes" not in clean:
-        clean["notes"] = ""
-    clean["notes"] = clean["notes"].fillna("").astype(str)
+    roster = st.session_state.get("current_roster_for_drinks")
+    if not isinstance(roster, pd.DataFrame) or roster.empty:
+        roster = pd.DataFrame(
+            {
+                "runner": table["runner"].astype(str).str.strip().tolist() if "runner" in table else [],
+                "running_order": list(range(1, len(table) + 1)),
+            }
+        )
+    clean = normalise_drinks_table(table, roster)
     st.session_state["drinks_tracker"] = clean[["runner", "count", "notes"]].copy()
     return clean
+
+
+def drinks_sheet_payload(table: pd.DataFrame) -> pd.DataFrame:
+    clean = table.copy()
+    clean["unit"] = clean["runner"].map(runner_drink_unit)
+    return clean[["runner", "count", "unit", "notes"]]
+
+
+def drinks_digest(table: pd.DataFrame) -> str:
+    return hashlib.sha256(table[["runner", "count", "notes"]].to_csv(index=False).encode("utf-8")).hexdigest()
+
+
+def show_drinks_sheet_controls(table: pd.DataFrame, roster: pd.DataFrame) -> pd.DataFrame:
+    default_sheet_id = get_streamlit_secret("google_sheet_id", "race_log_google_sheet_id") or ""
+    default_sheet_id = st.session_state.get("race_day_sheet_id", default_sheet_id)
+    st.session_state.setdefault("drinks_sheet_id", str(default_sheet_id))
+    st.session_state.setdefault("drinks_worksheet_name", "drinks")
+
+    sheet_id = str(st.session_state.get("drinks_sheet_id") or default_sheet_id).strip()
+    worksheet_name = str(st.session_state.get("drinks_worksheet_name") or "drinks").strip() or "drinks"
+    configured = google_sheets_configured(st.secrets, sheet_id or None)
+
+    with st.container(border=True):
+        top_cols = st.columns([1.5, 1, 1])
+        with top_cols[0]:
+            st.markdown("#### Drinks Sheet")
+            if configured:
+                st.caption("Connected to the same Google Sheet using a separate drinks worksheet.")
+            else:
+                st.caption("Google sync is not configured. Local tracking and CSV download still work.")
+
+        live_reload = top_cols[1].checkbox(
+            "Auto reload",
+            value=st.session_state.get("drinks_live_sheet_enabled", False),
+            help="Reloads the drinks worksheet while this tab is open.",
+        )
+        refresh_seconds = top_cols[2].number_input(
+            "Every seconds",
+            min_value=10,
+            max_value=300,
+            value=int(st.session_state.get("drinks_live_refresh_seconds", 30)),
+            step=5,
+            key="drinks_refresh_seconds_input",
+        )
+        st.session_state["drinks_live_sheet_enabled"] = live_reload
+        st.session_state["drinks_live_refresh_seconds"] = int(refresh_seconds)
+
+        if live_reload and st_autorefresh is not None:
+            st_autorefresh(
+                interval=int(refresh_seconds) * 1000,
+                key="drinks_live_sheet_autorefresh",
+            )
+        elif live_reload and st_autorefresh is None:
+            st.warning("Live reload needs the streamlit-autorefresh package. Manual loading still works.")
+
+        action_cols = st.columns([1, 1, 1.2])
+        load_now = action_cols[0].button("Load drinks", width="stretch", disabled=not configured)
+        save_now = action_cols[1].button("Save drinks", width="stretch", disabled=not configured)
+        if configured:
+            action_cols[2].success(f"Worksheet: {worksheet_name}")
+        else:
+            action_cols[2].warning("Save disabled until secrets are set.")
+
+        if (load_now or live_reload) and configured:
+            try:
+                loaded = read_drinks_from_google_sheet(
+                    st.secrets,
+                    sheet_id=sheet_id or None,
+                    worksheet_name=worksheet_name,
+                )
+                before = drinks_digest(table)
+                table = set_drinks_state(loaded)
+                loaded_at = pd.Timestamp.now().strftime("%H:%M:%S")
+                st.session_state["drinks_sheet_last_loaded"] = loaded_at
+                if drinks_digest(table) != before:
+                    st.success(f"Drinks loaded at {loaded_at}.")
+                else:
+                    st.caption(f"Drinks checked at {loaded_at}; no changes found.")
+            except Exception as exc:
+                st.error(f"Could not load drinks worksheet: {exc}")
+
+        if st.session_state.get("drinks_sheet_last_loaded"):
+            st.caption(f"Last drinks load: {st.session_state['drinks_sheet_last_loaded']}.")
+
+        if save_now and configured:
+            try:
+                write_drinks_to_google_sheet(
+                    drinks_sheet_payload(table),
+                    st.secrets,
+                    sheet_id=sheet_id or None,
+                    worksheet_name=worksheet_name,
+                )
+                st.success("Drinks saved to Google Sheet.")
+            except Exception as exc:
+                st.error(f"Could not save drinks worksheet: {exc}")
+
+        with st.expander("Drinks Sheet settings", expanded=False):
+            settings_cols = st.columns([2, 1])
+            settings_cols[0].text_input("Sheet ID", key="drinks_sheet_id", placeholder="Google Sheet ID")
+            settings_cols[1].text_input("Worksheet", key="drinks_worksheet_name")
+
+    return drinks_state_table(roster)
 
 
 def show_drinks_tab(roster: pd.DataFrame) -> None:
     st.subheader("Drinks")
     st.caption("For morale monitoring only. This does not affect race forecasts, runner order, or pacing assumptions.")
+    st.session_state["current_roster_for_drinks"] = roster.copy()
 
     table = drinks_state_table(roster)
+    table = show_drinks_sheet_controls(table, roster)
     if table.empty:
         st.info("Add runners in Setup before tracking drinks.")
         return

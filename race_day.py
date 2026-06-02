@@ -30,6 +30,8 @@ RACE_LOG_COLUMNS = [
     "official",
 ]
 
+DRINKS_COLUMNS = ["runner", "count", "unit", "notes"]
+
 GOOGLE_SHEET_TEMPLATE_COLUMNS = [
     "lap_number",
     "runner",
@@ -683,6 +685,33 @@ def write_race_log_to_google_sheet(
         sheet.update(values)
 
 
+def read_drinks_from_google_sheet(
+    secrets: Mapping[str, Any],
+    sheet_id: str | None = None,
+    worksheet_name: str = "drinks",
+) -> pd.DataFrame:
+    sheet = _open_sheet(secrets, sheet_id, worksheet_name, columns=DRINKS_COLUMNS)
+    records = sheet.get_all_records()
+    return pd.DataFrame(records)
+
+
+def write_drinks_to_google_sheet(
+    drinks: pd.DataFrame,
+    secrets: Mapping[str, Any],
+    sheet_id: str | None = None,
+    worksheet_name: str = "drinks",
+) -> None:
+    sheet = _open_sheet(secrets, sheet_id, worksheet_name, columns=DRINKS_COLUMNS)
+    clean = drinks.copy()
+    for column in DRINKS_COLUMNS:
+        if column not in clean:
+            clean[column] = ""
+    clean = clean[DRINKS_COLUMNS]
+    values = [DRINKS_COLUMNS] + clean.replace({np.nan: ""}).astype(str).values.tolist()
+    sheet.clear()
+    sheet.update(values)
+
+
 def google_sheet_url_to_csv_url(url: str) -> str:
     text = str(url or "").strip()
     if not text:
@@ -906,7 +935,12 @@ def _service_account_info(secrets: Mapping[str, Any]) -> dict[str, Any] | None:
     return dict(value)
 
 
-def _open_sheet(secrets: Mapping[str, Any], sheet_id: str | None, worksheet_name: str):
+def _open_sheet(
+    secrets: Mapping[str, Any],
+    sheet_id: str | None,
+    worksheet_name: str,
+    columns: list[str] | None = None,
+):
     try:
         import gspread
         from google.oauth2.service_account import Credentials
@@ -925,4 +959,4 @@ def _open_sheet(secrets: Mapping[str, Any], sheet_id: str | None, worksheet_name
     try:
         return spreadsheet.worksheet(worksheet_name)
     except Exception:
-        return spreadsheet.add_worksheet(title=worksheet_name, rows=200, cols=len(RACE_LOG_COLUMNS))
+        return spreadsheet.add_worksheet(title=worksheet_name, rows=200, cols=len(columns or RACE_LOG_COLUMNS))
