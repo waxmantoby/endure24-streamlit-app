@@ -209,7 +209,60 @@ def complete_in_progress_lap(
     return normalise_race_log(log, roster)
 
 
-def validate_race_log(log: pd.DataFrame, roster: pd.DataFrame) -> tuple[list[str], list[str]]:
+def race_order_review(log: pd.DataFrame, roster: pd.DataFrame, caps_enabled: bool = True) -> pd.DataFrame:
+    columns = ["lap_number", "runner", "expected_runner", "order_status", "order_exception"]
+    clean = normalise_race_log(log, roster)
+    if clean.empty:
+        return pd.DataFrame(columns=columns)
+
+    try:
+        order = _available_order(roster)
+    except Exception:
+        return pd.DataFrame(columns=columns)
+    if not order:
+        return pd.DataFrame(columns=columns)
+
+    counts = {runner: 0 for runner in order}
+    pointer = 0
+    rows: list[dict[str, Any]] = []
+    for row in clean.sort_values("lap_number").itertuples(index=False):
+        actual = str(row.runner).strip()
+        expected, expected_index = next_eligible_runner(roster, counts, pointer, caps_enabled=caps_enabled)
+
+        if not actual:
+            status = "Missing runner"
+            exception = True
+        elif actual not in order:
+            status = "Unknown runner"
+            exception = True
+        elif expected and actual != expected:
+            status = f"Expected {expected}"
+            exception = True
+        else:
+            status = "On plan"
+            exception = False
+
+        rows.append(
+            {
+                "lap_number": int(row.lap_number),
+                "runner": actual,
+                "expected_runner": expected,
+                "order_status": status,
+                "order_exception": exception,
+            }
+        )
+
+        if actual in order:
+            pointer = (order.index(actual) + 1) % len(order)
+            if bool(row.official):
+                counts[actual] = counts.get(actual, 0) + 1
+        elif expected_index is not None:
+            pointer = expected_index
+
+    return pd.DataFrame(rows, columns=columns)
+
+
+def validate_race_log(log: pd.DataFrame, roster: pd.DataFrame, caps_enabled: bool = True) -> tuple[list[str], list[str]]:
     clean = normalise_race_log(log, roster)
     warnings: list[str] = []
     errors: list[str] = []
@@ -219,7 +272,7 @@ def validate_race_log(log: pd.DataFrame, roster: pd.DataFrame) -> tuple[list[str
     known_runners = set(roster["runner"].astype(str).str.strip())
     unknown = sorted(set(clean["runner"].astype(str).str.strip()).difference(known_runners).difference({""}))
     if unknown:
-        errors.append(f"Unknown runner names in race log: {', '.join(unknown)}.")
+        errors.append(f"Unknown runner in the race log: {', '.join(unknown)}. Use the roster spelling or correct the Sheet.")
 
     if clean["runner"].astype(str).str.strip().eq("").any():
         errors.append("Every race-log row needs a runner.")
@@ -253,7 +306,7 @@ def validate_race_log(log: pd.DataFrame, roster: pd.DataFrame) -> tuple[list[str
         clean["start_minute"].lt(0)
     ]
     if not impossible.empty:
-        errors.append("One or more laps have a start time before Saturday 12:00.")
+        errors.append(f"Start time is before Saturday 12:00 on lap(s) {_format_laps(impossible['lap_number'])}.")
 
     impossible_completed = completed[
         completed["finish_minute"].lt(0)
@@ -261,32 +314,110 @@ def validate_race_log(log: pd.DataFrame, roster: pd.DataFrame) -> tuple[list[str
         | completed["lap_duration_minutes"].le(0)
     ]
     if not impossible_completed.empty:
-        bad_laps = ", ".join(str(int(lap)) for lap in impossible_completed["lap_number"].tolist())
-        errors.append(f"Lap timing is impossible on lap(s) {bad_laps}: finish must be after start and duration must be positive.")
+        errors.append(
+            f"Lap timing is impossible on lap(s) {_format_laps(impossible_completed['lap_number'])}: "
+            "finish must be after start and duration must be positive."
+        )
 
     if clean["finish_minute"].gt(FINAL_CUTOFF_MINUTE).any():
-        warnings.append("At least one logged finish is after Sunday 13:00, so it will not count as an official lap.")
+        late_finish = clean[clean["finish_minute"].gt(FINAL_CUTOFF_MINUTE)]
+        warnings.append(f"Lap(s) {_format_laps(late_finish['lap_number'])} finish after Sunday 13:00 and will not count.")
     if clean["start_minute"].gt(LAST_START_MINUTE).any():
-        warnings.append("At least one logged start is after Sunday 12:00, so it will not count as an official lap.")
+        late_start = clean[clean["start_minute"].gt(LAST_START_MINUTE)]
+        warnings.append(f"Lap(s) {_format_laps(late_start['lap_number'])} start after Sunday 12:00 and will not count.")
 
     ordered = clean.sort_values("lap_number")
-    if ordered.dropna(subset=["finish_minute"])["finish_minute"].diff().le(0).any():
-        errors.append("Logged finish times must increase lap by lap.")
-    if ordered["start_minute"].dropna().diff().lt(0).any():
-        errors.append("Logged start times must not move backwards.")
+    completed_ordered = ordered.dropna(subset=["start_minute", "finish_minute"])
+    overlap_laps = []
+    gap_messages = []
+    previous_lap = None
+    previous_finish = None
+    for row in completed_ordered.itertuples(index=False):
+        if previous_finish is not None:
+            if float(row.start_minute) < previous_finish - 0.01:
+                overlap_laps.append(int(row.lap_number))
+            elif float(row.start_minute) > previous_finish + 10:
+                gap_messages.append(f"lap {int(row.lap_number)} has a {float(row.start_minute) - previous_finish:.1f} min gap after lap {previous_lap}")
+        previous_lap = int(row.lap_number)
+        previous_finish = float(row.finish_minute)
+    if overlap_laps:
+        errors.append(f"Lap(s) {_format_laps(overlap_laps)} start before the previous lap has finished.")
 
-    caps = roster.copy()
-    caps["max_laps"] = pd.to_numeric(caps["max_laps"], errors="coerce")
-    official_counts = clean[clean["official"].fillna(False).astype(bool)]["runner"].value_counts()
-    cap_messages = []
-    for row in caps.dropna(subset=["max_laps"]).itertuples(index=False):
-        max_laps = int(row.max_laps)
-        if max_laps > 0 and official_counts.get(str(row.runner), 0) > max_laps:
-            cap_messages.append(f"{row.runner} has {official_counts.get(str(row.runner), 0)} logged laps against cap {max_laps}")
-    if cap_messages:
-        warnings.append("Cap warning: " + "; ".join(cap_messages) + ".")
+    finish_regressions = ordered.dropna(subset=["finish_minute"])
+    if finish_regressions["finish_minute"].diff().le(0).any():
+        bad_laps = finish_regressions.loc[finish_regressions["finish_minute"].diff().le(0), "lap_number"]
+        errors.append(f"Finish times must increase lap by lap. Check lap(s) {_format_laps(bad_laps)}.")
+    start_regressions = ordered.dropna(subset=["start_minute"])
+    if start_regressions["start_minute"].diff().lt(0).any():
+        bad_laps = start_regressions.loc[start_regressions["start_minute"].diff().lt(0), "lap_number"]
+        errors.append(f"Start times move backwards. Check lap(s) {_format_laps(bad_laps)}.")
+
+    if gap_messages:
+        warnings.append("Timing gap check: " + "; ".join(gap_messages[:3]) + ("." if len(gap_messages) <= 3 else "; more gaps hidden."))
+
+    if {"projected_mean_minutes", "projected_sd_minutes"}.issubset(roster.columns):
+        pace_source = roster.copy()
+        pace_source["_runner_key"] = pace_source["runner"].astype(str).str.strip()
+        pace_lookup = pace_source.drop_duplicates("_runner_key").set_index("_runner_key")
+        pace_messages = []
+        for row in completed.itertuples(index=False):
+            runner = str(row.runner).strip()
+            if runner not in pace_lookup.index:
+                continue
+            pace_row = pace_lookup.loc[runner]
+            mean = pd.to_numeric(pace_row.get("projected_mean_minutes"), errors="coerce")
+            sd = pd.to_numeric(pace_row.get("projected_sd_minutes"), errors="coerce")
+            if pd.isna(mean) or pd.isna(sd) or float(sd) <= 0:
+                continue
+            duration = float(row.lap_duration_minutes)
+            low = max(10.0, float(mean) - 3 * float(sd))
+            high = float(mean) + 3 * float(sd)
+            if duration < low or duration > high:
+                pace_messages.append(f"lap {int(row.lap_number)} {runner} is {duration:.1f} min vs usual {float(mean):.1f}")
+        if pace_messages:
+            warnings.append("Pace check: " + "; ".join(pace_messages[:4]) + ("." if len(pace_messages) <= 4 else "; more pace checks hidden."))
+
+    order_review = race_order_review(clean, roster, caps_enabled=caps_enabled)
+    if not order_review.empty:
+        exceptions = order_review[
+            order_review["order_exception"].fillna(False)
+            & order_review["runner"].astype(str).ne("")
+            & order_review["expected_runner"].astype(str).ne("")
+            & ~order_review["order_status"].isin(["Unknown runner", "Missing runner"])
+        ]
+        if not exceptions.empty:
+            details = [
+                f"lap {int(row.lap_number)} {row.runner} ran, expected {row.expected_runner}"
+                for row in exceptions.head(4).itertuples(index=False)
+            ]
+            suffix = "." if len(exceptions) <= 4 else "; more order exceptions hidden."
+            warnings.append(
+                "Order exception: "
+                + "; ".join(details)
+                + suffix
+                + " This is allowed; the forecast resumes the fixed order from the actual runner logged."
+            )
+
+    if caps_enabled:
+        caps = roster.copy()
+        caps["max_laps"] = pd.to_numeric(caps["max_laps"], errors="coerce")
+        official_counts = clean[clean["official"].fillna(False).astype(bool)]["runner"].value_counts()
+        cap_messages = []
+        for row in caps.dropna(subset=["max_laps"]).itertuples(index=False):
+            max_laps = int(row.max_laps)
+            if max_laps > 0 and official_counts.get(str(row.runner), 0) > max_laps:
+                cap_messages.append(f"{row.runner} has {official_counts.get(str(row.runner), 0)} logged laps against cap {max_laps}")
+        if cap_messages:
+            warnings.append("Cap warning: " + "; ".join(cap_messages) + ".")
 
     return warnings, errors
+
+
+def _format_laps(values: Any) -> str:
+    laps = [str(int(value)) for value in pd.Series(values).dropna().tolist()]
+    if not laps:
+        return "-"
+    return ", ".join(laps)
 
 
 def race_state_from_log(

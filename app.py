@@ -27,6 +27,7 @@ from race_day import (
     parse_duration_minutes,
     parse_pasted_laps,
     parse_race_time_to_minute,
+    race_order_review,
     race_state_from_log,
     read_race_log_from_google_sheet_url,
     read_race_log_from_google_sheet,
@@ -612,19 +613,31 @@ def get_streamlit_secret(*keys: str):
     return None
 
 
-def format_race_log_for_display(log: pd.DataFrame) -> pd.DataFrame:
-    display = normalise_race_log(log, pd.DataFrame({"runner": []}))
+def format_race_log_for_display(log: pd.DataFrame, roster: pd.DataFrame, caps_enabled: bool) -> pd.DataFrame:
+    display = normalise_race_log(log, roster)
     display = add_clock_columns(display, ["start_minute", "finish_minute"])
+    review = race_order_review(display, roster, caps_enabled=caps_enabled)
+    if not review.empty:
+        display = display.merge(
+            review[["lap_number", "expected_runner", "order_status"]],
+            on="lap_number",
+            how="left",
+        )
+    else:
+        display["expected_runner"] = ""
+        display["order_status"] = ""
     display["status"] = display.apply(
         lambda row: "In progress"
         if pd.notna(row.get("start_minute")) and pd.isna(row.get("finish_minute"))
         else ("Official" if bool(row.get("official")) else "Not official"),
         axis=1,
     )
+    display["lap_duration_minutes"] = pd.to_numeric(display["lap_duration_minutes"], errors="coerce").round(1)
     columns = [
         "lap_number",
         "runner",
         "status",
+        "order_status",
         "start_time",
         "finish_time",
         "lap_duration_minutes",
@@ -681,36 +694,48 @@ def show_race_day_metrics(state, live_bundle: dict | None, target_laps: int) -> 
         st.info(" ".join(parts))
 
 
-def show_google_sheet_controls(log: pd.DataFrame, roster: pd.DataFrame) -> pd.DataFrame:
+def show_race_day_alerts(warnings: list[str], errors: list[str]) -> None:
+    if not warnings and not errors:
+        st.success("Race log looks clean.")
+        return
+
+    if errors:
+        st.error("Fix before forecasting or saving:\n\n- " + "\n- ".join(errors[:6]))
+        if len(errors) > 6:
+            st.caption(f"{len(errors) - 6} more errors hidden.")
+    if warnings:
+        st.warning("Check on the day:\n\n- " + "\n- ".join(warnings[:7]))
+        if len(warnings) > 7:
+            st.caption(f"{len(warnings) - 7} more checks hidden.")
+
+
+def show_google_sheet_controls(log: pd.DataFrame, roster: pd.DataFrame, caps_enabled: bool) -> pd.DataFrame:
     default_sheet_id = get_streamlit_secret("google_sheet_id", "race_log_google_sheet_id") or ""
-    with st.expander("Google Sheet tracking", expanded=True):
-        st.markdown("#### Editable Google Sheet")
-        st.caption(
-            "Use this when you want to update a normal Google Sheet during the race. "
-            "Share or publish the Sheet so the app can view it, paste the Sheet link below, then reload it here."
-        )
-        template = pd.DataFrame(columns=GOOGLE_SHEET_TEMPLATE_COLUMNS)
-        st.download_button(
-            "Download Google Sheet template CSV",
-            template.to_csv(index=False),
-            file_name="endure24_google_sheet_race_log_template.csv",
-            mime="text/csv",
-            width="stretch",
-        )
-        sheet_url = st.text_input(
-            "Editable Google Sheet link",
-            value=st.session_state.get("editable_google_sheet_url", DEFAULT_EDITABLE_GOOGLE_SHEET_URL),
-            placeholder="https://docs.google.com/spreadsheets/d/.../edit#gid=0",
-        )
-        st.session_state["editable_google_sheet_url"] = sheet_url
-        c1, c2 = st.columns([1, 1])
-        live_reload = c1.checkbox(
-            "Live reload from this Sheet",
+    st.session_state.setdefault("race_day_sheet_id", str(default_sheet_id))
+    st.session_state.setdefault("race_day_worksheet_name", "race_log")
+    st.session_state.setdefault("editable_google_sheet_url", DEFAULT_EDITABLE_GOOGLE_SHEET_URL)
+
+    sheet_id = str(st.session_state.get("race_day_sheet_id") or default_sheet_id).strip()
+    worksheet_name = str(st.session_state.get("race_day_worksheet_name") or "race_log").strip() or "race_log"
+    sheet_url = str(st.session_state.get("editable_google_sheet_url") or "").strip()
+    configured = google_sheets_configured(st.secrets, sheet_id or None)
+
+    with st.container(border=True):
+        top_cols = st.columns([1.5, 1, 1])
+        with top_cols[0]:
+            st.markdown("#### Live Sheet")
+            if configured:
+                st.caption("Connected. Load pulls the latest race log; Save writes the app log back to the Sheet.")
+            else:
+                st.caption("Write access is not configured. Public-link loading and CSV backup are still available.")
+
+        live_reload = top_cols[1].checkbox(
+            "Auto reload",
             value=st.session_state.get("race_day_live_sheet_enabled", False),
-            help="When enabled, the app reloads the Google Sheet automatically while this tab is open.",
+            help="Reloads the Sheet while this Race Day tab is open.",
         )
-        refresh_seconds = c2.number_input(
-            "Refresh seconds",
+        refresh_seconds = top_cols[2].number_input(
+            "Every seconds",
             min_value=10,
             max_value=300,
             value=int(st.session_state.get("race_day_live_refresh_seconds", 30)),
@@ -727,79 +752,86 @@ def show_google_sheet_controls(log: pd.DataFrame, roster: pd.DataFrame) -> pd.Da
         elif live_reload and st_autorefresh is None:
             st.warning("Live reload needs the streamlit-autorefresh package. Manual loading still works.")
 
-        should_load_sheet = st.button("Load editable Google Sheet now", width="stretch") or live_reload
+        action_cols = st.columns([1, 1, 1.2])
+        load_now = action_cols[0].button("Load Sheet", width="stretch")
+        save_now = action_cols[1].button("Save Sheet", width="stretch", disabled=not configured)
+        if configured:
+            action_cols[2].success("Google sync ready.")
+        else:
+            action_cols[2].warning("Save disabled until secrets are set.")
+
+        should_load_sheet = load_now or live_reload
         if should_load_sheet:
             try:
-                loaded = read_race_log_from_google_sheet_url(sheet_url, roster)
-                warnings, errors = validate_race_log(loaded, roster)
+                if configured:
+                    loaded = read_race_log_from_google_sheet(
+                        st.secrets,
+                        sheet_id=sheet_id or None,
+                        worksheet_name=worksheet_name,
+                    )
+                else:
+                    loaded = read_race_log_from_google_sheet_url(sheet_url, roster)
+                warnings, errors = validate_race_log(loaded, roster, caps_enabled=caps_enabled)
                 if errors:
-                    for error in errors:
-                        st.error(error)
+                    show_race_day_alerts(warnings, errors)
                 else:
                     log = set_race_log(loaded, roster)
                     loaded_at = pd.Timestamp.now().strftime("%H:%M:%S")
                     st.session_state["editable_google_sheet_last_loaded"] = loaded_at
                     if st.session_state.get("race_log_changed"):
-                        st.success(f"Race log loaded from editable Google Sheet at {loaded_at}.")
+                        st.success(f"Race log loaded at {loaded_at}.")
                     else:
                         st.caption(f"Sheet checked at {loaded_at}; no race-log changes found.")
-                    for warning in warnings:
-                        st.warning(warning)
+                    if warnings:
+                        show_race_day_alerts(warnings, [])
             except Exception as exc:
                 st.error(
-                    "Could not load the Google Sheet. Make sure the link is shared so the app can view it, "
-                    f"or use File > Share > Publish to web. Details: {exc}"
+                    "Could not load the Sheet. Check sharing, credentials, and worksheet name. "
+                    f"Details: {exc}"
                 )
         if st.session_state.get("editable_google_sheet_last_loaded"):
-            st.caption(f"Last successful Sheet load: {st.session_state['editable_google_sheet_last_loaded']}.")
+            st.caption(f"Last load: {st.session_state['editable_google_sheet_last_loaded']}.")
 
-        st.divider()
-        st.markdown("#### App write-back with service account")
-        st.caption("Optional advanced mode: lets the app save directly into Google Sheets using Streamlit secrets.")
-        c1, c2 = st.columns([2, 1])
-        sheet_id = c1.text_input("Sheet ID", value=str(default_sheet_id), placeholder="Google Sheet ID")
-        worksheet_name = c2.text_input("Worksheet", value="race_log")
-        configured = google_sheets_configured(st.secrets, sheet_id.strip() or None)
-        if configured:
-            st.success("Google Sheets credentials detected.")
-        else:
-            st.warning("Google Sheets credentials are not configured. CSV backup is available below.")
-
-        load_col, save_col = st.columns(2)
-        if load_col.button("Load from Google Sheet", width="stretch"):
-            try:
-                loaded = read_race_log_from_google_sheet(
-                    st.secrets,
-                    sheet_id=sheet_id.strip() or None,
-                    worksheet_name=worksheet_name.strip() or "race_log",
-                )
-                log = set_race_log(loaded, roster)
-                st.success("Race log loaded from Google Sheets.")
-            except Exception as exc:
-                st.error(f"Could not load Google Sheet: {exc}")
-
-        if save_col.button("Save to Google Sheet", width="stretch"):
-            warnings, errors = validate_race_log(log, roster)
+        if save_now:
+            warnings, errors = validate_race_log(log, roster, caps_enabled=caps_enabled)
             if errors:
-                st.error("Fix race-log errors before saving to Google Sheets.")
+                show_race_day_alerts(warnings, errors)
             else:
                 try:
                     write_race_log_to_google_sheet(
                         log,
                         st.secrets,
-                        sheet_id=sheet_id.strip() or None,
-                        worksheet_name=worksheet_name.strip() or "race_log",
+                        sheet_id=sheet_id or None,
+                        worksheet_name=worksheet_name,
                     )
-                    st.success("Race log saved to Google Sheets.")
-                    for warning in warnings:
-                        st.warning(warning)
+                    st.success("Race log saved to the Sheet.")
+                    if warnings:
+                        show_race_day_alerts(warnings, [])
                 except Exception as exc:
-                    st.error(f"Could not save Google Sheet: {exc}")
+                    st.error(f"Could not save the Sheet: {exc}")
+
+        with st.expander("Sheet settings", expanded=False):
+            settings_cols = st.columns([2, 1])
+            settings_cols[0].text_input("Sheet ID", key="race_day_sheet_id", placeholder="Google Sheet ID")
+            settings_cols[1].text_input("Worksheet", key="race_day_worksheet_name")
+            st.text_input(
+                "Public Sheet link fallback",
+                key="editable_google_sheet_url",
+                placeholder="https://docs.google.com/spreadsheets/d/.../edit#gid=0",
+            )
+            template = pd.DataFrame(columns=GOOGLE_SHEET_TEMPLATE_COLUMNS)
+            st.download_button(
+                "Download Sheet template CSV",
+                template.to_csv(index=False),
+                file_name="endure24_google_sheet_race_log_template.csv",
+                mime="text/csv",
+                width="stretch",
+            )
     return log
 
 
-def show_race_log_entry(log: pd.DataFrame, roster: pd.DataFrame) -> pd.DataFrame:
-    state = race_state_from_log(log, roster, target_laps=1)
+def show_race_log_entry(log: pd.DataFrame, roster: pd.DataFrame, caps_enabled: bool) -> pd.DataFrame:
+    state = race_state_from_log(log, roster, target_laps=1, caps_enabled=caps_enabled)
     runner_options = roster.sort_values("running_order")["runner"].astype(str).tolist()
     if not runner_options:
         st.warning("Add at least one available runner before logging race laps.")
@@ -827,6 +859,10 @@ def show_race_log_entry(log: pd.DataFrame, roster: pd.DataFrame) -> pd.DataFrame
                 f"Completing lap {int(state.latest_lap['lap_number'])}, started {format_race_clock(state.in_progress_start_minute)}."
             )
         notes = top_cols[2].text_input("Notes", value="")
+        if action != "Complete current lap" and state.next_runner and runner != state.next_runner:
+            st.warning(
+                f"Fixed order expects {state.next_runner}. Saving {runner} is allowed and will be marked as an order exception."
+            )
 
         start_minute = None
         finish_minute = None
@@ -919,56 +955,53 @@ def show_race_log_entry(log: pd.DataFrame, roster: pd.DataFrame) -> pd.DataFrame
                 candidate = None
 
         if not form_errors and candidate is not None:
-            warnings, errors = validate_race_log(candidate, roster)
+            warnings, errors = validate_race_log(candidate, roster, caps_enabled=caps_enabled)
             if errors:
-                for error in errors:
-                    st.error(error)
+                show_race_day_alerts(warnings, errors)
             else:
                 log = set_race_log(candidate, roster)
                 st.success("Race log updated.")
-                for warning in warnings:
-                    st.warning(warning)
+                if warnings:
+                    show_race_day_alerts(warnings, [])
 
-    st.markdown("#### Paste Laps")
-    pasted = st.text_area(
-        "Pasted table",
-        height=120,
-        placeholder="runner,start_time,finish_time,lap_duration_minutes,notes\nToby,Sat 12:00,Sat 12:41,41,clean lap",
-    )
-    paste_col_1, paste_col_2 = st.columns(2)
-    if paste_col_1.button("Append pasted rows", width="stretch"):
-        try:
-            pasted_log = parse_pasted_laps(pasted, roster)
-            if not pasted_log.empty:
-                offset = int(log["lap_number"].max()) if not log.empty else 0
-                pasted_log["lap_number"] = pasted_log["lap_number"] + offset
-            candidate = normalise_race_log(pd.concat([log, pasted_log], ignore_index=True), roster)
-            warnings, errors = validate_race_log(candidate, roster)
-            if errors:
-                for error in errors:
-                    st.error(error)
-            else:
-                log = set_race_log(candidate, roster)
-                st.success("Pasted rows appended.")
-                for warning in warnings:
-                    st.warning(warning)
-        except Exception as exc:
-            st.error(f"Could not import pasted rows: {exc}")
+    with st.expander("Bulk paste", expanded=False):
+        pasted = st.text_area(
+            "Paste rows",
+            height=120,
+            placeholder="runner,start_time,finish_time,lap_duration_minutes,notes\nToby,Sat 12:00,Sat 12:41,41,clean lap",
+        )
+        paste_col_1, paste_col_2 = st.columns(2)
+        if paste_col_1.button("Append pasted rows", width="stretch"):
+            try:
+                pasted_log = parse_pasted_laps(pasted, roster)
+                if not pasted_log.empty:
+                    offset = int(log["lap_number"].max()) if not log.empty else 0
+                    pasted_log["lap_number"] = pasted_log["lap_number"] + offset
+                candidate = normalise_race_log(pd.concat([log, pasted_log], ignore_index=True), roster)
+                warnings, errors = validate_race_log(candidate, roster, caps_enabled=caps_enabled)
+                if errors:
+                    show_race_day_alerts(warnings, errors)
+                else:
+                    log = set_race_log(candidate, roster)
+                    st.success("Pasted rows appended.")
+                    if warnings:
+                        show_race_day_alerts(warnings, [])
+            except Exception as exc:
+                st.error(f"Could not import pasted rows: {exc}")
 
-    if paste_col_2.button("Replace with pasted table", width="stretch"):
-        try:
-            candidate = parse_pasted_laps(pasted, roster)
-            warnings, errors = validate_race_log(candidate, roster)
-            if errors:
-                for error in errors:
-                    st.error(error)
-            else:
-                log = set_race_log(candidate, roster)
-                st.success("Race log replaced.")
-                for warning in warnings:
-                    st.warning(warning)
-        except Exception as exc:
-            st.error(f"Could not import pasted table: {exc}")
+        if paste_col_2.button("Replace with pasted table", width="stretch"):
+            try:
+                candidate = parse_pasted_laps(pasted, roster)
+                warnings, errors = validate_race_log(candidate, roster, caps_enabled=caps_enabled)
+                if errors:
+                    show_race_day_alerts(warnings, errors)
+                else:
+                    log = set_race_log(candidate, roster)
+                    st.success("Race log replaced.")
+                    if warnings:
+                        show_race_day_alerts(warnings, [])
+            except Exception as exc:
+                st.error(f"Could not import pasted table: {exc}")
 
     return log
 
@@ -1030,73 +1063,90 @@ def update_race_day_forecast(
 
 
 def show_race_day(roster: pd.DataFrame, settings: SimulationSettings, caps_enabled: bool) -> None:
-    st.subheader("Race Day Command Centre")
+    st.subheader("Race Day")
     if "race_log" not in st.session_state:
         st.session_state["race_log"] = empty_race_log()
     log = normalise_race_log(st.session_state["race_log"], roster)
     st.session_state["race_log"] = log
 
-    log = show_google_sheet_controls(log, roster)
-    warnings, errors = validate_race_log(log, roster)
-
-    auto_forecast = st.checkbox(
-        "Auto-update forecast when the live Sheet changes",
-        value=st.session_state.get("race_day_live_auto_forecast", True),
-        help="Keeps the forecast current when live Sheet reload detects a changed race log.",
-    )
-    st.session_state["race_day_live_auto_forecast"] = auto_forecast
-    if auto_forecast and st.session_state.get("race_log_changed") and not errors:
-        with st.spinner("Live Sheet changed; updating race-day forecast..."):
-            update_race_day_forecast(roster, settings, log, caps_enabled)
-            st.success("Live Sheet changed; race-day forecast updated.")
+    log = show_google_sheet_controls(log, roster, caps_enabled)
+    warnings, errors = validate_race_log(log, roster, caps_enabled=caps_enabled)
 
     state = race_state_from_log(log, roster, settings.target_laps, caps_enabled=caps_enabled)
     live_bundle = st.session_state.get("race_day_forecast", {}).get("live_bundle")
     baseline_bundle = st.session_state.get("race_day_forecast", {}).get("baseline_bundle")
     show_race_day_metrics(state, live_bundle, settings.target_laps)
-
-    forecast_col, sync_col = st.columns([1.2, 1])
-    with forecast_col:
-        if st.button("Update race-day forecast", type="primary", width="stretch"):
-            if errors:
-                st.error("Fix race-log errors before forecasting.")
-            else:
-                with st.spinner("Updating race-day forecast..."):
-                    baseline_bundle, live_bundle = update_race_day_forecast(roster, settings, log, caps_enabled)
-                    st.success("Race-day forecast updated.")
-    with sync_col:
-        if st.session_state.get("race_day_live_sheet_enabled"):
-            st.info("Live Sheet reload is on.")
-        else:
-            st.info("Live Sheet reload is off.")
-
-    for warning in warnings:
-        st.warning(warning)
-    for error in errors:
-        st.error(error)
-
-    if baseline_bundle and live_bundle:
-        fig = final_lap_comparison_figure(
-            baseline_bundle["final_lap_distribution"],
-            live_bundle["final_lap_distribution"],
-            "Pre-race forecast",
-            "Actual-adjusted forecast",
-            "Pre-race vs actual-adjusted final lap probability",
-        )
-        st.plotly_chart(fig, width="stretch")
+    show_race_day_alerts(warnings, errors)
 
     c1, c2 = st.columns([1, 1])
     with c1:
-        log = show_race_log_entry(log, roster)
+        log = show_race_log_entry(log, roster, caps_enabled)
     with c2:
         st.markdown("#### Latest Laps")
-        display_log = format_race_log_for_display(log)
+        display_log = format_race_log_for_display(log, roster, caps_enabled)
         if display_log.empty:
             st.info("No race laps logged yet.")
         else:
-            st.dataframe(display_log.tail(12).sort_values("lap_number", ascending=False), width="stretch", hide_index=True)
-        st.markdown("#### Backup")
-        log = show_race_log_backup(log, roster)
+            st.dataframe(
+                display_log.tail(12).sort_values("lap_number", ascending=False),
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    "lap_number": st.column_config.NumberColumn("Lap", format="%d"),
+                    "runner": "Runner",
+                    "status": "Status",
+                    "order_status": "Order",
+                    "start_time": "Start",
+                    "finish_time": "Finish",
+                    "lap_duration_minutes": st.column_config.NumberColumn("Mins", format="%.1f"),
+                    "notes": "Notes",
+                },
+            )
+        with st.expander("Backup", expanded=False):
+            log = show_race_log_backup(log, roster)
+
+    with st.expander("Forecast plot", expanded=bool(baseline_bundle and live_bundle)):
+        forecast_col, auto_col = st.columns([1.2, 1])
+        with forecast_col:
+            if st.button("Update race-day forecast", type="primary", width="stretch"):
+                if errors:
+                    st.error("Fix race-log errors before forecasting.")
+                else:
+                    with st.spinner("Updating race-day forecast..."):
+                        baseline_bundle, live_bundle = update_race_day_forecast(roster, settings, log, caps_enabled)
+                        st.success("Race-day forecast updated.")
+        auto_forecast = auto_col.checkbox(
+            "Update after Sheet changes",
+            value=st.session_state.get("race_day_live_auto_forecast", True),
+            help="When live Sheet reload changes the log, refresh the forecast automatically.",
+        )
+        st.session_state["race_day_live_auto_forecast"] = auto_forecast
+        if auto_forecast and st.session_state.get("race_log_changed") and not errors:
+            with st.spinner("Live Sheet changed; updating race-day forecast..."):
+                update_race_day_forecast(roster, settings, log, caps_enabled)
+                st.success("Live Sheet changed; race-day forecast updated.")
+
+        if st.session_state.get("race_day_live_sheet_enabled"):
+            st.caption("Live Sheet reload is on.")
+        else:
+            st.caption("Live Sheet reload is off.")
+
+        if baseline_bundle and live_bundle:
+            fig = final_lap_comparison_figure(
+                baseline_bundle["final_lap_distribution"],
+                live_bundle["final_lap_distribution"],
+                "Pre-race forecast",
+                "Actual-adjusted forecast",
+                "Pre-race vs actual-adjusted final lap probability",
+            )
+            st.plotly_chart(fig, width="stretch")
+        elif errors:
+            st.info("Forecast plot is paused until race-log errors are fixed.")
+        else:
+            st.info("Run the race-day forecast to show the live probability plot.")
+
+    # Keep the latest validated log in session after any nested controls changed it.
+    st.session_state["race_log"] = normalise_race_log(log, roster)
 
 
 def show_exports_tab(sim_output: dict | None, summary_bundle: dict | None, comparison: pd.DataFrame | None) -> None:
