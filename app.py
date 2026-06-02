@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import hashlib
+import html
 from pathlib import Path
 
 import pandas as pd
@@ -19,6 +20,9 @@ from optimizer import optimize_running_orders
 from race_day import (
     GOOGLE_SHEET_TEMPLATE_COLUMNS,
     append_manual_lap,
+    build_progress_actuals,
+    build_runner_queue,
+    build_runner_status_table,
     complete_in_progress_lap,
     empty_race_log,
     forecast_from_race_log,
@@ -31,6 +35,7 @@ from race_day import (
     race_state_from_log,
     read_race_log_from_google_sheet_url,
     read_race_log_from_google_sheet,
+    target_pace_series,
     validate_race_log,
     write_race_log_to_google_sheet,
 )
@@ -84,6 +89,59 @@ def inject_app_styles() -> None:
             border-radius: 6px;
             min-height: 2.5rem;
         }
+        .race-status {
+            border: 1px solid #d7dde5;
+            border-left-width: 8px;
+            border-radius: 8px;
+            padding: 0.85rem 1rem;
+            margin: 0.25rem 0 0.75rem 0;
+            background: #ffffff;
+        }
+        .race-status h3 {
+            font-size: 1.05rem;
+            margin: 0 0 0.15rem 0;
+        }
+        .race-status p {
+            margin: 0;
+            color: #465467;
+        }
+        .race-status-good {
+            border-left-color: #168251;
+            background: #f3fbf7;
+        }
+        .race-status-watch {
+            border-left-color: #c47a00;
+            background: #fff8eb;
+        }
+        .race-status-risk {
+            border-left-color: #c03535;
+            background: #fff4f4;
+        }
+        .race-mini {
+            border: 1px solid #e2e8f0;
+            border-radius: 8px;
+            padding: 0.75rem 0.85rem;
+            background: #ffffff;
+            min-height: 5.25rem;
+        }
+        .race-mini-label {
+            color: #617083;
+            font-size: 0.78rem;
+            font-weight: 650;
+            text-transform: uppercase;
+        }
+        .race-mini-value {
+            color: #162235;
+            font-size: 1.35rem;
+            font-weight: 760;
+            line-height: 1.2;
+            margin-top: 0.2rem;
+        }
+        .race-mini-help {
+            color: #617083;
+            font-size: 0.82rem;
+            margin-top: 0.25rem;
+        }
         @media (max-width: 760px) {
             .block-container {
                 padding-left: 0.75rem;
@@ -92,6 +150,12 @@ def inject_app_styles() -> None:
             div[data-testid="column"] {
                 width: 100% !important;
                 flex: 1 1 100% !important;
+            }
+            .race-mini {
+                min-height: auto;
+            }
+            .race-mini-value {
+                font-size: 1.2rem;
             }
         }
         </style>
@@ -242,6 +306,112 @@ def final_lap_comparison_figure(
         legend_title_text="Forecast",
     )
     return fig
+
+
+def race_progress_figure(
+    actual_progress: pd.DataFrame,
+    target_progress: pd.DataFrame,
+    baseline_output: dict | None,
+    live_output: dict | None,
+    elapsed_minute: float,
+) -> go.Figure:
+    fig = go.Figure()
+
+    fig.add_trace(
+        go.Scatter(
+            x=target_progress["time_minute"],
+            y=target_progress["completed_laps"],
+            mode="lines",
+            name="Target pace",
+            line={"color": "#7a5c00", "dash": "dash", "width": 2},
+            hovertemplate="%{y:.1f} laps by %{x:.0f} min<extra></extra>",
+        )
+    )
+
+    _add_forecast_band(fig, baseline_output, "Pre-race", "#2f6f8f", "rgba(47, 111, 143, 0.13)")
+    _add_forecast_band(fig, live_output, "Live forecast", "#168251", "rgba(22, 130, 81, 0.14)")
+
+    if not actual_progress.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=actual_progress["time_minute"],
+                y=actual_progress["completed_laps"],
+                mode="lines+markers",
+                name="Actual",
+                line={"color": "#111827", "width": 4, "shape": "hv"},
+                marker={"size": 7, "color": "#111827"},
+                hovertemplate="%{y:.0f} official laps<extra></extra>",
+            )
+        )
+
+    if elapsed_minute > 0:
+        fig.add_vline(x=float(elapsed_minute), line_color="#64748b", line_dash="solid", opacity=0.45)
+    fig.add_vline(x=LAST_START_MINUTE, line_dash="dash", line_color="#c03535")
+    fig.add_vline(x=FINAL_CUTOFF_MINUTE, line_dash="dot", line_color="#c03535")
+
+    max_laps = float(target_progress["completed_laps"].max()) if not target_progress.empty else 0.0
+    for source in [actual_progress, _path_quantiles_or_empty(baseline_output), _path_quantiles_or_empty(live_output)]:
+        if not source.empty:
+            for column in ["completed_laps", "p90", "median"]:
+                if column in source:
+                    max_laps = max(max_laps, float(pd.to_numeric(source[column], errors="coerce").max()))
+    fig.update_layout(
+        title="Progress vs plan",
+        height=390,
+        margin={"l": 8, "r": 8, "t": 46, "b": 8},
+        legend={"orientation": "h", "y": -0.18},
+        yaxis_title="Official laps",
+        yaxis_range=[0, max_laps + 1],
+    )
+    apply_race_clock_axis(fig)
+    return fig
+
+
+def _add_forecast_band(fig: go.Figure, sim_output: dict | None, label: str, color: str, fillcolor: str) -> None:
+    quantiles = _path_quantiles_or_empty(sim_output)
+    if quantiles.empty:
+        return
+    fig.add_trace(
+        go.Scatter(
+            x=quantiles["time_minute"],
+            y=quantiles["p90"],
+            mode="lines",
+            line={"width": 0},
+            showlegend=False,
+            hoverinfo="skip",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=quantiles["time_minute"],
+            y=quantiles["p10"],
+            mode="lines",
+            fill="tonexty",
+            fillcolor=fillcolor,
+            line={"width": 0},
+            name=f"{label} 10-90%",
+            hovertemplate="%{y:.0f} laps<extra></extra>",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=quantiles["time_minute"],
+            y=quantiles["median"],
+            mode="lines",
+            name=f"{label} median",
+            line={"color": color, "width": 2},
+            hovertemplate="%{y:.0f} laps<extra></extra>",
+        )
+    )
+
+
+def _path_quantiles_or_empty(sim_output: dict | None) -> pd.DataFrame:
+    if not sim_output:
+        return pd.DataFrame()
+    quantiles = sim_output.get("path_quantiles")
+    if not isinstance(quantiles, pd.DataFrame):
+        return pd.DataFrame()
+    return quantiles
 
 
 def edited_roster_table(roster: pd.DataFrame) -> pd.DataFrame:
@@ -694,19 +864,216 @@ def show_race_day_metrics(state, live_bundle: dict | None, target_laps: int) -> 
         st.info(" ".join(parts))
 
 
-def show_race_day_alerts(warnings: list[str], errors: list[str]) -> None:
+def show_race_control_dashboard(
+    log: pd.DataFrame,
+    roster: pd.DataFrame,
+    settings: SimulationSettings,
+    state,
+    baseline_output: dict | None,
+    live_output: dict | None,
+    live_bundle: dict | None,
+    warnings: list[str],
+    errors: list[str],
+    caps_enabled: bool,
+) -> None:
+    live_summary = live_bundle["summary"] if live_bundle else None
+    status_level, status_title, status_body = race_day_status_summary(state, live_summary, warnings, errors)
+
+    st.markdown("### Race Control")
+    st.markdown(
+        f"""
+        <div class="race-status race-status-{status_level}">
+            <h3>{html.escape(status_title)}</h3>
+            <p>{html.escape(status_body)}</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    latest_completed = latest_completed_lap(log, roster)
+    last_lap_value = "-"
+    last_lap_help = "No completed laps yet"
+    if latest_completed is not None:
+        last_lap_value = f"{latest_completed['runner']} {float(latest_completed['lap_duration_minutes']):.1f}m"
+        last_lap_help = f"Finished {format_race_clock(latest_completed['finish_minute'])}"
+
+    runner_label = "Current" if state.current_lap_in_progress else "Next"
+    runner_value = state.next_runner or "None"
+    runner_help = "On course now" if state.current_lap_in_progress else "Fixed planned order"
+
+    pace_needed = state.average_needed_to_start_target_lap or state.average_needed_to_target
+    pace_value = f"{pace_needed:.1f}m" if pace_needed is not None else "Hit"
+    pace_help = "Avg needed to start target lap by Sunday 12:00" if state.average_needed_to_start_target_lap else "Avg needed by Sunday 13:00"
+    if state.remaining_to_target <= 0:
+        pace_help = "Target already logged"
+
+    cards = [
+        ("Official laps", str(state.current_laps), f"Target {settings.target_laps}"),
+        ("Target chance", format_probability(live_summary["probability_target_laps"]) if live_summary else "-", "Run forecast for live probability"),
+        ("Projected final", format_minutes(live_summary["expected_official_laps"]) if live_summary else "-", "Actual-adjusted forecast"),
+        (runner_label, runner_value, runner_help),
+        ("Last lap", last_lap_value, last_lap_help),
+        ("Pace needed", pace_value, pace_help),
+    ]
+    for row_start in range(0, len(cards), 3):
+        cols = st.columns(3)
+        for col, card in zip(cols, cards[row_start : row_start + 3]):
+            with col:
+                race_mini_card(*card)
+
+    actual_progress = build_progress_actuals(log, roster)
+    target_progress = target_pace_series(settings.target_laps)
+    st.plotly_chart(
+        race_progress_figure(actual_progress, target_progress, baseline_output, live_output, state.elapsed_minute),
+        width="stretch",
+    )
+
+    queue = build_runner_queue(log, roster, caps_enabled=caps_enabled, queue_size=3)
+    st.markdown("#### Runner Queue")
+    if queue.empty:
+        st.info("No available runners in the current setup.")
+    else:
+        st.dataframe(
+            format_runner_queue_for_display(queue),
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "role": "Slot",
+                "runner": "Runner",
+                "completed_laps": st.column_config.NumberColumn("Laps", format="%d"),
+                "cap_remaining": "Cap left",
+                "last_lap": "Last",
+                "rest": "Rest",
+                "order_status": "Order",
+            },
+        )
+
+    with st.expander("All runner status", expanded=False):
+        status = build_runner_status_table(log, roster, caps_enabled=caps_enabled)
+        st.dataframe(
+            format_runner_queue_for_display(status),
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "role": "Status",
+                "runner": "Runner",
+                "completed_laps": st.column_config.NumberColumn("Laps", format="%d"),
+                "cap_remaining": "Cap left",
+                "last_lap": "Last",
+                "rest": "Rest",
+            },
+        )
+
+
+def race_mini_card(label: str, value: str, help_text: str) -> None:
+    st.markdown(
+        f"""
+        <div class="race-mini">
+            <div class="race-mini-label">{html.escape(str(label))}</div>
+            <div class="race-mini-value">{html.escape(str(value))}</div>
+            <div class="race-mini-help">{html.escape(str(help_text))}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def race_day_status_summary(
+    state,
+    live_summary: dict | None,
+    warnings: list[str],
+    errors: list[str],
+) -> tuple[str, str, str]:
+    if errors:
+        return "risk", "Fix now", f"{len(errors)} issue(s) block forecasting or saving."
+    if state.remaining_to_target <= 0:
+        return "good", "Target logged", "The selected target lap count is already in the race log."
+
+    probability = None if live_summary is None else live_summary.get("probability_target_laps")
+    if probability is not None and not pd.isna(probability):
+        probability = float(probability)
+        if probability >= 0.7 and not warnings:
+            return "good", "On track", f"Live target probability is {probability:.0%}."
+        if probability < 0.35:
+            return "risk", "Target at risk", f"Live target probability is {probability:.0%}."
+        return "watch", "Watch closely", f"Live target probability is {probability:.0%}."
+
+    if warnings:
+        return "watch", "Watch closely", f"{len(warnings)} race-log check(s) need attention."
+    return "good", "Ready", "No race-log issues detected. Run a race-day forecast for live probability."
+
+
+def latest_completed_lap(log: pd.DataFrame, roster: pd.DataFrame) -> dict | None:
+    clean = normalise_race_log(log, roster)
+    completed = clean.dropna(subset=["finish_minute", "lap_duration_minutes"]).sort_values("finish_minute")
+    if completed.empty:
+        return None
+    return completed.iloc[-1].to_dict()
+
+
+def format_runner_queue_for_display(queue: pd.DataFrame) -> pd.DataFrame:
+    display = queue.copy()
+    display["last_lap"] = display["last_lap_minutes"].map(lambda value: "-" if pd.isna(value) else f"{float(value):.1f}m")
+    display["rest"] = display["rest_minutes"].map(lambda value: "-" if pd.isna(value) else f"{float(value):.0f}m")
+    columns = ["role", "runner", "completed_laps", "cap_remaining", "last_lap", "rest", "order_status"]
+    return display[[column for column in columns if column in display.columns]]
+
+
+def show_race_day_alerts(warnings: list[str], errors: list[str], detail_expanded: bool = False) -> None:
+    warnings = prioritize_alerts(warnings)
+    errors = prioritize_alerts(errors)
     if not warnings and not errors:
         st.success("Race log looks clean.")
         return
 
+    cols = st.columns(2)
     if errors:
-        st.error("Fix before forecasting or saving:\n\n- " + "\n- ".join(errors[:6]))
-        if len(errors) > 6:
-            st.caption(f"{len(errors) - 6} more errors hidden.")
+        cols[0].error(f"Fix now: {len(errors)}")
+    else:
+        cols[0].success("Fix now: 0")
     if warnings:
-        st.warning("Check on the day:\n\n- " + "\n- ".join(warnings[:7]))
-        if len(warnings) > 7:
-            st.caption(f"{len(warnings) - 7} more checks hidden.")
+        cols[1].warning(f"Watch: {len(warnings)}")
+    else:
+        cols[1].success("Watch: 0")
+
+    with st.expander("Alert details", expanded=detail_expanded):
+        if errors:
+            st.markdown("**Fix now**")
+            st.markdown("- " + "\n- ".join(errors[:8]))
+            if len(errors) > 8:
+                st.caption(f"{len(errors) - 8} more errors hidden.")
+        if warnings:
+            st.markdown("**Watch**")
+            st.markdown("- " + "\n- ".join(warnings[:10]))
+            if len(warnings) > 10:
+                st.caption(f"{len(warnings) - 10} more checks hidden.")
+
+
+def prioritize_alerts(messages: list[str]) -> list[str]:
+    priority_terms = [
+        "Unknown runner",
+        "Every race-log row",
+        "Duplicate",
+        "overlap",
+        "start before",
+        "Finish times",
+        "Start times",
+        "in progress",
+        "Order exception",
+        "Sunday 13:00",
+        "Sunday 12:00",
+        "Pace check",
+        "Cap warning",
+        "Timing gap",
+    ]
+
+    def key(message: str) -> tuple[int, str]:
+        for index, term in enumerate(priority_terms):
+            if term.lower() in str(message).lower():
+                return index, str(message)
+        return len(priority_terms), str(message)
+
+    return sorted(messages, key=key)
 
 
 def show_google_sheet_controls(log: pd.DataFrame, roster: pd.DataFrame, caps_enabled: bool) -> pd.DataFrame:
@@ -779,7 +1146,8 @@ def show_google_sheet_controls(log: pd.DataFrame, roster: pd.DataFrame, caps_ena
                     loaded_at = pd.Timestamp.now().strftime("%H:%M:%S")
                     st.session_state["editable_google_sheet_last_loaded"] = loaded_at
                     if st.session_state.get("race_log_changed"):
-                        st.success(f"Race log loaded at {loaded_at}.")
+                        st.session_state["race_day_notice"] = f"Race log loaded at {loaded_at}."
+                        st.rerun()
                     else:
                         st.caption(f"Sheet checked at {loaded_at}; no race-log changes found.")
                     if warnings:
@@ -960,9 +1328,8 @@ def show_race_log_entry(log: pd.DataFrame, roster: pd.DataFrame, caps_enabled: b
                 show_race_day_alerts(warnings, errors)
             else:
                 log = set_race_log(candidate, roster)
-                st.success("Race log updated.")
-                if warnings:
-                    show_race_day_alerts(warnings, [])
+                st.session_state["race_day_notice"] = "Race log updated."
+                st.rerun()
 
     with st.expander("Bulk paste", expanded=False):
         pasted = st.text_area(
@@ -983,9 +1350,8 @@ def show_race_log_entry(log: pd.DataFrame, roster: pd.DataFrame, caps_enabled: b
                     show_race_day_alerts(warnings, errors)
                 else:
                     log = set_race_log(candidate, roster)
-                    st.success("Pasted rows appended.")
-                    if warnings:
-                        show_race_day_alerts(warnings, [])
+                    st.session_state["race_day_notice"] = "Pasted rows appended."
+                    st.rerun()
             except Exception as exc:
                 st.error(f"Could not import pasted rows: {exc}")
 
@@ -997,9 +1363,8 @@ def show_race_log_entry(log: pd.DataFrame, roster: pd.DataFrame, caps_enabled: b
                     show_race_day_alerts(warnings, errors)
                 else:
                     log = set_race_log(candidate, roster)
-                    st.success("Race log replaced.")
-                    if warnings:
-                        show_race_day_alerts(warnings, [])
+                    st.session_state["race_day_notice"] = "Race log replaced."
+                    st.rerun()
             except Exception as exc:
                 st.error(f"Could not import pasted table: {exc}")
 
@@ -1015,7 +1380,8 @@ def show_race_log_backup(log: pd.DataFrame, roster: pd.DataFrame) -> pd.DataFram
         else:
             try:
                 log = set_race_log(pd.read_csv(uploaded_log), roster)
-                st.success("CSV backup loaded.")
+                st.session_state["race_day_notice"] = "CSV backup loaded."
+                st.rerun()
             except Exception as exc:
                 st.error(f"Could not load CSV backup: {exc}")
 
@@ -1034,11 +1400,13 @@ def show_race_log_backup(log: pd.DataFrame, roster: pd.DataFrame) -> pd.DataFram
         else:
             last_lap = int(clean["lap_number"].max())
             log = set_race_log(clean[clean["lap_number"].astype(int) != last_lap], roster)
-            st.success(f"Removed lap {last_lap}.")
+            st.session_state["race_day_notice"] = f"Removed lap {last_lap}."
+            st.rerun()
 
     if st.button("Clear race log"):
         log = set_race_log(empty_race_log(), roster)
-        st.success("Race log cleared.")
+        st.session_state["race_day_notice"] = "Race log cleared."
+        st.rerun()
     return log
 
 
@@ -1056,6 +1424,7 @@ def update_race_day_forecast(
     st.session_state["race_day_forecast"] = {
         "baseline_bundle": baseline_bundle,
         "live_bundle": live_bundle,
+        "baseline_output": baseline_output,
         "live_output": live_output,
     }
     st.session_state["race_log_changed"] = False
@@ -1064,18 +1433,33 @@ def update_race_day_forecast(
 
 def show_race_day(roster: pd.DataFrame, settings: SimulationSettings, caps_enabled: bool) -> None:
     st.subheader("Race Day")
+    if st.session_state.get("race_day_notice"):
+        st.success(st.session_state.pop("race_day_notice"))
     if "race_log" not in st.session_state:
         st.session_state["race_log"] = empty_race_log()
     log = normalise_race_log(st.session_state["race_log"], roster)
     st.session_state["race_log"] = log
 
-    log = show_google_sheet_controls(log, roster, caps_enabled)
     warnings, errors = validate_race_log(log, roster, caps_enabled=caps_enabled)
-
     state = race_state_from_log(log, roster, settings.target_laps, caps_enabled=caps_enabled)
-    live_bundle = st.session_state.get("race_day_forecast", {}).get("live_bundle")
-    baseline_bundle = st.session_state.get("race_day_forecast", {}).get("baseline_bundle")
-    show_race_day_metrics(state, live_bundle, settings.target_laps)
+    forecast_state = st.session_state.get("race_day_forecast", {})
+    live_bundle = forecast_state.get("live_bundle")
+    baseline_bundle = forecast_state.get("baseline_bundle")
+    baseline_output = forecast_state.get("baseline_output")
+    live_output = forecast_state.get("live_output")
+
+    show_race_control_dashboard(
+        log,
+        roster,
+        settings,
+        state,
+        baseline_output,
+        live_output,
+        live_bundle,
+        warnings,
+        errors,
+        caps_enabled,
+    )
     show_race_day_alerts(warnings, errors)
 
     c1, c2 = st.columns([1, 1])
@@ -1105,6 +1489,9 @@ def show_race_day(roster: pd.DataFrame, settings: SimulationSettings, caps_enabl
         with st.expander("Backup", expanded=False):
             log = show_race_log_backup(log, roster)
 
+    st.markdown("#### Live Sync")
+    log = show_google_sheet_controls(log, roster, caps_enabled)
+
     with st.expander("Forecast plot", expanded=bool(baseline_bundle and live_bundle)):
         forecast_col, auto_col = st.columns([1.2, 1])
         with forecast_col:
@@ -1113,8 +1500,9 @@ def show_race_day(roster: pd.DataFrame, settings: SimulationSettings, caps_enabl
                     st.error("Fix race-log errors before forecasting.")
                 else:
                     with st.spinner("Updating race-day forecast..."):
-                        baseline_bundle, live_bundle = update_race_day_forecast(roster, settings, log, caps_enabled)
-                        st.success("Race-day forecast updated.")
+                        update_race_day_forecast(roster, settings, log, caps_enabled)
+                        st.session_state["race_day_notice"] = "Race-day forecast updated."
+                        st.rerun()
         auto_forecast = auto_col.checkbox(
             "Update after Sheet changes",
             value=st.session_state.get("race_day_live_auto_forecast", True),
@@ -1124,7 +1512,8 @@ def show_race_day(roster: pd.DataFrame, settings: SimulationSettings, caps_enabl
         if auto_forecast and st.session_state.get("race_log_changed") and not errors:
             with st.spinner("Live Sheet changed; updating race-day forecast..."):
                 update_race_day_forecast(roster, settings, log, caps_enabled)
-                st.success("Live Sheet changed; race-day forecast updated.")
+                st.session_state["race_day_notice"] = "Live Sheet changed; race-day forecast updated."
+                st.rerun()
 
         if st.session_state.get("race_day_live_sheet_enabled"):
             st.caption("Live Sheet reload is on.")

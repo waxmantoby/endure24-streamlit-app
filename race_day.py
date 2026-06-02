@@ -420,6 +420,119 @@ def _format_laps(values: Any) -> str:
     return ", ".join(laps)
 
 
+def build_progress_actuals(log: pd.DataFrame, roster: pd.DataFrame) -> pd.DataFrame:
+    clean = normalise_race_log(log, roster)
+    official = clean[clean["official"].fillna(False).astype(bool)].copy()
+    official = official.dropna(subset=["finish_minute"]).sort_values("finish_minute")
+
+    rows = [{"time_minute": 0.0, "completed_laps": 0}]
+    for lap_count, row in enumerate(official.itertuples(index=False), start=1):
+        rows.append({"time_minute": float(row.finish_minute), "completed_laps": lap_count})
+    return pd.DataFrame(rows, columns=["time_minute", "completed_laps"])
+
+
+def target_pace_series(target_laps: int) -> pd.DataFrame:
+    target = max(0, int(target_laps))
+    return pd.DataFrame(
+        [
+            {"time_minute": 0.0, "completed_laps": 0.0},
+            {"time_minute": float(LAST_START_MINUTE), "completed_laps": float(max(target - 1, 0))},
+            {"time_minute": float(FINAL_CUTOFF_MINUTE), "completed_laps": float(target)},
+        ]
+    )
+
+
+def build_runner_queue(
+    log: pd.DataFrame,
+    roster: pd.DataFrame,
+    caps_enabled: bool = True,
+    queue_size: int = 3,
+) -> pd.DataFrame:
+    clean = normalise_race_log(log, roster)
+    state = race_state_from_log(clean, roster, target_laps=1, caps_enabled=caps_enabled)
+    order = _available_order(roster)
+    columns = ["role", "runner", "completed_laps", "cap_remaining", "last_lap_minutes", "rest_minutes", "order_status"]
+    if not order:
+        return pd.DataFrame(columns=columns)
+
+    roster_lookup = _roster_lookup(roster)
+    completed = clean.dropna(subset=["finish_minute", "lap_duration_minutes"]).copy()
+    order_review = race_order_review(clean, roster, caps_enabled=caps_enabled)
+    latest_order_status = ""
+    if state.latest_lap is not None and not order_review.empty:
+        latest_lap_number = int(state.latest_lap["lap_number"])
+        matched = order_review[order_review["lap_number"].astype(int) == latest_lap_number]
+        if not matched.empty:
+            latest_order_status = str(matched.iloc[-1]["order_status"])
+
+    rows: list[dict[str, Any]] = []
+    queued = 0
+    pointer = int(state.next_runner_index)
+
+    if state.current_lap_in_progress and state.in_progress_runner in order:
+        rows.append(
+            _runner_queue_row(
+                role="Current",
+                runner=state.in_progress_runner,
+                state=state,
+                completed=completed,
+                roster_lookup=roster_lookup,
+                caps_enabled=caps_enabled,
+                order_status=latest_order_status or "Running",
+            )
+        )
+        pointer = (order.index(state.in_progress_runner) + 1) % len(order)
+
+    counts = dict(state.runner_lap_counts)
+    while queued < int(queue_size):
+        runner, runner_index = next_eligible_runner(roster, counts, pointer, caps_enabled=caps_enabled)
+        if runner is None:
+            break
+        rows.append(
+            _runner_queue_row(
+                role="Next" if queued == 0 and not state.current_lap_in_progress else f"+{queued + 1}",
+                runner=runner,
+                state=state,
+                completed=completed,
+                roster_lookup=roster_lookup,
+                caps_enabled=caps_enabled,
+                order_status="Planned",
+            )
+        )
+        pointer = (int(runner_index) + 1) % len(order)
+        queued += 1
+
+    return pd.DataFrame(rows, columns=columns)
+
+
+def build_runner_status_table(
+    log: pd.DataFrame,
+    roster: pd.DataFrame,
+    caps_enabled: bool = True,
+) -> pd.DataFrame:
+    clean = normalise_race_log(log, roster)
+    state = race_state_from_log(clean, roster, target_laps=1, caps_enabled=caps_enabled)
+    completed = clean.dropna(subset=["finish_minute", "lap_duration_minutes"]).copy()
+    roster_lookup = _roster_lookup(roster)
+
+    rows = []
+    for runner in _available_order(roster):
+        row = _runner_queue_row(
+            role="Running" if state.current_lap_in_progress and state.in_progress_runner == runner else "Available",
+            runner=runner,
+            state=state,
+            completed=completed,
+            roster_lookup=roster_lookup,
+            caps_enabled=caps_enabled,
+            order_status="",
+        )
+        rows.append(row)
+    return pd.DataFrame(
+        rows,
+        columns=["role", "runner", "completed_laps", "cap_remaining", "last_lap_minutes", "rest_minutes", "order_status"],
+    )
+
+
 def race_state_from_log(
     log: pd.DataFrame,
     roster: pd.DataFrame,
@@ -714,6 +827,49 @@ def _number_or_default(value: Any, default: int) -> int:
     if pd.isna(number):
         return int(default)
     return int(number)
+
+
+def _roster_lookup(roster: pd.DataFrame) -> dict[str, dict[str, Any]]:
+    rows = {}
+    for row in roster.itertuples(index=False):
+        runner = str(getattr(row, "runner", "")).strip()
+        if runner:
+            rows[runner] = row._asdict()
+    return rows
+
+
+def _runner_queue_row(
+    role: str,
+    runner: str,
+    state: RaceState,
+    completed: pd.DataFrame,
+    roster_lookup: dict[str, dict[str, Any]],
+    caps_enabled: bool,
+    order_status: str,
+) -> dict[str, Any]:
+    runner_laps = completed[completed["runner"].astype(str).str.strip() == str(runner)].sort_values("finish_minute")
+    last_lap_minutes = np.nan
+    rest_minutes = np.nan
+    if not runner_laps.empty:
+        latest = runner_laps.iloc[-1]
+        last_lap_minutes = float(latest["lap_duration_minutes"])
+        rest_minutes = max(0.0, float(state.elapsed_minute) - float(latest["finish_minute"]))
+
+    completed_laps = int(state.runner_lap_counts.get(str(runner), 0))
+    cap_remaining: str | int = "Open"
+    cap = pd.to_numeric(roster_lookup.get(str(runner), {}).get("max_laps"), errors="coerce")
+    if caps_enabled and pd.notna(cap):
+        cap_remaining = max(0, int(cap) - completed_laps)
+
+    return {
+        "role": role,
+        "runner": runner,
+        "completed_laps": completed_laps,
+        "cap_remaining": cap_remaining,
+        "last_lap_minutes": np.nan if pd.isna(last_lap_minutes) else round(float(last_lap_minutes), 1),
+        "rest_minutes": np.nan if pd.isna(rest_minutes) else round(float(rest_minutes), 0),
+        "order_status": order_status,
+    }
 
 
 def _available_order(roster: pd.DataFrame) -> list[str]:
