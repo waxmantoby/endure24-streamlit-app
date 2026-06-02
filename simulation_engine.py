@@ -136,6 +136,7 @@ def simulate_many_from_state(
     official_laps_so_far: int,
     laps_by_noon_so_far: int,
     caps_enabled: bool = True,
+    first_transition_already_applied: bool = False,
 ) -> dict[str, Any]:
     """Run relay simulations from a partially completed race state."""
 
@@ -165,6 +166,7 @@ def simulate_many_from_state(
             initial_runner_lap_counts=runner_lap_counts,
             initial_official_laps=int(official_laps_so_far),
             initial_laps_by_noon=int(laps_by_noon_so_far),
+            skip_first_transition=bool(first_transition_already_applied),
         )
 
         simulation_rows.append(
@@ -363,6 +365,7 @@ def _simulate_one(
     initial_runner_lap_counts: dict[str, int] | None = None,
     initial_official_laps: int = 0,
     initial_laps_by_noon: int = 0,
+    skip_first_transition: bool = False,
 ) -> dict[str, Any]:
     elapsed = float(start_elapsed)
     pointer = int(start_pointer) % max(len(runners), 1)
@@ -395,6 +398,7 @@ def _simulate_one(
     final_runner = None
     final_lap_start = np.nan
     final_lap_finish = np.nan
+    first_simulated_lap = True
 
     while True:
         eligible_idx, next_pointer = _next_eligible_runner_index(runners, pointer, runner_lap_counts, caps_enabled)
@@ -405,8 +409,12 @@ def _simulate_one(
         pointer = next_pointer
         runner = runners[eligible_idx]
 
-        transition_delay = _sample_transition_delay(settings, rng)
+        if first_simulated_lap and skip_first_transition:
+            transition_delay = 0.0
+        else:
+            transition_delay = _sample_transition_delay(settings, rng)
         lap_start = elapsed + transition_delay
+        first_simulated_lap = False
         if lap_start > LAST_START_MINUTE:
             missed_start_cutoff = True
             stop_reason = "start_after_sunday_noon"

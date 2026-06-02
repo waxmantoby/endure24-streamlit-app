@@ -33,6 +33,7 @@ RACE_LOG_COLUMNS = [
 GOOGLE_SHEET_TEMPLATE_COLUMNS = [
     "lap_number",
     "runner",
+    "start_time",
     "finish_time",
     "lap_duration_minutes",
     "notes",
@@ -48,6 +49,9 @@ class RaceState:
     next_runner_index: int
     runner_lap_counts: dict[str, int]
     latest_lap: dict[str, Any] | None
+    current_lap_in_progress: bool
+    in_progress_runner: str | None
+    in_progress_start_minute: float | None
     remaining_to_target: int
     average_needed_to_target: float | None
     average_needed_to_start_target_lap: float | None
@@ -134,26 +138,34 @@ def append_manual_lap(
     current_log: pd.DataFrame,
     roster: pd.DataFrame,
     runner: str,
+    start_minute: float | None = None,
     finish_minute: float | None = None,
     duration_minutes: float | None = None,
     notes: str = "",
 ) -> pd.DataFrame:
     log = normalise_race_log(current_log, roster)
-    start_minute = float(log["finish_minute"].dropna().max()) if not log["finish_minute"].dropna().empty else 0.0
-    if finish_minute is None and duration_minutes is not None:
-        finish_minute = start_minute + float(duration_minutes)
-    if finish_minute is None:
-        finish_minute = start_minute
-    duration = float(finish_minute) - start_minute
+    previous_finish = float(log["finish_minute"].dropna().max()) if not log["finish_minute"].dropna().empty else 0.0
+    resolved_start = previous_finish if start_minute is None else float(start_minute)
+    resolved_finish = None if finish_minute is None else float(finish_minute)
+    resolved_duration = None if duration_minutes is None else float(duration_minutes)
+
+    if start_minute is None and resolved_finish is not None and resolved_duration is not None:
+        resolved_start = resolved_finish - resolved_duration
+    elif resolved_finish is None and resolved_duration is not None:
+        resolved_finish = resolved_start + resolved_duration
+
+    if resolved_duration is None and resolved_finish is not None:
+        resolved_duration = resolved_finish - resolved_start
+
     next_lap = int(log["lap_number"].max()) + 1 if not log.empty else 1
     added = pd.DataFrame(
         [
             {
                 "lap_number": next_lap,
                 "runner": runner,
-                "start_minute": start_minute,
-                "finish_minute": float(finish_minute),
-                "lap_duration_minutes": duration,
+                "start_minute": resolved_start,
+                "finish_minute": np.nan if resolved_finish is None else resolved_finish,
+                "lap_duration_minutes": np.nan if resolved_duration is None else resolved_duration,
                 "notes": notes,
             }
         ]
@@ -161,6 +173,40 @@ def append_manual_lap(
     if log.empty:
         return normalise_race_log(added, roster)
     return normalise_race_log(pd.concat([log, added], ignore_index=True), roster)
+
+
+def complete_in_progress_lap(
+    current_log: pd.DataFrame,
+    roster: pd.DataFrame,
+    finish_minute: float | None = None,
+    duration_minutes: float | None = None,
+    notes: str = "",
+) -> pd.DataFrame:
+    log = normalise_race_log(current_log, roster)
+    if log.empty:
+        raise ValueError("There is no in-progress lap to complete.")
+
+    latest_idx = log.sort_values("lap_number").index[-1]
+    latest = log.loc[latest_idx]
+    if pd.isna(latest.get("start_minute")) or pd.notna(latest.get("finish_minute")):
+        raise ValueError("The latest row is not an in-progress lap.")
+
+    start_minute = float(latest["start_minute"])
+    resolved_finish = None if finish_minute is None else float(finish_minute)
+    resolved_duration = None if duration_minutes is None else float(duration_minutes)
+    if resolved_finish is None and resolved_duration is not None:
+        resolved_finish = start_minute + resolved_duration
+    if resolved_duration is None and resolved_finish is not None:
+        resolved_duration = resolved_finish - start_minute
+    if resolved_finish is None or resolved_duration is None:
+        raise ValueError("Enter either the finish time or the lap duration.")
+
+    log.loc[latest_idx, "finish_minute"] = resolved_finish
+    log.loc[latest_idx, "lap_duration_minutes"] = resolved_duration
+    if notes.strip():
+        existing_notes = str(log.loc[latest_idx, "notes"] or "").strip()
+        log.loc[latest_idx, "notes"] = f"{existing_notes}; {notes.strip()}" if existing_notes else notes.strip()
+    return normalise_race_log(log, roster)
 
 
 def validate_race_log(log: pd.DataFrame, roster: pd.DataFrame) -> tuple[list[str], list[str]]:
@@ -179,19 +225,44 @@ def validate_race_log(log: pd.DataFrame, roster: pd.DataFrame) -> tuple[list[str
         errors.append("Every race-log row needs a runner.")
     if clean["lap_number"].duplicated().any():
         errors.append("Duplicate lap numbers found. Each lap number must be unique.")
-    if clean.duplicated(["runner", "finish_minute"]).any():
+    completed = clean.dropna(subset=["start_minute", "finish_minute", "lap_duration_minutes"]).copy()
+    incomplete = clean[clean[["start_minute", "finish_minute", "lap_duration_minutes"]].isna().any(axis=1)].copy()
+    completed_finish_rows = clean.dropna(subset=["runner", "finish_minute"])
+    if completed_finish_rows.duplicated(["runner", "finish_minute"]).any():
         errors.append("Duplicate runner/finish-time entries found.")
-    if clean[["start_minute", "finish_minute", "lap_duration_minutes"]].isna().any(axis=None):
-        errors.append("Every race-log row needs enough timing data to calculate start, finish, and duration.")
+
+    if not incomplete.empty:
+        latest_lap_number = int(clean["lap_number"].max())
+        incomplete_laps = incomplete["lap_number"].astype(int).tolist()
+        if len(incomplete) == 1 and int(incomplete.iloc[0]["lap_number"]) == latest_lap_number:
+            row = incomplete.iloc[0]
+            if pd.notna(row.get("start_minute")) and pd.isna(row.get("finish_minute")):
+                warnings.append(
+                    f"Lap {latest_lap_number} is in progress. It will not count as official until a finish time or duration is added."
+                )
+            else:
+                errors.append(f"Lap {latest_lap_number} needs a start time plus either finish time or duration.")
+        else:
+            errors.append(
+                "Incomplete timing is only allowed for the latest lap. Check laps "
+                + ", ".join(str(lap) for lap in incomplete_laps)
+                + "."
+            )
 
     impossible = clean[
         clean["start_minute"].lt(0)
-        | clean["finish_minute"].lt(0)
-        | clean["finish_minute"].le(clean["start_minute"])
-        | clean["lap_duration_minutes"].le(0)
     ]
     if not impossible.empty:
-        errors.append("One or more laps have impossible timing: finish must be after start and duration must be positive.")
+        errors.append("One or more laps have a start time before Saturday 12:00.")
+
+    impossible_completed = completed[
+        completed["finish_minute"].lt(0)
+        | completed["finish_minute"].le(completed["start_minute"])
+        | completed["lap_duration_minutes"].le(0)
+    ]
+    if not impossible_completed.empty:
+        bad_laps = ", ".join(str(int(lap)) for lap in impossible_completed["lap_number"].tolist())
+        errors.append(f"Lap timing is impossible on lap(s) {bad_laps}: finish must be after start and duration must be positive.")
 
     if clean["finish_minute"].gt(FINAL_CUTOFF_MINUTE).any():
         warnings.append("At least one logged finish is after Sunday 13:00, so it will not count as an official lap.")
@@ -199,7 +270,7 @@ def validate_race_log(log: pd.DataFrame, roster: pd.DataFrame) -> tuple[list[str
         warnings.append("At least one logged start is after Sunday 12:00, so it will not count as an official lap.")
 
     ordered = clean.sort_values("lap_number")
-    if ordered["finish_minute"].dropna().diff().le(0).any():
+    if ordered.dropna(subset=["finish_minute"])["finish_minute"].diff().le(0).any():
         errors.append("Logged finish times must increase lap by lap.")
     if ordered["start_minute"].dropna().diff().lt(0).any():
         errors.append("Logged start times must not move backwards.")
@@ -225,8 +296,23 @@ def race_state_from_log(
     caps_enabled: bool = True,
 ) -> RaceState:
     clean = normalise_race_log(log, roster)
-    official = clean[clean["official"].fillna(False).astype(bool)].copy()
-    elapsed_minute = float(clean["finish_minute"].dropna().max()) if not clean["finish_minute"].dropna().empty else 0.0
+    completed = clean.dropna(subset=["start_minute", "finish_minute", "lap_duration_minutes"]).copy()
+    official = completed[completed["official"].fillna(False).astype(bool)].copy()
+
+    latest_lap = clean.sort_values("lap_number").iloc[-1].to_dict() if not clean.empty else None
+    current_lap_in_progress = False
+    in_progress_runner = None
+    in_progress_start_minute = None
+    if latest_lap is not None:
+        has_start = pd.notna(latest_lap.get("start_minute"))
+        has_finish = pd.notna(latest_lap.get("finish_minute"))
+        if has_start and not has_finish:
+            current_lap_in_progress = True
+            in_progress_runner = str(latest_lap.get("runner") or "").strip() or None
+            in_progress_start_minute = float(latest_lap["start_minute"])
+
+    last_completed_finish = float(completed["finish_minute"].max()) if not completed.empty else 0.0
+    elapsed_minute = max(last_completed_finish, in_progress_start_minute or 0.0)
     current_laps = int(len(official))
     laps_by_noon = int(official["finish_minute"].le(LAST_START_MINUTE).sum()) if not official.empty else 0
 
@@ -236,12 +322,16 @@ def race_state_from_log(
         if str(runner) in counts:
             counts[str(runner)] = int(count)
 
-    if not clean.empty and str(clean.iloc[-1]["runner"]) in order:
-        start_index = (order.index(str(clean.iloc[-1]["runner"])) + 1) % len(order)
+    if current_lap_in_progress and in_progress_runner in order:
+        start_index = order.index(in_progress_runner)
+        next_runner = in_progress_runner
+        next_index = start_index
+    elif not completed.empty and str(completed.iloc[-1]["runner"]) in order:
+        start_index = (order.index(str(completed.iloc[-1]["runner"])) + 1) % len(order)
+        next_runner, next_index = next_eligible_runner(roster, counts, start_index, caps_enabled=caps_enabled)
     else:
         start_index = current_laps % len(order) if order else 0
-    next_runner, next_index = next_eligible_runner(roster, counts, start_index, caps_enabled=caps_enabled)
-    latest_lap = clean.iloc[-1].to_dict() if not clean.empty else None
+        next_runner, next_index = next_eligible_runner(roster, counts, start_index, caps_enabled=caps_enabled)
 
     remaining_to_target = max(0, int(target_laps) - current_laps)
     time_remaining_to_cutoff = max(0.0, FINAL_CUTOFF_MINUTE - elapsed_minute)
@@ -265,6 +355,9 @@ def race_state_from_log(
         next_runner_index=next_index,
         runner_lap_counts=counts,
         latest_lap=latest_lap,
+        current_lap_in_progress=current_lap_in_progress,
+        in_progress_runner=in_progress_runner,
+        in_progress_start_minute=in_progress_start_minute,
         remaining_to_target=remaining_to_target,
         average_needed_to_target=average_needed_to_target,
         average_needed_to_start_target_lap=average_needed_to_start_target_lap,
@@ -287,6 +380,7 @@ def forecast_from_race_log(
         official_laps_so_far=state.current_laps,
         laps_by_noon_so_far=state.laps_by_noon,
         caps_enabled=caps_enabled,
+        first_transition_already_applied=state.current_lap_in_progress,
     )
 
 
@@ -406,6 +500,47 @@ def parse_race_time_to_minute(value: Any) -> float | None:
     return float(absolute - 12 * 60)
 
 
+def parse_duration_minutes(value: Any) -> float | None:
+    if value is None or pd.isna(value):
+        return None
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        return float(value)
+
+    text = str(value).strip().lower()
+    if not text:
+        return None
+
+    numeric = pd.to_numeric(text, errors="coerce")
+    if pd.notna(numeric):
+        return float(numeric)
+
+    clock_match = re.fullmatch(r"(?:(\d+):)?(\d{1,2}):(\d{2})", text)
+    if clock_match:
+        hours = int(clock_match.group(1) or 0)
+        minutes = int(clock_match.group(2))
+        seconds = int(clock_match.group(3))
+        if minutes > 59 or seconds > 59:
+            return None
+        return hours * 60 + minutes + seconds / 60
+
+    words_match = re.fullmatch(
+        r"(?:(\d+(?:\.\d+)?)\s*(?:h|hr|hrs|hour|hours)\s*)?"
+        r"(?:(\d+(?:\.\d+)?)\s*(?:m|min|mins|minute|minutes)\s*)?"
+        r"(?:(\d+(?:\.\d+)?)\s*(?:s|sec|secs|second|seconds)\s*)?",
+        text,
+    )
+    if words_match and any(words_match.groups()):
+        hours = float(words_match.group(1) or 0)
+        minutes = float(words_match.group(2) or 0)
+        seconds = float(words_match.group(3) or 0)
+        return hours * 60 + minutes + seconds / 60
+
+    number_match = re.search(r"\d+(?:\.\d+)?", text)
+    if number_match:
+        return float(number_match.group(0))
+    return None
+
+
 def _normalise_column_name(column: Any) -> str:
     text = str(column).strip().lower()
     text = re.sub(r"[^a-z0-9]+", "_", text)
@@ -437,8 +572,8 @@ def _first_parsed_time(row: pd.Series, columns: list[str]) -> float | None:
 def _first_number(row: pd.Series, columns: list[str]) -> float | None:
     for column in columns:
         if column in row.index and pd.notna(row[column]):
-            number = pd.to_numeric(row[column], errors="coerce")
-            if pd.notna(number):
+            number = parse_duration_minutes(row[column])
+            if number is not None:
                 return float(number)
     return None
 

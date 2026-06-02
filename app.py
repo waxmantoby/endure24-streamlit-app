@@ -19,10 +19,12 @@ from optimizer import optimize_running_orders
 from race_day import (
     GOOGLE_SHEET_TEMPLATE_COLUMNS,
     append_manual_lap,
+    complete_in_progress_lap,
     empty_race_log,
     forecast_from_race_log,
     google_sheets_configured,
     normalise_race_log,
+    parse_duration_minutes,
     parse_pasted_laps,
     parse_race_time_to_minute,
     race_state_from_log,
@@ -613,13 +615,19 @@ def get_streamlit_secret(*keys: str):
 def format_race_log_for_display(log: pd.DataFrame) -> pd.DataFrame:
     display = normalise_race_log(log, pd.DataFrame({"runner": []}))
     display = add_clock_columns(display, ["start_minute", "finish_minute"])
+    display["status"] = display.apply(
+        lambda row: "In progress"
+        if pd.notna(row.get("start_minute")) and pd.isna(row.get("finish_minute"))
+        else ("Official" if bool(row.get("official")) else "Not official"),
+        axis=1,
+    )
     columns = [
         "lap_number",
         "runner",
+        "status",
         "start_time",
         "finish_time",
         "lap_duration_minutes",
-        "official",
         "notes",
     ]
     return display[[column for column in columns if column in display.columns]]
@@ -649,7 +657,15 @@ def show_race_day_metrics(state, live_bundle: dict | None, target_laps: int) -> 
     cols[1].metric("Target probability", format_probability(live_summary["probability_target_laps"]) if live_summary else "-")
     cols[2].metric("Projected final laps", format_minutes(live_summary["expected_official_laps"]) if live_summary else "-")
     cols[3].metric("Elapsed", format_race_clock(state.elapsed_minute))
-    cols[4].metric("Next runner", state.next_runner or "No eligible runner")
+    runner_label = "Current runner" if state.current_lap_in_progress else "Next runner"
+    cols[4].metric(runner_label, state.next_runner or "No eligible runner")
+
+    if state.current_lap_in_progress:
+        st.info(
+            f"Lap {int(state.latest_lap['lap_number'])} is in progress: "
+            f"{state.in_progress_runner} started at {format_race_clock(state.in_progress_start_minute)}. "
+            "Add the finish time or lap duration when they come in."
+        )
 
     if state.remaining_to_target <= 0:
         st.success(f"Target of {target_laps} official laps is already logged.")
@@ -785,44 +801,131 @@ def show_google_sheet_controls(log: pd.DataFrame, roster: pd.DataFrame) -> pd.Da
 def show_race_log_entry(log: pd.DataFrame, roster: pd.DataFrame) -> pd.DataFrame:
     state = race_state_from_log(log, roster, target_laps=1)
     runner_options = roster.sort_values("running_order")["runner"].astype(str).tolist()
+    if not runner_options:
+        st.warning("Add at least one available runner before logging race laps.")
+        return log
+
     next_runner_index = runner_options.index(state.next_runner) if state.next_runner in runner_options else 0
 
-    st.markdown("#### Add Lap")
+    st.markdown("#### Log Lap")
     with st.form("manual_lap_form", clear_on_submit=True):
-        c1, c2, c3 = st.columns([1.2, 1, 1])
-        runner = c1.selectbox("Runner", runner_options, index=next_runner_index)
-        entry_mode = c2.radio("Time entry", ["Lap duration", "Finish time"], horizontal=True)
-        notes = c3.text_input("Notes", value="")
+        action_options = ["Add completed lap", "Record start only"]
+        if state.current_lap_in_progress:
+            action_options = ["Complete current lap"] + action_options
 
-        if entry_mode == "Lap duration":
-            duration_minutes = st.number_input("Lap duration minutes", min_value=1.0, max_value=180.0, value=40.0, step=0.1)
-            finish_minute = None
+        action = st.radio("Action", action_options, horizontal=True)
+        top_cols = st.columns([1.2, 1.4, 1.2])
+        runner = top_cols[0].selectbox(
+            "Runner",
+            runner_options,
+            index=next_runner_index,
+            disabled=action == "Complete current lap",
+        )
+        if action == "Complete current lap" and state.in_progress_runner in runner_options:
+            runner = state.in_progress_runner
+            top_cols[1].caption(
+                f"Completing lap {int(state.latest_lap['lap_number'])}, started {format_race_clock(state.in_progress_start_minute)}."
+            )
+        notes = top_cols[2].text_input("Notes", value="")
+
+        start_minute = None
+        finish_minute = None
+        duration_minutes = None
+        start_text = ""
+        finish_text = ""
+        duration_text = ""
+
+        if action == "Complete current lap":
+            detail_mode = st.radio("Known timing", ["Finish time", "Lap duration"], horizontal=True)
+            if detail_mode == "Finish time":
+                finish_text = st.text_input("Finish time", placeholder="Sat 13:04, Sun 00:12, or 724")
+            else:
+                duration_text = st.text_input("Lap duration", placeholder="41.5, 41 min, or 41:30")
+        elif action == "Record start only":
+            start_text = st.text_input("Start time", placeholder="Sat 13:04, Sun 00:12, or 724")
         else:
-            duration_minutes = None
-            finish_text = st.text_input("Finish time", placeholder="Saturday 13:04, Sunday 00:12, or 724")
-            finish_minute = parse_race_time_to_minute(finish_text)
+            detail_mode = st.selectbox(
+                "Known timing",
+                ["Lap duration only", "Finish time only", "Start + finish", "Start + duration"],
+            )
+            detail_cols = st.columns(2)
+            if detail_mode in {"Start + finish", "Start + duration"}:
+                start_text = detail_cols[0].text_input("Start time", placeholder="Sat 13:04, Sun 00:12, or 724")
+            if detail_mode in {"Finish time only", "Start + finish"}:
+                target_col = detail_cols[1] if detail_mode == "Start + finish" else detail_cols[0]
+                finish_text = target_col.text_input("Finish time", placeholder="Sat 13:45, Sun 00:52, or 765")
+            if detail_mode in {"Lap duration only", "Start + duration"}:
+                target_col = detail_cols[1] if detail_mode == "Start + duration" else detail_cols[0]
+                duration_text = target_col.text_input("Lap duration", placeholder="41.5, 41 min, or 41:30")
 
-        submitted = st.form_submit_button("Add lap", type="primary")
+        submitted = st.form_submit_button("Save race entry", type="primary")
 
     if submitted:
-        if entry_mode == "Finish time" and finish_minute is None:
-            st.error("Enter a valid finish time.")
+        if start_text:
+            start_minute = parse_race_time_to_minute(start_text)
+        if finish_text:
+            finish_minute = parse_race_time_to_minute(finish_text)
+        if duration_text:
+            duration_minutes = parse_duration_minutes(duration_text)
+
+        form_errors = []
+        if state.current_lap_in_progress and action != "Complete current lap":
+            form_errors.append("Complete the in-progress lap before adding another row.")
+        if action == "Complete current lap":
+            if finish_text and finish_minute is None:
+                form_errors.append("Enter a valid finish time.")
+            if duration_text and duration_minutes is None:
+                form_errors.append("Enter a valid lap duration.")
+            if not finish_text and not duration_text:
+                form_errors.append("Enter either the finish time or lap duration.")
+        elif action == "Record start only":
+            if start_minute is None:
+                form_errors.append("Enter a valid start time.")
         else:
-            candidate = append_manual_lap(
-                log,
-                roster,
-                runner=runner,
-                finish_minute=finish_minute,
-                duration_minutes=duration_minutes,
-                notes=notes,
-            )
+            if start_text and start_minute is None:
+                form_errors.append("Enter a valid start time.")
+            if finish_text and finish_minute is None:
+                form_errors.append("Enter a valid finish time.")
+            if duration_text and duration_minutes is None:
+                form_errors.append("Enter a valid lap duration.")
+            if not finish_text and not duration_text:
+                form_errors.append("Enter a finish time or lap duration.")
+
+        if form_errors:
+            for error in form_errors:
+                st.error(error)
+        else:
+            try:
+                if action == "Complete current lap":
+                    candidate = complete_in_progress_lap(
+                        log,
+                        roster,
+                        finish_minute=finish_minute,
+                        duration_minutes=duration_minutes,
+                        notes=notes,
+                    )
+                else:
+                    candidate = append_manual_lap(
+                        log,
+                        roster,
+                        runner=runner,
+                        start_minute=start_minute,
+                        finish_minute=finish_minute,
+                        duration_minutes=duration_minutes,
+                        notes=notes,
+                    )
+            except ValueError as exc:
+                st.error(str(exc))
+                candidate = None
+
+        if not form_errors and candidate is not None:
             warnings, errors = validate_race_log(candidate, roster)
             if errors:
                 for error in errors:
                     st.error(error)
             else:
                 log = set_race_log(candidate, roster)
-                st.success("Lap added.")
+                st.success("Race log updated.")
                 for warning in warnings:
                     st.warning(warning)
 
@@ -830,7 +933,7 @@ def show_race_log_entry(log: pd.DataFrame, roster: pd.DataFrame) -> pd.DataFrame
     pasted = st.text_area(
         "Pasted table",
         height=120,
-        placeholder="runner,finish_time,notes\nToby,Saturday 12:33,clean lap",
+        placeholder="runner,start_time,finish_time,lap_duration_minutes,notes\nToby,Sat 12:00,Sat 12:41,41,clean lap",
     )
     paste_col_1, paste_col_2 = st.columns(2)
     if paste_col_1.button("Append pasted rows", width="stretch"):
@@ -871,7 +974,7 @@ def show_race_log_entry(log: pd.DataFrame, roster: pd.DataFrame) -> pd.DataFrame
 
 
 def show_race_log_backup(log: pd.DataFrame, roster: pd.DataFrame) -> pd.DataFrame:
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     uploaded_log = c1.file_uploader("Upload race-log CSV", type=["csv"], key="race_log_csv")
     if c2.button("Load CSV backup", width="stretch"):
         if uploaded_log is None:
@@ -890,6 +993,16 @@ def show_race_log_backup(log: pd.DataFrame, roster: pd.DataFrame) -> pd.DataFram
         mime="text/csv",
         width="stretch",
     )
+
+    if c4.button("Undo last entry", width="stretch"):
+        clean = normalise_race_log(log, roster)
+        if clean.empty:
+            st.warning("There is no race-log entry to undo.")
+        else:
+            last_lap = int(clean["lap_number"].max())
+            log = set_race_log(clean[clean["lap_number"].astype(int) != last_lap], roster)
+            st.success(f"Removed lap {last_lap}.")
+
     if st.button("Clear race log"):
         log = set_race_log(empty_race_log(), roster)
         st.success("Race log cleared.")
