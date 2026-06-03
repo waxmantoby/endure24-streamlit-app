@@ -64,8 +64,10 @@ DEFAULT_EDITABLE_GOOGLE_SHEET_URL = (
 )
 RACE_TIMEZONE = "Europe/London"
 RACE_TIMEZONE_LABEL = "BST"
-DEFAULT_LIVE_REFRESH_SECONDS = 60
-OLD_LIVE_REFRESH_DEFAULT_SECONDS = 15
+DEFAULT_LIVE_REFRESH_SECONDS = 300
+OLD_LIVE_REFRESH_DEFAULT_SECONDS = {15, 60}
+DEFAULT_LIVE_RELOAD_ENABLED = False
+SHEET_API_COOLDOWN_SECONDS = 600
 
 
 def inject_app_styles() -> None:
@@ -197,6 +199,23 @@ def now_bst_label() -> str:
     return pd.Timestamp.now(tz=RACE_TIMEZONE).strftime("%H:%M:%S %Z")
 
 
+def current_epoch_seconds() -> float:
+    return float(pd.Timestamp.now(tz="UTC").timestamp())
+
+
+def live_reload_enabled_default(session_key: str, configured: bool) -> bool:
+    migration_key = f"{session_key}_enabled_default_migrated"
+    current = st.session_state.get(session_key)
+    if current is None:
+        return DEFAULT_LIVE_RELOAD_ENABLED
+    if not st.session_state.get(migration_key) and bool(current) and configured:
+        st.session_state[migration_key] = True
+        st.session_state[session_key] = DEFAULT_LIVE_RELOAD_ENABLED
+        return DEFAULT_LIVE_RELOAD_ENABLED
+    st.session_state[migration_key] = True
+    return bool(current)
+
+
 def live_refresh_seconds_default(session_key: str) -> int:
     migration_key = f"{session_key}_default_migrated"
     current = st.session_state.get(session_key)
@@ -206,11 +225,58 @@ def live_refresh_seconds_default(session_key: str) -> int:
         value = int(current)
     except Exception:
         return DEFAULT_LIVE_REFRESH_SECONDS
-    if not st.session_state.get(migration_key) and value == OLD_LIVE_REFRESH_DEFAULT_SECONDS:
+    if not st.session_state.get(migration_key) and value in OLD_LIVE_REFRESH_DEFAULT_SECONDS:
         st.session_state[migration_key] = True
+        st.session_state[session_key] = DEFAULT_LIVE_REFRESH_SECONDS
         return DEFAULT_LIVE_REFRESH_SECONDS
     st.session_state[migration_key] = True
     return value
+
+
+def sheet_cooldown_remaining_seconds(prefix: str) -> int:
+    try:
+        cooldown_until = float(st.session_state.get(f"{prefix}_sheet_cooldown_until", 0) or 0)
+    except Exception:
+        cooldown_until = 0
+    remaining = int(max(0, round(cooldown_until - current_epoch_seconds())))
+    if remaining <= 0:
+        st.session_state.pop(f"{prefix}_sheet_cooldown_until", None)
+    return remaining
+
+
+def should_load_sheet_now(prefix: str, load_now: bool, live_reload: bool, refresh_seconds: int) -> bool:
+    if load_now:
+        return True
+    if not live_reload:
+        return False
+    if sheet_cooldown_remaining_seconds(prefix) > 0:
+        return False
+    now = current_epoch_seconds()
+    last_attempt = float(st.session_state.get(f"{prefix}_last_auto_sheet_load_attempt", 0) or 0)
+    if now - last_attempt < max(10, int(refresh_seconds)):
+        return False
+    st.session_state[f"{prefix}_last_auto_sheet_load_attempt"] = now
+    return True
+
+
+def show_sheet_cooldown(prefix: str, label: str) -> None:
+    remaining = sheet_cooldown_remaining_seconds(prefix)
+    if remaining > 0:
+        minutes = max(1, int((remaining + 59) // 60))
+        st.warning(f"{label} auto reload is paused for about {minutes} minute(s) after a Google Sheets quota error.")
+
+
+def handle_sheet_load_error(prefix: str, label: str, exc: Exception, live_reload_key: str) -> None:
+    message = str(exc)
+    if "429" in message or "Quota exceeded" in message:
+        st.session_state[f"{prefix}_sheet_cooldown_until"] = current_epoch_seconds() + SHEET_API_COOLDOWN_SECONDS
+        st.session_state[live_reload_key] = False
+        st.error(
+            f"Google Sheets quota was hit while loading {label}. Auto reload has been turned off and "
+            f"{label} loading is paused for about 10 minutes. Manual saves from the app still work."
+        )
+    else:
+        st.error(f"Could not load {label}: {exc}")
 
 
 def format_race_clock(minute: float | int | None) -> str:
@@ -1100,7 +1166,7 @@ def show_race_day_plan_assistant(
 def show_race_day_sync_status(sync: Mapping[str, Any]) -> None:
     last_load = st.session_state.get("editable_google_sheet_last_loaded", "-")
     last_save = st.session_state.get("race_day_sheet_last_saved", "-")
-    live_reload = st.session_state.get("race_day_live_sheet_enabled", bool(sync.get("configured")))
+    live_reload = live_reload_enabled_default("race_day_live_sheet_enabled", bool(sync.get("configured")))
     refresh_seconds = live_refresh_seconds_default("race_day_live_refresh_seconds")
     with st.container(border=True):
         st.markdown("#### Sheet Activity")
@@ -1122,7 +1188,7 @@ def show_race_day_readiness(
     caps_enabled: bool,
 ) -> None:
     sheet_state = "Ready" if sync.get("configured") else "Check setup"
-    live_enabled = st.session_state.get("race_day_live_sheet_enabled", bool(sync.get("configured")))
+    live_enabled = live_reload_enabled_default("race_day_live_sheet_enabled", bool(sync.get("configured")))
     live_state = f"On ({live_refresh_seconds_default('race_day_live_refresh_seconds')}s)" if live_enabled else "Off"
     if errors:
         log_state = f"{len(errors)} fix"
@@ -1259,7 +1325,7 @@ def build_team_brief(
     sheet_line = (
         "Sheet: "
         f"{'write ready' if sync.get('configured') else 'read/local only'}, "
-        f"auto reload {'on' if st.session_state.get('race_day_live_sheet_enabled', bool(sync.get('configured'))) else 'off'}, "
+        f"auto reload {'on' if live_reload_enabled_default('race_day_live_sheet_enabled', bool(sync.get('configured'))) else 'off'}, "
         f"load {st.session_state.get('editable_google_sheet_last_loaded', '-')}, "
         f"save {st.session_state.get('race_day_sheet_last_saved', '-')}"
     )
@@ -1474,13 +1540,13 @@ def show_google_sheet_controls(
         with top_cols[0]:
             st.markdown("#### Live Sheet")
             if configured:
-                st.caption("App changes save immediately. Sheet auto reload defaults to once per minute.")
+                st.caption("App changes save immediately. Sheet auto reload is off by default to protect Google quota.")
             else:
                 st.caption("Write access is not configured. Public-link loading and CSV backup are still available.")
 
         live_reload = top_cols[1].checkbox(
             "Auto reload",
-            value=st.session_state.get("race_day_live_sheet_enabled", configured),
+            value=live_reload_enabled_default("race_day_live_sheet_enabled", configured),
             help="Polls the Sheet while this Race Day tab is open. App saves still write immediately.",
         )
         refresh_seconds = top_cols[2].number_input(
@@ -1492,8 +1558,9 @@ def show_google_sheet_controls(
         )
         st.session_state["race_day_live_sheet_enabled"] = live_reload
         st.session_state["race_day_live_refresh_seconds"] = int(refresh_seconds)
+        show_sheet_cooldown("race_day", "Race log Sheet")
 
-        if live_reload and st_autorefresh is not None:
+        if live_reload and sheet_cooldown_remaining_seconds("race_day") <= 0 and st_autorefresh is not None:
             st_autorefresh(
                 interval=int(refresh_seconds) * 1000,
                 key="race_day_live_sheet_autorefresh",
@@ -1509,7 +1576,7 @@ def show_google_sheet_controls(
         else:
             action_cols[2].warning("Save disabled until secrets are set.")
 
-        should_load_sheet = load_now or live_reload
+        should_load_sheet = should_load_sheet_now("race_day", load_now, live_reload, int(refresh_seconds))
         if should_load_sheet:
             try:
                 if configured:
@@ -1535,10 +1602,7 @@ def show_google_sheet_controls(
                     if warnings:
                         show_race_day_alerts(warnings, [])
             except Exception as exc:
-                st.error(
-                    "Could not load the Sheet. Check sharing, credentials, and worksheet name. "
-                    f"Details: {exc}"
-                )
+                handle_sheet_load_error("race_day", "the race log Sheet", exc, "race_day_live_sheet_enabled")
         if st.session_state.get("editable_google_sheet_last_loaded"):
             st.caption(f"Last load: {st.session_state['editable_google_sheet_last_loaded']}.")
         if st.session_state.get("race_day_sheet_last_saved"):
@@ -2655,13 +2719,13 @@ def show_drinks_sheet_controls(table: pd.DataFrame, roster: pd.DataFrame) -> tup
         with top_cols[0]:
             st.markdown("#### Drinks Sheet")
             if configured:
-                st.caption("App changes save immediately. Sheet auto reload defaults to once per minute.")
+                st.caption("App changes save immediately. Sheet auto reload is off by default to protect Google quota.")
             else:
                 st.caption("Google sync is not configured. Local tracking and CSV download still work.")
 
         live_reload = top_cols[1].checkbox(
             "Auto reload",
-            value=st.session_state.get("drinks_live_sheet_enabled", configured),
+            value=live_reload_enabled_default("drinks_live_sheet_enabled", configured),
             help="Polls the drinks worksheet while this tab is open. App saves still write immediately.",
         )
         refresh_seconds = top_cols[2].number_input(
@@ -2674,8 +2738,9 @@ def show_drinks_sheet_controls(table: pd.DataFrame, roster: pd.DataFrame) -> tup
         )
         st.session_state["drinks_live_sheet_enabled"] = live_reload
         st.session_state["drinks_live_refresh_seconds"] = int(refresh_seconds)
+        show_sheet_cooldown("drinks", "Drinks Sheet")
 
-        if live_reload and st_autorefresh is not None:
+        if live_reload and sheet_cooldown_remaining_seconds("drinks") <= 0 and st_autorefresh is not None:
             st_autorefresh(
                 interval=int(refresh_seconds) * 1000,
                 key="drinks_live_sheet_autorefresh",
@@ -2691,7 +2756,7 @@ def show_drinks_sheet_controls(table: pd.DataFrame, roster: pd.DataFrame) -> tup
         else:
             action_cols[2].warning("Save disabled until secrets are set.")
 
-        if (load_now or live_reload) and configured:
+        if should_load_sheet_now("drinks", load_now, live_reload, int(refresh_seconds)) and configured:
             try:
                 loaded = read_drinks_from_google_sheet(
                     st.secrets,
@@ -2707,7 +2772,7 @@ def show_drinks_sheet_controls(table: pd.DataFrame, roster: pd.DataFrame) -> tup
                 else:
                     st.caption(f"Drinks checked at {loaded_at}; no changes found.")
             except Exception as exc:
-                st.error(f"Could not load drinks worksheet: {exc}")
+                handle_sheet_load_error("drinks", "the drinks worksheet", exc, "drinks_live_sheet_enabled")
 
         if st.session_state.get("drinks_sheet_last_loaded"):
             st.caption(f"Last drinks load: {st.session_state['drinks_sheet_last_loaded']}.")
@@ -3158,13 +3223,13 @@ def show_sleep_sheet_controls(log: pd.DataFrame, roster: pd.DataFrame) -> tuple[
         with top_cols[0]:
             st.markdown("#### Sleep Sheet")
             if configured:
-                st.caption("App changes save immediately. Sheet auto reload defaults to once per minute.")
+                st.caption("App changes save immediately. Sheet auto reload is off by default to protect Google quota.")
             else:
                 st.caption("Google sync is not configured. Local tracking and CSV download still work.")
 
         live_reload = top_cols[1].checkbox(
             "Auto reload",
-            value=st.session_state.get("sleep_live_sheet_enabled", configured),
+            value=live_reload_enabled_default("sleep_live_sheet_enabled", configured),
             help="Polls the sleep worksheet while this tab is open. App saves still write immediately.",
             key="sleep_live_reload_checkbox",
         )
@@ -3178,8 +3243,9 @@ def show_sleep_sheet_controls(log: pd.DataFrame, roster: pd.DataFrame) -> tuple[
         )
         st.session_state["sleep_live_sheet_enabled"] = live_reload
         st.session_state["sleep_live_refresh_seconds"] = int(refresh_seconds)
+        show_sheet_cooldown("sleep", "Sleep Sheet")
 
-        if live_reload and st_autorefresh is not None:
+        if live_reload and sheet_cooldown_remaining_seconds("sleep") <= 0 and st_autorefresh is not None:
             st_autorefresh(
                 interval=int(refresh_seconds) * 1000,
                 key="sleep_live_sheet_autorefresh",
@@ -3195,7 +3261,7 @@ def show_sleep_sheet_controls(log: pd.DataFrame, roster: pd.DataFrame) -> tuple[
         else:
             action_cols[2].warning("Save disabled until secrets are set.")
 
-        if (load_now or live_reload) and configured:
+        if should_load_sheet_now("sleep", load_now, live_reload, int(refresh_seconds)) and configured:
             try:
                 loaded = read_sleep_from_google_sheet(
                     st.secrets,
@@ -3211,7 +3277,7 @@ def show_sleep_sheet_controls(log: pd.DataFrame, roster: pd.DataFrame) -> tuple[
                 else:
                     st.caption(f"Sleep checked at {loaded_at}; no changes found.")
             except Exception as exc:
-                st.error(f"Could not load sleep worksheet: {exc}")
+                handle_sheet_load_error("sleep", "the sleep worksheet", exc, "sleep_live_sheet_enabled")
 
         if st.session_state.get("sleep_sheet_last_loaded"):
             st.caption(f"Last sleep load: {st.session_state['sleep_sheet_last_loaded']}.")
