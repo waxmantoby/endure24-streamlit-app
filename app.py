@@ -64,6 +64,8 @@ DEFAULT_EDITABLE_GOOGLE_SHEET_URL = (
 )
 RACE_TIMEZONE = "Europe/London"
 RACE_TIMEZONE_LABEL = "BST"
+DEFAULT_LIVE_REFRESH_SECONDS = 60
+OLD_LIVE_REFRESH_DEFAULT_SECONDS = 15
 
 
 def inject_app_styles() -> None:
@@ -193,6 +195,22 @@ def format_probability(value: float | int | None) -> str:
 
 def now_bst_label() -> str:
     return pd.Timestamp.now(tz=RACE_TIMEZONE).strftime("%H:%M:%S %Z")
+
+
+def live_refresh_seconds_default(session_key: str) -> int:
+    migration_key = f"{session_key}_default_migrated"
+    current = st.session_state.get(session_key)
+    if current is None:
+        return DEFAULT_LIVE_REFRESH_SECONDS
+    try:
+        value = int(current)
+    except Exception:
+        return DEFAULT_LIVE_REFRESH_SECONDS
+    if not st.session_state.get(migration_key) and value == OLD_LIVE_REFRESH_DEFAULT_SECONDS:
+        st.session_state[migration_key] = True
+        return DEFAULT_LIVE_REFRESH_SECONDS
+    st.session_state[migration_key] = True
+    return value
 
 
 def format_race_clock(minute: float | int | None) -> str:
@@ -1083,7 +1101,7 @@ def show_race_day_sync_status(sync: Mapping[str, Any]) -> None:
     last_load = st.session_state.get("editable_google_sheet_last_loaded", "-")
     last_save = st.session_state.get("race_day_sheet_last_saved", "-")
     live_reload = st.session_state.get("race_day_live_sheet_enabled", bool(sync.get("configured")))
-    refresh_seconds = st.session_state.get("race_day_live_refresh_seconds", 15)
+    refresh_seconds = live_refresh_seconds_default("race_day_live_refresh_seconds")
     with st.container(border=True):
         st.markdown("#### Sheet Activity")
         cols = st.columns(4)
@@ -1104,7 +1122,8 @@ def show_race_day_readiness(
     caps_enabled: bool,
 ) -> None:
     sheet_state = "Ready" if sync.get("configured") else "Check setup"
-    live_state = "On" if st.session_state.get("race_day_live_sheet_enabled", bool(sync.get("configured"))) else "Off"
+    live_enabled = st.session_state.get("race_day_live_sheet_enabled", bool(sync.get("configured")))
+    live_state = f"On ({live_refresh_seconds_default('race_day_live_refresh_seconds')}s)" if live_enabled else "Off"
     if errors:
         log_state = f"{len(errors)} fix"
     elif warnings:
@@ -1455,20 +1474,20 @@ def show_google_sheet_controls(
         with top_cols[0]:
             st.markdown("#### Live Sheet")
             if configured:
-                st.caption("Live sync is on. Portal lap changes save to the Sheet; Sheet changes reload here.")
+                st.caption("App changes save immediately. Sheet auto reload defaults to once per minute.")
             else:
                 st.caption("Write access is not configured. Public-link loading and CSV backup are still available.")
 
         live_reload = top_cols[1].checkbox(
             "Auto reload",
             value=st.session_state.get("race_day_live_sheet_enabled", configured),
-            help="Reloads the Sheet while this Race Day tab is open.",
+            help="Polls the Sheet while this Race Day tab is open. App saves still write immediately.",
         )
         refresh_seconds = top_cols[2].number_input(
-            "Every seconds",
+            "Reload every seconds",
             min_value=10,
             max_value=300,
-            value=int(st.session_state.get("race_day_live_refresh_seconds", 15)),
+            value=live_refresh_seconds_default("race_day_live_refresh_seconds"),
             step=5,
         )
         st.session_state["race_day_live_sheet_enabled"] = live_reload
@@ -2636,20 +2655,20 @@ def show_drinks_sheet_controls(table: pd.DataFrame, roster: pd.DataFrame) -> tup
         with top_cols[0]:
             st.markdown("#### Drinks Sheet")
             if configured:
-                st.caption("Live sync is on. Website changes save to the drinks worksheet; Sheet changes reload here.")
+                st.caption("App changes save immediately. Sheet auto reload defaults to once per minute.")
             else:
                 st.caption("Google sync is not configured. Local tracking and CSV download still work.")
 
         live_reload = top_cols[1].checkbox(
             "Auto reload",
             value=st.session_state.get("drinks_live_sheet_enabled", configured),
-            help="Reloads the drinks worksheet while this tab is open.",
+            help="Polls the drinks worksheet while this tab is open. App saves still write immediately.",
         )
         refresh_seconds = top_cols[2].number_input(
-            "Every seconds",
+            "Reload every seconds",
             min_value=10,
             max_value=300,
-            value=int(st.session_state.get("drinks_live_refresh_seconds", 15)),
+            value=live_refresh_seconds_default("drinks_live_refresh_seconds"),
             step=5,
             key="drinks_refresh_seconds_input",
         )
@@ -3048,21 +3067,21 @@ def show_sleep_sheet_controls(table: pd.DataFrame, roster: pd.DataFrame) -> tupl
         with top_cols[0]:
             st.markdown("#### Sleep Sheet")
             if configured:
-                st.caption("Live sync is on. Website changes save to the sleep worksheet; Sheet changes reload here.")
+                st.caption("App changes save immediately. Sheet auto reload defaults to once per minute.")
             else:
                 st.caption("Google sync is not configured. Local tracking and CSV download still work.")
 
         live_reload = top_cols[1].checkbox(
             "Auto reload",
             value=st.session_state.get("sleep_live_sheet_enabled", configured),
-            help="Reloads the sleep worksheet while this tab is open.",
+            help="Polls the sleep worksheet while this tab is open. App saves still write immediately.",
             key="sleep_live_reload_checkbox",
         )
         refresh_seconds = top_cols[2].number_input(
-            "Every seconds",
+            "Reload every seconds",
             min_value=10,
             max_value=300,
-            value=int(st.session_state.get("sleep_live_refresh_seconds", 15)),
+            value=live_refresh_seconds_default("sleep_live_refresh_seconds"),
             step=5,
             key="sleep_refresh_seconds_input",
         )
