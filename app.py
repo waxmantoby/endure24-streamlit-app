@@ -6715,6 +6715,181 @@ def weather_conditions_plot(laps: pd.DataFrame) -> go.Figure:
     return fig
 
 
+def weather_rain_probability(row: pd.Series) -> float:
+    value = pd.to_numeric(pd.Series([row.get("rain_probability_pct")]), errors="coerce").iloc[0]
+    return 0.0 if pd.isna(value) else float(value)
+
+
+def weather_precipitation_mm(row: pd.Series) -> float:
+    value = pd.to_numeric(pd.Series([row.get("precipitation_mm")]), errors="coerce").iloc[0]
+    return 0.0 if pd.isna(value) else float(value)
+
+
+def weather_wind_kph(row: pd.Series) -> float:
+    value = pd.to_numeric(pd.Series([row.get("wind_kph")]), errors="coerce").iloc[0]
+    return 0.0 if pd.isna(value) else float(value)
+
+
+def weather_gust_kph(row: pd.Series) -> float:
+    value = pd.to_numeric(pd.Series([row.get("gust_kph")]), errors="coerce").iloc[0]
+    return 0.0 if pd.isna(value) else float(value)
+
+
+def lap_has_rain_risk(row: pd.Series) -> bool:
+    condition = str(row.get("condition", "") or "").lower()
+    return (
+        weather_rain_probability(row) >= 45.0
+        or weather_precipitation_mm(row) >= 0.2
+        or any(term in condition for term in ["rain", "shower", "sleet", "snow", "thunder"])
+    )
+
+
+def lap_has_wind_risk(row: pd.Series) -> bool:
+    return weather_wind_kph(row) >= 20.0 or weather_gust_kph(row) >= 35.0
+
+
+def rain_status_text(row: pd.Series) -> tuple[str, str]:
+    rain = weather_rain_probability(row)
+    precipitation = weather_precipitation_mm(row)
+    condition = str(row.get("condition", "-") or "-")
+    if lap_has_rain_risk(row):
+        return "Rain watch", f"{rain:.0f}% rain chance, {precipitation:.1f} mm forecast, {condition}."
+    if rain <= 20 and precipitation < 0.1:
+        return "No rain", f"{rain:.0f}% rain chance, dry forecast, {condition}."
+    return "Low rain risk", f"{rain:.0f}% rain chance, {precipitation:.1f} mm forecast, {condition}."
+
+
+def wind_status_text(row: pd.Series) -> tuple[str, str]:
+    wind = weather_wind_kph(row)
+    gust = weather_gust_kph(row)
+    if lap_has_wind_risk(row):
+        return "Wind watch", f"{wind:.0f} km/h wind, gusts {gust:.0f} km/h."
+    return "Wind okay", f"{wind:.0f} km/h wind, gusts {gust:.0f} km/h."
+
+
+def weather_lap_brief(row: pd.Series) -> str:
+    start = row.get("start_time")
+    start_label = pd.Timestamp(start).strftime("%a %H:%M") if pd.notna(start) else "-"
+    return f"Lap {int(row.get('lap_number'))}: {row.get('runner')} at {start_label}"
+
+
+def weather_risk_callouts(laps: pd.DataFrame) -> dict[str, tuple[str, str]]:
+    if laps.empty:
+        return {
+            "next_rain": ("Next Lap", "-"),
+            "first_rain": ("First Rain", "-"),
+            "first_wind": ("First Wind", "-"),
+            "worst_rain": ("Wettest Lap", "-"),
+        }
+
+    next_lap = laps.iloc[0]
+    next_rain_label, next_rain_help = rain_status_text(next_lap)
+    next_wind_label, next_wind_help = wind_status_text(next_lap)
+    rain_rows = laps[laps.apply(lap_has_rain_risk, axis=1)]
+    wind_rows = laps[laps.apply(lap_has_wind_risk, axis=1)]
+    rain_numeric = pd.to_numeric(laps["rain_probability_pct"], errors="coerce").fillna(0)
+    worst_rain = laps.loc[rain_numeric.idxmax()]
+
+    if rain_rows.empty:
+        first_rain = ("No forecast rain", "No predicted lap currently crosses the rain-watch threshold.")
+    else:
+        row = rain_rows.iloc[0]
+        first_rain = (
+            f"{row['runner']} lap {int(row['lap_number'])}",
+            f"{weather_lap_brief(row)}; {weather_rain_probability(row):.0f}% rain chance, {weather_precipitation_mm(row):.1f} mm.",
+        )
+
+    if wind_rows.empty:
+        first_wind = ("No wind watch", "No predicted lap currently crosses the wind-watch threshold.")
+    else:
+        row = wind_rows.iloc[0]
+        first_wind = (
+            f"{row['runner']} lap {int(row['lap_number'])}",
+            f"{weather_lap_brief(row)}; {weather_wind_kph(row):.0f} km/h wind, gusts {weather_gust_kph(row):.0f} km/h.",
+        )
+
+    return {
+        "next_rain": (
+            f"Next lap: {next_rain_label}",
+            f"{weather_lap_brief(next_lap)}; {next_rain_help}",
+        ),
+        "next_wind": (
+            f"Next lap: {next_wind_label}",
+            f"{weather_lap_brief(next_lap)}; {next_wind_help}",
+        ),
+        "first_rain": first_rain,
+        "first_wind": first_wind,
+        "worst_rain": (
+            f"{worst_rain['runner']} {weather_rain_probability(worst_rain):.0f}%",
+            f"{weather_lap_brief(worst_rain)}; highest rain chance in the shown forecast.",
+        ),
+    }
+
+
+def rain_wind_runner_plot(laps: pd.DataFrame) -> go.Figure:
+    fig = go.Figure()
+    if laps.empty:
+        return fig
+    plot = laps.copy()
+    plot["runner_label"] = plot["runner"].astype(str) + "<br>L" + plot["lap_number"].astype(int).astype(str)
+    rain_values = pd.to_numeric(plot["rain_probability_pct"], errors="coerce").fillna(0)
+    colors = [
+        "#0f766e" if value < 25 else "#f59e0b" if value < 50 else "#2563eb" if value < 75 else "#1d4ed8"
+        for value in rain_values
+    ]
+    fig.add_trace(
+        go.Bar(
+            x=plot["start_time"],
+            y=rain_values,
+            name="Rain chance",
+            text=plot["runner_label"],
+            textposition="outside",
+            marker_color=colors,
+            customdata=plot[["runner", "lap_number", "condition", "precipitation_mm", "wind_kph", "gust_kph", "pace"]],
+            hovertemplate=(
+                "%{customdata[0]} lap %{customdata[1]:.0f}<br>"
+                "Rain chance %{y:.0f}%<br>"
+                "%{customdata[2]}, %{customdata[3]:.1f} mm<br>"
+                "Wind %{customdata[4]:.0f} km/h, gusts %{customdata[5]:.0f} km/h<br>"
+                "%{customdata[6]}<extra></extra>"
+            ),
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=plot["start_time"],
+            y=plot["wind_kph"],
+            mode="lines+markers",
+            name="Wind km/h",
+            line={"color": "#7c3aed", "width": 3},
+            yaxis="y2",
+            hovertemplate="Wind %{y:.0f} km/h<extra></extra>",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=plot["start_time"],
+            y=plot["gust_kph"],
+            mode="lines",
+            name="Gusts km/h",
+            line={"color": "#4c1d95", "dash": "dot", "width": 2},
+            yaxis="y2",
+            hovertemplate="Gusts %{y:.0f} km/h<extra></extra>",
+        )
+    )
+    fig.add_hline(y=45, line_dash="dash", line_color="#2563eb", annotation_text="Rain watch")
+    fig.update_layout(
+        title="Rain and wind by predicted runner",
+        height=440,
+        xaxis_title="Predicted lap start",
+        yaxis={"title": "Rain chance %", "range": [0, 105]},
+        yaxis2={"title": "Wind / gust km/h", "overlaying": "y", "side": "right", "rangemode": "tozero"},
+        legend={"orientation": "h", "y": -0.18},
+        margin={"t": 70, "b": 82},
+    )
+    return fig
+
+
 def show_weather_tab(roster: pd.DataFrame, course: CourseSettings) -> None:
     st.subheader("Weather")
     st.caption(
@@ -6771,6 +6946,25 @@ def show_weather_tab(roster: pd.DataFrame, course: CourseSettings) -> None:
         st.info("No lap forecast could be built yet.")
         return
 
+    callouts = weather_risk_callouts(laps)
+    st.markdown("#### Rain & Wind Watch")
+    rain_cols = st.columns(5)
+    rain_cols[0].metric("Next lap rain", callouts["next_rain"][0])
+    rain_cols[0].caption(callouts["next_rain"][1])
+    rain_cols[1].metric("First rain lap", callouts["first_rain"][0])
+    rain_cols[1].caption(callouts["first_rain"][1])
+    rain_cols[2].metric("Wettest shown", callouts["worst_rain"][0])
+    rain_cols[2].caption(callouts["worst_rain"][1])
+    rain_cols[3].metric("Next lap wind", callouts["next_wind"][0])
+    rain_cols[3].caption(callouts["next_wind"][1])
+    rain_cols[4].metric("First wind lap", callouts["first_wind"][0])
+    rain_cols[4].caption(callouts["first_wind"][1])
+    st.plotly_chart(rain_wind_runner_plot(laps), width="stretch")
+    st.caption(
+        "Rain watch starts at 45% rain chance, 0.2 mm forecast precipitation, or rain/showers in the condition. "
+        "Wind watch starts at 20 km/h wind or 35 km/h gusts."
+    )
+
     summary_cols = st.columns(4)
     summary_cols[0].metric("Planned order", " -> ".join(sequence[:3]) + ("..." if len(sequence) > 3 else ""))
     summary_cols[1].metric("Next forecast runner", str(laps.iloc[0]["runner"]))
@@ -6788,6 +6982,7 @@ def show_weather_tab(roster: pd.DataFrame, course: CourseSettings) -> None:
     display["rain_probability_pct"] = pd.to_numeric(display["rain_probability_pct"], errors="coerce").round(0)
     display["precipitation_mm"] = pd.to_numeric(display["precipitation_mm"], errors="coerce").round(1)
     display["wind_kph"] = pd.to_numeric(display["wind_kph"], errors="coerce").round(1)
+    display["gust_kph"] = pd.to_numeric(display["gust_kph"], errors="coerce").round(1)
     st.dataframe(
         display[
             [
@@ -6804,6 +6999,7 @@ def show_weather_tab(roster: pd.DataFrame, course: CourseSettings) -> None:
                 "rain_probability_pct",
                 "precipitation_mm",
                 "wind_kph",
+                "gust_kph",
             ]
         ],
         width="stretch",
@@ -6822,6 +7018,7 @@ def show_weather_tab(roster: pd.DataFrame, course: CourseSettings) -> None:
             "rain_probability_pct": st.column_config.NumberColumn("Rain %", format="%.0f"),
             "precipitation_mm": st.column_config.NumberColumn("Rain mm", format="%.1f"),
             "wind_kph": st.column_config.NumberColumn("Wind km/h", format="%.1f"),
+            "gust_kph": st.column_config.NumberColumn("Gust km/h", format="%.1f"),
         },
     )
 
