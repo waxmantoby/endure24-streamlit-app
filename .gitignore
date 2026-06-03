@@ -4,3 +4,4 @@ __pycache__/
 .DS_Store
 work/
 .streamlit/secrets.toml
+.weather_cache/

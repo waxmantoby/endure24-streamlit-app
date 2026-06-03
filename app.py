@@ -66,6 +66,8 @@ EVENT_LOCATION_NAME = "Wasing Park, Wasing Lane, Berkshire, RG7 4LY"
 EVENT_LATITUDE = 51.38132
 EVENT_LONGITUDE = -1.16803
 WEATHER_CACHE_SECONDS = 30 * 60
+WEATHER_STALE_FALLBACK_SECONDS = 12 * 60 * 60
+WEATHER_CACHE_PATH = Path(__file__).with_name(".weather_cache") / "open_meteo_forecast.json"
 DEFAULT_EDITABLE_GOOGLE_SHEET_URL = (
     "https://docs.google.com/spreadsheets/d/1dKvzME6TL4EJ8u_f0-l2p7ZENBwj7TUZLt0cW0T7QHo/edit?usp=sharing"
 )
@@ -786,6 +788,169 @@ def fetch_open_meteo_forecast(latitude: float, longitude: float, timezone: str) 
             forecast[column] = pd.to_numeric(forecast[column], errors="coerce")
     forecast["condition"] = forecast.get("weather_code", pd.Series(dtype=float)).map(weather_code_label)
     return forecast, now_bst_label()
+
+
+def is_weather_quota_error(exc: Exception) -> bool:
+    status_code = getattr(getattr(exc, "response", None), "status_code", None)
+    return status_code == 429 or "429" in str(exc) or "Too Many Requests" in str(exc)
+
+
+def weather_cooldown_remaining_seconds() -> int:
+    try:
+        cooldown_until = float(st.session_state.get("weather_api_cooldown_until", 0) or 0)
+    except Exception:
+        cooldown_until = 0
+    remaining = int(max(0, round(cooldown_until - current_epoch_seconds())))
+    if remaining <= 0:
+        st.session_state.pop("weather_api_cooldown_until", None)
+    return remaining
+
+
+def read_weather_file_cache(
+    latitude: float,
+    longitude: float,
+    timezone: str,
+    max_age_seconds: int = WEATHER_STALE_FALLBACK_SECONDS,
+) -> tuple[pd.DataFrame, str, int] | None:
+    try:
+        if not WEATHER_CACHE_PATH.exists():
+            return None
+        payload = json.loads(WEATHER_CACHE_PATH.read_text(encoding="utf-8"))
+        if payload.get("timezone") != timezone:
+            return None
+        if abs(float(payload.get("latitude", 999)) - float(latitude)) > 0.01:
+            return None
+        if abs(float(payload.get("longitude", 999)) - float(longitude)) > 0.01:
+            return None
+        fetched_epoch = float(payload.get("fetched_epoch", 0) or 0)
+        age_seconds = int(max(0, current_epoch_seconds() - fetched_epoch))
+        if age_seconds > max_age_seconds:
+            return None
+        records = payload.get("records", [])
+        weather = pd.DataFrame(records)
+        if weather.empty or "time" not in weather:
+            return None
+        weather["time"] = pd.to_datetime(weather["time"], errors="coerce", utc=True).dt.tz_convert(RACE_TIMEZONE)
+        for column in [
+            "temperature_2m",
+            "apparent_temperature",
+            "relative_humidity_2m",
+            "precipitation_probability",
+            "precipitation",
+            "weather_code",
+            "wind_speed_10m",
+            "wind_gusts_10m",
+        ]:
+            if column in weather:
+                weather[column] = pd.to_numeric(weather[column], errors="coerce")
+        if "condition" not in weather and "weather_code" in weather:
+            weather["condition"] = weather["weather_code"].map(weather_code_label)
+        return weather, str(payload.get("fetched_at", "-")), age_seconds
+    except Exception:
+        return None
+
+
+def write_weather_file_cache(latitude: float, longitude: float, timezone: str, weather: pd.DataFrame, fetched_at: str) -> None:
+    if weather.empty:
+        return
+    try:
+        serializable = weather.copy()
+        if "time" in serializable:
+            serializable["time"] = pd.to_datetime(serializable["time"], errors="coerce").map(
+                lambda value: value.isoformat() if pd.notna(value) else None
+            )
+        serializable = serializable.astype(object).where(pd.notna(serializable), None)
+        payload = {
+            "latitude": float(latitude),
+            "longitude": float(longitude),
+            "timezone": timezone,
+            "fetched_at": fetched_at,
+            "fetched_epoch": current_epoch_seconds(),
+            "records": serializable.to_dict("records"),
+        }
+        WEATHER_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        WEATHER_CACHE_PATH.write_text(json.dumps(payload), encoding="utf-8")
+    except Exception:
+        return
+
+
+def load_weather_forecast_guarded(latitude: float, longitude: float, timezone: str) -> dict[str, Any]:
+    cached = read_weather_file_cache(latitude, longitude, timezone)
+    if cached is not None:
+        weather, fetched_at, age_seconds = cached
+        if age_seconds < WEATHER_CACHE_SECONDS:
+            return {
+                "weather": weather,
+                "fetched_at": fetched_at,
+                "status": "cached",
+                "message": f"Using cached weather from {fetched_at}. Next API refresh is allowed in about {max(1, int((WEATHER_CACHE_SECONDS - age_seconds + 59) // 60))} minute(s).",
+                "age_seconds": age_seconds,
+            }
+
+    remaining = weather_cooldown_remaining_seconds()
+    if remaining > 0:
+        if cached is not None:
+            weather, fetched_at, age_seconds = cached
+            return {
+                "weather": weather,
+                "fetched_at": fetched_at,
+                "status": "quota",
+                "message": f"Open-Meteo is rate limiting requests. Using cached weather from {fetched_at}; retry in about {max(1, int((remaining + 59) // 60))} minute(s).",
+                "age_seconds": age_seconds,
+            }
+        return {
+            "weather": pd.DataFrame(),
+            "fetched_at": "-",
+            "status": "quota",
+            "message": f"Open-Meteo is rate limiting requests. Weather will retry in about {max(1, int((remaining + 59) // 60))} minute(s).",
+            "age_seconds": None,
+        }
+
+    try:
+        weather, fetched_at = fetch_open_meteo_forecast(latitude, longitude, timezone)
+        write_weather_file_cache(latitude, longitude, timezone, weather, fetched_at)
+        return {
+            "weather": weather,
+            "fetched_at": fetched_at,
+            "status": "live",
+            "message": f"Weather refreshed from Open-Meteo at {fetched_at}.",
+            "age_seconds": 0,
+        }
+    except Exception as exc:
+        if is_weather_quota_error(exc):
+            st.session_state["weather_api_cooldown_until"] = current_epoch_seconds() + WEATHER_CACHE_SECONDS
+            if cached is not None:
+                weather, fetched_at, age_seconds = cached
+                return {
+                    "weather": weather,
+                    "fetched_at": fetched_at,
+                    "status": "quota",
+                    "message": f"Open-Meteo returned too many requests. Using cached weather from {fetched_at}; retry in about {WEATHER_CACHE_SECONDS // 60} minute(s).",
+                    "age_seconds": age_seconds,
+                }
+            return {
+                "weather": pd.DataFrame(),
+                "fetched_at": "-",
+                "status": "quota",
+                "message": f"Open-Meteo returned too many requests. Weather is paused for about {WEATHER_CACHE_SECONDS // 60} minute(s) to avoid hammering the API.",
+                "age_seconds": None,
+            }
+        if cached is not None:
+            weather, fetched_at, age_seconds = cached
+            return {
+                "weather": weather,
+                "fetched_at": fetched_at,
+                "status": "stale",
+                "message": f"Could not refresh weather, so using cached weather from {fetched_at}.",
+                "age_seconds": age_seconds,
+            }
+        return {
+            "weather": pd.DataFrame(),
+            "fetched_at": "-",
+            "status": "error",
+            "message": f"Weather forecast is unavailable right now: {exc}",
+            "age_seconds": None,
+        }
 
 
 def weather_row_for_time(weather: pd.DataFrame, timestamp: pd.Timestamp) -> dict[str, Any] | None:
@@ -6396,14 +6561,20 @@ def show_weather_tab(roster: pd.DataFrame, course: CourseSettings) -> None:
     control_cols[2].metric("Location", "Wasing Park", f"{EVENT_LATITUDE:.4f}, {EVENT_LONGITUDE:.4f}")
     race_start = race_start_timestamp(race_date)
 
-    try:
-        weather, fetched_at = fetch_open_meteo_forecast(EVENT_LATITUDE, EVENT_LONGITUDE, RACE_TIMEZONE)
-    except Exception as exc:
-        st.error(f"Could not load Open-Meteo weather forecast: {exc}")
-        weather = pd.DataFrame()
-        fetched_at = "-"
+    weather_bundle = load_weather_forecast_guarded(EVENT_LATITUDE, EVENT_LONGITUDE, RACE_TIMEZONE)
+    weather = weather_bundle["weather"]
+    fetched_at = weather_bundle["fetched_at"]
+    weather_status = weather_bundle["status"]
+    if weather_status == "live":
+        st.success(weather_bundle["message"])
+    elif weather_status == "cached":
+        st.info(weather_bundle["message"])
+    elif weather_status in {"quota", "stale"}:
+        st.warning(weather_bundle["message"])
+    else:
+        st.error(weather_bundle["message"])
 
-    st.caption(f"Weather source: Open-Meteo. Last API fetch/cache refresh: {fetched_at}.")
+    st.caption(f"Weather source: Open-Meteo. Last successful API/cache refresh: {fetched_at}.")
     if not sequence:
         st.warning("Set at least one active runner in the Run Plan tab to forecast weather-adjusted laps.")
         return
