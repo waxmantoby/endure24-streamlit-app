@@ -192,6 +192,34 @@ def inject_app_styles() -> None:
             background: #f8fafc;
             color: #516173;
         }
+        .achievement-grid {
+            display: grid;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            gap: 0.55rem;
+            margin: 0.25rem 0 0.8rem 0;
+        }
+        .achievement-card {
+            border: 1px solid #d7dde5;
+            border-radius: 8px;
+            padding: 0.65rem 0.75rem;
+            background: #f8fafc;
+            min-height: 5.2rem;
+        }
+        .achievement-card-unlocked {
+            border-color: #9ed6b9;
+            background: #edf9f2;
+        }
+        .achievement-title {
+            color: #162235;
+            font-size: 0.92rem;
+            font-weight: 760;
+            line-height: 1.2;
+        }
+        .achievement-detail {
+            color: #617083;
+            font-size: 0.82rem;
+            margin-top: 0.25rem;
+        }
         @media (max-width: 760px) {
             .block-container {
                 padding-left: 0.75rem;
@@ -206,6 +234,9 @@ def inject_app_styles() -> None:
             }
             .race-mini-value {
                 font-size: 1.2rem;
+            }
+            .achievement-grid {
+                grid-template-columns: repeat(2, minmax(0, 1fr));
             }
         }
         </style>
@@ -1388,6 +1419,7 @@ def show_race_control_dashboard(
         width="stretch",
     )
     show_race_day_visual_panels(log, roster, state, caps_enabled)
+    show_race_day_fun_zone(log, roster, settings, state, live_bundle)
 
     with st.expander("Fixed-order queue and runner status", expanded=False):
         queue = build_runner_queue(log, roster, caps_enabled=caps_enabled, queue_size=5)
@@ -1462,6 +1494,318 @@ def show_race_day_visual_panels(
                 "rest": "Rest",
             },
         )
+
+
+def completed_official_laps(log: pd.DataFrame, roster: pd.DataFrame) -> pd.DataFrame:
+    clean = normalise_race_log(log, roster)
+    completed = clean.dropna(subset=["lap_duration_minutes", "finish_minute"]).copy()
+    if "official" in completed:
+        completed = completed[completed["official"].fillna(False).astype(bool)].copy()
+    if completed.empty:
+        return completed
+    completed["lap_number"] = pd.to_numeric(completed["lap_number"], errors="coerce").astype("Int64")
+    completed["lap_duration_minutes"] = pd.to_numeric(completed["lap_duration_minutes"], errors="coerce")
+    completed["finish_minute"] = pd.to_numeric(completed["finish_minute"], errors="coerce")
+    return completed.sort_values("lap_number").reset_index(drop=True)
+
+
+def runner_mean_lookup(roster: pd.DataFrame) -> dict[str, float]:
+    clean = roster.copy()
+    clean["runner"] = clean["runner"].astype(str).str.strip()
+    clean["projected_mean_minutes"] = pd.to_numeric(clean["projected_mean_minutes"], errors="coerce")
+    return clean.dropna(subset=["projected_mean_minutes"]).drop_duplicates("runner").set_index("runner")[
+        "projected_mean_minutes"
+    ].to_dict()
+
+
+def prediction_leaderboard_table(predictions: pd.DataFrame) -> pd.DataFrame:
+    if predictions is None or predictions.empty:
+        return pd.DataFrame(columns=["player", "runner", "lap_number", "predicted_minutes", "actual_minutes", "miss"])
+    clean = predictions.copy()
+    clean["actual_minutes"] = pd.to_numeric(clean.get("actual_minutes"), errors="coerce")
+    clean["delta_minutes"] = pd.to_numeric(clean.get("delta_minutes"), errors="coerce")
+    clean = clean.dropna(subset=["actual_minutes", "delta_minutes"]).copy()
+    if clean.empty:
+        return pd.DataFrame(columns=["player", "runner", "lap_number", "predicted_minutes", "actual_minutes", "miss"])
+    clean["miss"] = clean["delta_minutes"].abs()
+    clean = clean.sort_values(["miss", "recorded_at", "player"], ascending=[True, True, True])
+    return clean[["player", "runner", "lap_number", "predicted_minutes", "actual_minutes", "miss", "notes"]].reset_index(
+        drop=True
+    )
+
+
+def team_morale_summary(
+    log: pd.DataFrame,
+    roster: pd.DataFrame,
+    state,
+    live_bundle: dict | None,
+    drinks_table: pd.DataFrame,
+    sleep_summary: pd.DataFrame,
+    predictions: pd.DataFrame,
+) -> dict[str, Any]:
+    completed = completed_official_laps(log, roster)
+    official_laps = len(completed)
+    live_summary = live_bundle["summary"] if live_bundle else {}
+    probability = live_summary.get("probability_target_laps") if live_summary else None
+    probability = None if probability is None or pd.isna(probability) else float(probability)
+    team_sleep = float(pd.to_numeric(sleep_summary.get("hours", pd.Series(dtype=float)), errors="coerce").fillna(0).sum())
+    drinks_total = int(pd.to_numeric(drinks_table.get("count", pd.Series(dtype=float)), errors="coerce").fillna(0).sum())
+    settled_predictions = len(prediction_leaderboard_table(predictions))
+
+    score = 35.0
+    score += min(32.0, official_laps * 1.8)
+    score += 10.0 if state.current_lap_in_progress else 0.0
+    score += min(8.0, team_sleep * 0.35)
+    score += min(6.0, drinks_total * 0.75)
+    score += min(5.0, settled_predictions * 1.25)
+    if probability is not None:
+        score += max(-14.0, min(14.0, (probability - 0.5) * 28.0))
+    score = int(round(max(0.0, min(100.0, score))))
+
+    if score >= 75:
+        label = "Flying"
+        help_text = "Pace, logs, and team tracking look lively."
+    elif score >= 55:
+        label = "Steady"
+        help_text = "Everything is moving; keep the logs clean."
+    else:
+        label = "Needs a lift"
+        help_text = "Race-day tracking suggests a check-in would help."
+
+    return {
+        "score": score,
+        "label": label,
+        "help": help_text,
+        "official_laps": official_laps,
+        "team_sleep": team_sleep,
+        "drinks_total": drinks_total,
+        "settled_predictions": settled_predictions,
+    }
+
+
+def build_runner_awards(
+    log: pd.DataFrame,
+    roster: pd.DataFrame,
+    drinks_table: pd.DataFrame,
+    sleep_summary: pd.DataFrame,
+    predictions: pd.DataFrame,
+) -> pd.DataFrame:
+    awards: list[dict[str, str]] = []
+    completed = completed_official_laps(log, roster)
+    mean_lookup = runner_mean_lookup(roster)
+
+    if completed.empty:
+        awards.append({"award": "Fastest lap", "winner": "-", "detail": "Waiting for the first completed official lap."})
+    else:
+        fastest = completed.sort_values("lap_duration_minutes").iloc[0]
+        awards.append(
+            {
+                "award": "Fastest lap",
+                "winner": str(fastest["runner"]),
+                "detail": f"Lap {int(fastest['lap_number'])}, {float(fastest['lap_duration_minutes']):.1f} min.",
+            }
+        )
+
+        over = completed.copy()
+        over["expected_mean"] = over["runner"].astype(str).map(mean_lookup)
+        over["minutes_ahead"] = over["expected_mean"] - over["lap_duration_minutes"]
+        over = over.dropna(subset=["minutes_ahead"]).sort_values("minutes_ahead", ascending=False)
+        if not over.empty:
+            row = over.iloc[0]
+            awards.append(
+                {
+                    "award": "Biggest pace pop",
+                    "winner": str(row["runner"]),
+                    "detail": f"{float(row['minutes_ahead']):+.1f} min vs expected on lap {int(row['lap_number'])}.",
+                }
+            )
+
+        counts = completed.groupby("runner", as_index=False).agg(laps=("lap_number", "count"))
+        workhorse = counts.sort_values(["laps", "runner"], ascending=[False, True]).iloc[0]
+        awards.append(
+            {
+                "award": "Workhorse",
+                "winner": str(workhorse["runner"]),
+                "detail": f"{int(workhorse['laps'])} official lap(s) logged.",
+            }
+        )
+
+        consistency = completed.groupby("runner", as_index=False).agg(
+            laps=("lap_number", "count"),
+            lap_sd=("lap_duration_minutes", "std"),
+        )
+        consistency = consistency[consistency["laps"].ge(2)].dropna(subset=["lap_sd"]).sort_values(["lap_sd", "runner"])
+        if not consistency.empty:
+            row = consistency.iloc[0]
+            awards.append(
+                {
+                    "award": "Most consistent",
+                    "winner": str(row["runner"]),
+                    "detail": f"{float(row['lap_sd']):.1f} min spread across {int(row['laps'])} laps.",
+                }
+            )
+
+    if isinstance(sleep_summary, pd.DataFrame) and not sleep_summary.empty:
+        rested = sleep_summary.copy()
+        rested["hours"] = pd.to_numeric(rested["hours"], errors="coerce").fillna(0)
+        most_rested = rested.sort_values(["hours", "runner"], ascending=[False, True]).iloc[0]
+        awards.append(
+            {
+                "award": "Best nap bank",
+                "winner": str(most_rested["runner"]),
+                "detail": f"{float(most_rested['hours']):.1f}h logged.",
+            }
+        )
+
+    if isinstance(drinks_table, pd.DataFrame) and not drinks_table.empty:
+        drinks = drinks_table.copy()
+        drinks["count"] = pd.to_numeric(drinks["count"], errors="coerce").fillna(0).astype(int)
+        leader = drinks.sort_values(["count", "runner"], ascending=[False, True]).iloc[0]
+        awards.append(
+            {
+                "award": "Refreshment leader",
+                "winner": str(leader["runner"]),
+                "detail": f"{int(leader['count'])} {str(leader['unit']).lower()}.",
+            }
+        )
+
+    leaderboard = prediction_leaderboard_table(predictions)
+    if not leaderboard.empty:
+        winner = leaderboard.iloc[0]
+        awards.append(
+            {
+                "award": "Prediction sharpest",
+                "winner": str(winner["player"]),
+                "detail": f"{float(winner['miss']):.1f} min off {winner['runner']} lap {int(winner['lap_number'])}.",
+            }
+        )
+
+    return pd.DataFrame(awards)
+
+
+def build_achievement_cards(
+    log: pd.DataFrame,
+    roster: pd.DataFrame,
+    settings: SimulationSettings,
+    state,
+    live_bundle: dict | None,
+    drinks_table: pd.DataFrame,
+    sleep_summary: pd.DataFrame,
+    predictions: pd.DataFrame,
+) -> pd.DataFrame:
+    completed = completed_official_laps(log, roster)
+    official_laps = len(completed)
+    runner_count = len(roster["runner"].astype(str).str.strip().drop_duplicates()) if "runner" in roster else 0
+    runners_with_laps = completed["runner"].astype(str).str.strip().nunique() if not completed.empty else 0
+    team_sleep = float(pd.to_numeric(sleep_summary.get("hours", pd.Series(dtype=float)), errors="coerce").fillna(0).sum())
+    drinks = drinks_table.copy() if isinstance(drinks_table, pd.DataFrame) else pd.DataFrame()
+    drinks["count"] = pd.to_numeric(drinks.get("count", pd.Series(dtype=float)), errors="coerce").fillna(0).astype(int)
+    jared_rows = drinks[drinks.get("runner", pd.Series(dtype=str)).astype(str).str.lower().eq("jared")]
+    jared_count = int(jared_rows.iloc[0]["count"]) if not jared_rows.empty else 0
+    leaderboard = prediction_leaderboard_table(predictions)
+
+    probability = None
+    if live_bundle:
+        probability = live_bundle.get("summary", {}).get("probability_target_laps")
+    probability = None if probability is None or pd.isna(probability) else float(probability)
+
+    achievements = [
+        {
+            "achievement": "First lap banked",
+            "unlocked": official_laps >= 1,
+            "detail": f"{official_laps} official lap(s) logged.",
+        },
+        {
+            "achievement": "Double figures",
+            "unlocked": official_laps >= 10,
+            "detail": f"{max(0, 10 - official_laps)} lap(s) to go.",
+        },
+        {
+            "achievement": "Everyone on course",
+            "unlocked": runner_count > 0 and runners_with_laps >= runner_count,
+            "detail": f"{runners_with_laps}/{runner_count} runners have an official lap.",
+        },
+        {
+            "achievement": "Midnight crew",
+            "unlocked": float(state.elapsed_minute) >= 12 * 60,
+            "detail": f"Race clock is {format_race_clock(state.elapsed_minute)}.",
+        },
+        {
+            "achievement": "Sleep bank",
+            "unlocked": team_sleep >= 20,
+            "detail": f"{team_sleep:.1f}h logged across the team.",
+        },
+        {
+            "achievement": "Rubicon checkpoint",
+            "unlocked": jared_count >= 3,
+            "detail": f"Jared has {jared_count} Rubicons logged.",
+        },
+        {
+            "achievement": "Forecast believer",
+            "unlocked": probability is not None and probability >= 0.5,
+            "detail": "Target chance is " + (format_probability(probability) if probability is not None else "not forecast yet") + ".",
+        },
+        {
+            "achievement": "Prediction game live",
+            "unlocked": not leaderboard.empty,
+            "detail": f"{len(leaderboard)} settled prediction(s).",
+        },
+    ]
+    return pd.DataFrame(achievements)
+
+
+def render_achievement_cards(achievements: pd.DataFrame) -> None:
+    cards = []
+    for row in achievements.to_dict("records"):
+        unlocked = bool(row.get("unlocked"))
+        css = "achievement-card achievement-card-unlocked" if unlocked else "achievement-card"
+        status = "Unlocked" if unlocked else "Locked"
+        cards.append(
+            f'<div class="{css}">'
+            f'<div class="achievement-title">{html.escape(str(row.get("achievement", "")))}</div>'
+            f'<div class="achievement-detail">{html.escape(status)}. {html.escape(str(row.get("detail", "")))}</div>'
+            "</div>"
+        )
+    st.markdown(f'<div class="achievement-grid">{"".join(cards)}</div>', unsafe_allow_html=True)
+
+
+def show_race_day_fun_zone(
+    log: pd.DataFrame,
+    roster: pd.DataFrame,
+    settings: SimulationSettings,
+    state,
+    live_bundle: dict | None,
+) -> None:
+    st.markdown("#### Team Fun")
+    drinks_table = drinks_state_table(roster)
+    sleep_log = sleep_state_log(roster)
+    sleep_summary = sleep_summary_table(sleep_log, roster)
+    predictions = prediction_state_table(roster, log)
+    morale = team_morale_summary(log, roster, state, live_bundle, drinks_table, sleep_summary, predictions)
+
+    cols = st.columns(4)
+    cards = [
+        ("Morale score", f"{morale['score']}/100", f"{morale['label']}: {morale['help']}"),
+        ("Team sleep bank", f"{morale['team_sleep']:.1f}h", "From the Sleep tab"),
+        ("Refreshments", str(morale["drinks_total"]), "Drinks tab total; Jared is Rubicons"),
+        ("Settled guesses", str(morale["settled_predictions"]), "Prediction game results"),
+    ]
+    for col, card in zip(cols, cards):
+        with col:
+            race_mini_card(*card)
+
+    awards_col, achievements_col = st.columns([1, 1.2])
+    with awards_col:
+        st.markdown("##### Runner Awards")
+        awards = build_runner_awards(log, roster, drinks_table, sleep_summary, predictions)
+        if awards.empty:
+            st.info("Awards appear as soon as logs exist.")
+        else:
+            st.dataframe(awards, width="stretch", hide_index=True)
+
+    with achievements_col:
+        st.markdown("##### Achievements")
+        render_achievement_cards(build_achievement_cards(log, roster, settings, state, live_bundle, drinks_table, sleep_summary, predictions))
 
 
 def queue_next_runner(queue: pd.DataFrame) -> str:
@@ -3022,6 +3366,260 @@ def _drinks_service_account_info(secrets: Mapping[str, Any]) -> dict[str, Any] |
     return dict(value)
 
 
+PREDICTION_SHEET_COLUMNS = [
+    "prediction_id",
+    "player",
+    "runner",
+    "lap_number",
+    "predicted_minutes",
+    "actual_minutes",
+    "delta_minutes",
+    "recorded_at",
+    "notes",
+]
+
+
+def _open_predictions_sheet(secrets: Mapping[str, Any], sheet_id: str | None, worksheet_name: str):
+    try:
+        import gspread
+        from google.oauth2.service_account import Credentials
+    except Exception as exc:  # pragma: no cover - depends on cloud packages.
+        raise RuntimeError("Install gspread and google-auth to use Google Sheets sync.") from exc
+
+    service_account = _drinks_service_account_info(secrets)
+    resolved_sheet_id = sheet_id or _drinks_secret_value(secrets, "google_sheet_id", "race_log_google_sheet_id")
+    if not service_account or not resolved_sheet_id:
+        raise RuntimeError("Google Sheets sync needs google_sheet_id and gcp_service_account in Streamlit secrets.")
+
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+    credentials = Credentials.from_service_account_info(service_account, scopes=scopes)
+    client = gspread.authorize(credentials)
+    spreadsheet = client.open_by_key(str(resolved_sheet_id))
+    try:
+        return spreadsheet.worksheet(worksheet_name)
+    except Exception:
+        return spreadsheet.add_worksheet(title=worksheet_name, rows=500, cols=len(PREDICTION_SHEET_COLUMNS))
+
+
+def read_predictions_from_google_sheet(
+    secrets: Mapping[str, Any],
+    sheet_id: str | None = None,
+    worksheet_name: str = "predictions",
+) -> pd.DataFrame:
+    sheet = _open_predictions_sheet(secrets, sheet_id, worksheet_name)
+    return pd.DataFrame(sheet.get_all_records())
+
+
+def write_predictions_to_google_sheet(
+    predictions: pd.DataFrame,
+    secrets: Mapping[str, Any],
+    sheet_id: str | None = None,
+    worksheet_name: str = "predictions",
+) -> None:
+    sheet = _open_predictions_sheet(secrets, sheet_id, worksheet_name)
+    clean = predictions.copy()
+    for column in PREDICTION_SHEET_COLUMNS:
+        if column not in clean:
+            clean[column] = ""
+    clean = clean[PREDICTION_SHEET_COLUMNS]
+    values = [PREDICTION_SHEET_COLUMNS] + clean.fillna("").astype(str).values.tolist()
+    sheet.clear()
+    sheet.update(values)
+
+
+def prediction_actual_lap_lookup(log: pd.DataFrame, roster: pd.DataFrame) -> dict[int, dict[str, Any]]:
+    completed = completed_official_laps(log, roster)
+    if completed.empty:
+        return {}
+    lookup: dict[int, dict[str, Any]] = {}
+    for row in completed.to_dict("records"):
+        lap_number = pd.to_numeric(pd.Series([row.get("lap_number")]), errors="coerce").iloc[0]
+        actual_minutes = pd.to_numeric(pd.Series([row.get("lap_duration_minutes")]), errors="coerce").iloc[0]
+        if pd.isna(lap_number) or pd.isna(actual_minutes):
+            continue
+        lookup[int(lap_number)] = {
+            "runner": str(row.get("runner", "")).strip(),
+            "actual_minutes": float(actual_minutes),
+        }
+    return lookup
+
+
+def _prediction_id(row: pd.Series, index: int) -> str:
+    existing = str(row.get("prediction_id", "") or "").strip()
+    if existing:
+        return existing
+    payload = "|".join(
+        [
+            str(index),
+            str(row.get("player", "")),
+            str(row.get("runner", "")),
+            str(row.get("lap_number", "")),
+            str(row.get("predicted_minutes", "")),
+            str(row.get("recorded_at", "")),
+            str(row.get("notes", "")),
+        ]
+    )
+    return f"pred_{hashlib.sha1(payload.encode('utf-8')).hexdigest()[:12]}"
+
+
+def normalise_predictions_table(raw: pd.DataFrame, roster: pd.DataFrame, log: pd.DataFrame) -> pd.DataFrame:
+    runners = roster.sort_values("running_order")["runner"].astype(str).str.strip()
+    runners = runners[runners.ne("")].drop_duplicates().tolist()
+    current = raw.copy() if raw is not None and not raw.empty else pd.DataFrame(columns=PREDICTION_SHEET_COLUMNS)
+    column_aliases = {
+        "id": "prediction_id",
+        "prediction": "predicted_minutes",
+        "guess": "predicted_minutes",
+        "guess_minutes": "predicted_minutes",
+        "predicted": "predicted_minutes",
+        "predicted_time": "predicted_minutes",
+        "lap": "lap_number",
+        "lap_no": "lap_number",
+        "lap_num": "lap_number",
+        "actual": "actual_minutes",
+        "actual_time": "actual_minutes",
+        "difference": "delta_minutes",
+        "delta": "delta_minutes",
+        "time": "recorded_at",
+        "timestamp": "recorded_at",
+        "recorded": "recorded_at",
+        "name": "player",
+    }
+    current.columns = [
+        column_aliases.get(str(column).strip().lower().replace(" ", "_").replace("-", "_"), str(column).strip().lower())
+        for column in current.columns
+    ]
+    for column in PREDICTION_SHEET_COLUMNS:
+        if column not in current:
+            current[column] = ""
+
+    current["prediction_id"] = current["prediction_id"].fillna("").astype(str).str.strip()
+    current["player"] = current["player"].fillna("").astype(str).str.strip()
+    current["runner"] = current["runner"].fillna("").astype(str).str.strip()
+    current["lap_number"] = pd.to_numeric(current["lap_number"], errors="coerce")
+    current["predicted_minutes"] = pd.to_numeric(current["predicted_minutes"], errors="coerce")
+    current["recorded_at"] = current["recorded_at"].fillna("").astype(str).str.strip()
+    current.loc[current["recorded_at"].eq(""), "recorded_at"] = "Manual entry"
+    current["notes"] = current["notes"].fillna("").astype(str)
+    current = current[
+        current["player"].ne("")
+        & current["runner"].isin(runners)
+        & current["lap_number"].notna()
+        & current["predicted_minutes"].notna()
+        & current["lap_number"].ge(1)
+        & current["predicted_minutes"].gt(0)
+    ].copy()
+    current["lap_number"] = current["lap_number"].round().astype(int)
+    current["predicted_minutes"] = current["predicted_minutes"].clip(lower=1, upper=180).round(2)
+
+    actual_lookup = prediction_actual_lap_lookup(log, roster)
+    current["actual_minutes"] = current["lap_number"].map(
+        lambda lap: actual_lookup.get(int(lap), {}).get("actual_minutes") if pd.notna(lap) else None
+    )
+    current["delta_minutes"] = current["predicted_minutes"] - pd.to_numeric(current["actual_minutes"], errors="coerce")
+    current["actual_minutes"] = pd.to_numeric(current["actual_minutes"], errors="coerce").round(2)
+    current["delta_minutes"] = pd.to_numeric(current["delta_minutes"], errors="coerce").round(2)
+
+    current = current.reset_index(drop=True)
+    seen: set[str] = set()
+    prediction_ids: list[str] = []
+    for index, row in current.iterrows():
+        prediction_id = _prediction_id(row, index)
+        if prediction_id in seen:
+            prediction_id = f"{prediction_id}_{index + 1}"
+        seen.add(prediction_id)
+        prediction_ids.append(prediction_id)
+    current["prediction_id"] = prediction_ids
+    return current[PREDICTION_SHEET_COLUMNS].reset_index(drop=True)
+
+
+def prediction_digest(table: pd.DataFrame) -> str:
+    clean = table.copy() if isinstance(table, pd.DataFrame) else pd.DataFrame(columns=PREDICTION_SHEET_COLUMNS)
+    for column in PREDICTION_SHEET_COLUMNS:
+        if column not in clean:
+            clean[column] = ""
+    return stable_table_digest(clean[PREDICTION_SHEET_COLUMNS], PREDICTION_SHEET_COLUMNS)
+
+
+def prediction_state_table(roster: pd.DataFrame, log: pd.DataFrame) -> pd.DataFrame:
+    if "predictions_tracker" not in st.session_state:
+        st.session_state["predictions_tracker"] = pd.DataFrame(columns=PREDICTION_SHEET_COLUMNS)
+    current = normalise_predictions_table(st.session_state["predictions_tracker"], roster, log)
+    st.session_state["predictions_tracker"] = current.copy()
+    return current
+
+
+def set_prediction_state(table: pd.DataFrame, roster: pd.DataFrame, log: pd.DataFrame) -> pd.DataFrame:
+    clean = normalise_predictions_table(table, roster, log)
+    st.session_state["predictions_tracker"] = clean.copy()
+    return clean
+
+
+def prediction_sheet_context() -> dict[str, Any]:
+    default_sheet_id = get_streamlit_secret("google_sheet_id", "race_log_google_sheet_id") or ""
+    default_sheet_id = st.session_state.get("race_day_sheet_id", default_sheet_id)
+    st.session_state.setdefault("predictions_sheet_id", str(default_sheet_id))
+    st.session_state.setdefault("predictions_worksheet_name", "predictions")
+
+    sheet_id = str(st.session_state.get("predictions_sheet_id") or default_sheet_id).strip()
+    worksheet_name = str(st.session_state.get("predictions_worksheet_name") or "predictions").strip() or "predictions"
+    return {
+        "sheet_id": sheet_id,
+        "worksheet_name": worksheet_name,
+        "configured": google_sheets_configured(st.secrets, sheet_id or None),
+    }
+
+
+def save_predictions_live(
+    table: pd.DataFrame,
+    sync: Mapping[str, Any],
+    roster: pd.DataFrame,
+    log: pd.DataFrame,
+    notice: str | None = None,
+    force: bool = False,
+) -> pd.DataFrame:
+    clean = set_prediction_state(table, roster, log)
+    digest = prediction_digest(clean)
+    if not sync.get("configured"):
+        st.session_state["predictions_save_status"] = "local"
+        st.session_state["predictions_sheet_notice"] = "Saved locally. Google Sheets is not configured."
+        return clean
+
+    allowed = conflict_safe_write_allowed(
+        prefix="predictions",
+        label="Predictions",
+        pending=clean,
+        pending_digest=digest,
+        read_remote=lambda: read_predictions_from_google_sheet(
+            st.secrets,
+            sheet_id=sync.get("sheet_id") or None,
+            worksheet_name=str(sync.get("worksheet_name") or "predictions"),
+        ),
+        remote_digest=lambda remote: prediction_digest(normalise_predictions_table(remote, roster, log)),
+        configured=bool(sync.get("configured")),
+        force=force,
+        live_reload_key="predictions_live_sheet_enabled",
+        safe_baseline_digest=prediction_digest(normalise_predictions_table(pd.DataFrame(), roster, log)),
+    )
+    if not allowed:
+        st.session_state["predictions_sheet_notice"] = (
+            "Prediction changes kept locally. Resolve the Sheet conflict before normal saves continue."
+        )
+        return clean
+
+    write_predictions_to_google_sheet(
+        clean,
+        st.secrets,
+        sheet_id=sync.get("sheet_id") or None,
+        worksheet_name=str(sync.get("worksheet_name") or "predictions"),
+    )
+    saved_at = now_bst_label()
+    st.session_state["predictions_sheet_last_saved"] = saved_at
+    mark_sheet_saved("predictions", digest, saved_at)
+    st.session_state["predictions_sheet_notice"] = notice or f"Predictions saved to Google Sheet at {saved_at}."
+    return clean
+
+
 def _open_drinks_sheet(secrets: Mapping[str, Any], sheet_id: str | None, worksheet_name: str):
     try:
         import gspread
@@ -4092,6 +4690,391 @@ def show_sleep_tab(roster: pd.DataFrame) -> None:
         st.plotly_chart(line, width="stretch")
 
 
+def next_prediction_lap_number(log: pd.DataFrame, roster: pd.DataFrame) -> int:
+    clean = normalise_race_log(log, roster)
+    if clean.empty or "lap_number" not in clean:
+        return 1
+    in_progress = clean[clean["finish_minute"].isna() & clean["start_minute"].notna()].copy()
+    if not in_progress.empty:
+        value = pd.to_numeric(in_progress["lap_number"], errors="coerce").dropna()
+        if not value.empty:
+            return int(value.iloc[-1])
+    value = pd.to_numeric(clean["lap_number"], errors="coerce").dropna()
+    if value.empty:
+        return 1
+    return int(value.max()) + 1
+
+
+def append_prediction_entry(
+    predictions: pd.DataFrame,
+    roster: pd.DataFrame,
+    log: pd.DataFrame,
+    player: str,
+    runner: str,
+    lap_number: int,
+    predicted_minutes: float,
+    notes: str = "",
+    recorded_at: str | None = None,
+) -> pd.DataFrame:
+    clean = normalise_predictions_table(predictions, roster, log)
+    entry = pd.DataFrame(
+        [
+            {
+                "prediction_id": "",
+                "player": str(player).strip(),
+                "runner": str(runner).strip(),
+                "lap_number": int(lap_number),
+                "predicted_minutes": float(predicted_minutes),
+                "actual_minutes": "",
+                "delta_minutes": "",
+                "recorded_at": recorded_at or now_bst_label(),
+                "notes": str(notes or "").strip(),
+            }
+        ]
+    )
+    return normalise_predictions_table(pd.concat([clean, entry], ignore_index=True), roster, log)
+
+
+def show_predictions_sheet_controls(
+    predictions: pd.DataFrame,
+    roster: pd.DataFrame,
+    log: pd.DataFrame,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    sync = prediction_sheet_context()
+    sheet_id = str(sync["sheet_id"])
+    worksheet_name = str(sync["worksheet_name"])
+    configured = bool(sync["configured"])
+
+    with st.container(border=True):
+        top_cols = st.columns([1.5, 1, 1])
+        with top_cols[0]:
+            st.markdown("#### Predictions Sheet")
+            if configured:
+                st.caption("Predictions save to the same Google Sheet. Auto reload is off by default to protect quota.")
+            else:
+                st.caption("Google sync is not configured. Local predictions and CSV download still work.")
+
+        live_reload = top_cols[1].checkbox(
+            "Auto reload",
+            value=live_reload_enabled_default("predictions_live_sheet_enabled", configured),
+            help="Polls the predictions worksheet while this tab is open. App saves still write immediately.",
+            key="predictions_live_reload_checkbox",
+        )
+        refresh_seconds = top_cols[2].number_input(
+            "Reload every seconds",
+            min_value=10,
+            max_value=300,
+            value=live_refresh_seconds_default("predictions_live_refresh_seconds"),
+            step=5,
+            key="predictions_refresh_seconds_input",
+        )
+        st.session_state["predictions_live_sheet_enabled"] = live_reload
+        st.session_state["predictions_live_refresh_seconds"] = int(refresh_seconds)
+        show_sheet_cooldown("predictions", "Predictions Sheet")
+
+        if live_reload and sheet_cooldown_remaining_seconds("predictions") <= 0 and st_autorefresh is not None:
+            st_autorefresh(
+                interval=int(refresh_seconds) * 1000,
+                key="predictions_live_sheet_autorefresh",
+            )
+        elif live_reload and st_autorefresh is None:
+            st.warning("Live reload needs the streamlit-autorefresh package. Manual loading still works.")
+
+        action_cols = st.columns([1, 1, 1.2])
+        load_now = action_cols[0].button("Load predictions", width="stretch", disabled=not configured)
+        save_now = action_cols[1].button("Save predictions", width="stretch", disabled=not configured)
+        if configured:
+            action_cols[2].success(f"Worksheet: {worksheet_name}")
+        else:
+            action_cols[2].warning("Save disabled until secrets are set.")
+
+        conflict_load, conflict_force = show_sheet_conflict_actions(
+            "predictions",
+            "Predictions Sheet",
+            "endure24_pending_predictions.csv",
+        )
+        load_now = load_now or conflict_load
+        if conflict_force:
+            pending = st.session_state.get("predictions_pending_df")
+            try:
+                predictions = save_predictions_live(
+                    pending if isinstance(pending, pd.DataFrame) else predictions,
+                    sync,
+                    roster,
+                    log,
+                    "Predictions force-saved to Google Sheet.",
+                    force=True,
+                )
+                if sheet_save_status("predictions") == "saved":
+                    st.success("Predictions force-saved to Google Sheet.")
+                    st.rerun()
+            except Exception as exc:
+                st.error(f"Could not force-save predictions worksheet: {exc}")
+
+        if should_load_sheet_now("predictions", load_now, live_reload, int(refresh_seconds)) and configured:
+            try:
+                loaded = read_predictions_from_google_sheet(
+                    st.secrets,
+                    sheet_id=sheet_id or None,
+                    worksheet_name=worksheet_name,
+                )
+                before = prediction_digest(predictions)
+                predictions = set_prediction_state(loaded, roster, log)
+                loaded_at = now_bst_label()
+                st.session_state["predictions_sheet_last_loaded"] = loaded_at
+                mark_sheet_loaded("predictions", prediction_digest(predictions), loaded_at)
+                if prediction_digest(predictions) != before:
+                    st.success(f"Predictions loaded at {loaded_at}.")
+                else:
+                    st.caption(f"Predictions checked at {loaded_at}; no changes found.")
+            except Exception as exc:
+                handle_sheet_load_error("predictions", "the predictions worksheet", exc, "predictions_live_sheet_enabled")
+
+        if st.session_state.get("predictions_sheet_last_loaded"):
+            st.caption(f"Last predictions load: {st.session_state['predictions_sheet_last_loaded']}.")
+        if st.session_state.get("predictions_sheet_last_saved"):
+            st.caption(f"Last predictions save: {st.session_state['predictions_sheet_last_saved']}.")
+        if st.session_state.get("predictions_sheet_notice"):
+            st.success(st.session_state.pop("predictions_sheet_notice"))
+
+        if save_now and configured:
+            try:
+                predictions = save_predictions_live(predictions, sync, roster, log, "Predictions saved to Google Sheet.")
+                if sheet_save_status("predictions") == "saved":
+                    st.success("Predictions saved to Google Sheet.")
+                elif sheet_save_status("predictions") in {"conflict", "quota"}:
+                    st.warning("Prediction changes kept locally. Resolve the Sheet warning above before normal saves continue.")
+            except Exception as exc:
+                st.error(f"Could not save predictions worksheet: {exc}")
+
+        with st.expander("Prediction Sheet settings", expanded=False):
+            settings_cols = st.columns([2, 1])
+            settings_cols[0].text_input("Sheet ID", key="predictions_sheet_id", placeholder="Google Sheet ID")
+            settings_cols[1].text_input("Worksheet", key="predictions_worksheet_name")
+
+    return prediction_state_table(roster, log), sync
+
+
+def show_predictions_tab(roster: pd.DataFrame, log: pd.DataFrame) -> None:
+    st.subheader("Predictions")
+    st.caption("Guess a lap time. Guesses settle automatically when that official lap is logged in Race Day.")
+
+    predictions = prediction_state_table(roster, log)
+    predictions, prediction_sync = show_predictions_sheet_controls(predictions, roster, log)
+    runner_options = roster.sort_values("running_order")["runner"].astype(str).str.strip().drop_duplicates().tolist()
+    if not runner_options:
+        st.info("Add runners in Setup before using the prediction game.")
+        return
+
+    leaderboard = prediction_leaderboard_table(predictions)
+    open_predictions = len(predictions) - len(leaderboard)
+    closest_label = "-"
+    if not leaderboard.empty:
+        closest = leaderboard.iloc[0]
+        closest_label = f"{closest['player']} ({float(closest['miss']):.1f}m)"
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total guesses", str(len(predictions)))
+    c2.metric("Settled", str(len(leaderboard)))
+    c3.metric("Still open", str(open_predictions))
+    c4.metric("Closest", closest_label)
+
+    st.markdown("#### Add Guess")
+    next_lap = next_prediction_lap_number(log, roster)
+    with st.form("prediction_add_form", clear_on_submit=True):
+        form_cols = st.columns([1, 1, 0.8, 0.8])
+        player = form_cols[0].text_input("Player", placeholder="Name")
+        runner = form_cols[1].selectbox("Runner", runner_options, key="prediction_runner")
+        lap_number = form_cols[2].number_input("Lap", min_value=1, max_value=200, value=next_lap, step=1)
+        default_guess = float(runner_mean_lookup(roster).get(str(runner), 40.0))
+        predicted_minutes = form_cols[3].number_input(
+            "Guess minutes",
+            min_value=1.0,
+            max_value=180.0,
+            value=round(default_guess, 1),
+            step=0.1,
+        )
+        notes = st.text_input("Prediction note", value="", placeholder="optional")
+        submitted = st.form_submit_button("Add prediction", type="primary", width="stretch")
+
+    if submitted:
+        if not str(player).strip():
+            st.error("Add a player name before saving the prediction.")
+        else:
+            updated = append_prediction_entry(
+                predictions,
+                roster,
+                log,
+                player,
+                runner,
+                int(lap_number),
+                float(predicted_minutes),
+                notes,
+            )
+            try:
+                save_predictions_live(
+                    updated,
+                    prediction_sync,
+                    roster,
+                    log,
+                    f"Prediction added for {runner} lap {int(lap_number)}.",
+                )
+            except Exception as exc:
+                set_prediction_state(updated, roster, log)
+                st.session_state["predictions_sheet_notice"] = f"Updated locally, but could not save to Sheet: {exc}"
+            st.rerun()
+
+    st.markdown("#### Leaderboard")
+    if leaderboard.empty:
+        st.info("No settled predictions yet. A guess settles once that lap has an official logged time.")
+    else:
+        display = leaderboard.copy()
+        display["predicted_minutes"] = pd.to_numeric(display["predicted_minutes"], errors="coerce").round(1)
+        display["actual_minutes"] = pd.to_numeric(display["actual_minutes"], errors="coerce").round(1)
+        display["miss"] = pd.to_numeric(display["miss"], errors="coerce").round(1)
+        st.dataframe(
+            display,
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "player": "Player",
+                "runner": "Runner",
+                "lap_number": st.column_config.NumberColumn("Lap", format="%d"),
+                "predicted_minutes": st.column_config.NumberColumn("Guess", format="%.1f"),
+                "actual_minutes": st.column_config.NumberColumn("Actual", format="%.1f"),
+                "miss": st.column_config.NumberColumn("Miss", format="%.1f"),
+                "notes": "Notes",
+            },
+        )
+
+    st.markdown("#### Prediction Log")
+    editor_columns = ["player", "runner", "lap_number", "predicted_minutes", "recorded_at", "notes"]
+    edited = st.data_editor(
+        predictions[editor_columns],
+        hide_index=True,
+        width="stretch",
+        column_config={
+            "player": st.column_config.TextColumn("Player"),
+            "runner": st.column_config.SelectboxColumn("Runner", options=runner_options),
+            "lap_number": st.column_config.NumberColumn("Lap", min_value=1, max_value=200, step=1, format="%d"),
+            "predicted_minutes": st.column_config.NumberColumn(
+                "Guess minutes",
+                min_value=1.0,
+                max_value=180.0,
+                step=0.1,
+                format="%.1f",
+            ),
+            "recorded_at": st.column_config.TextColumn("Recorded"),
+            "notes": st.column_config.TextColumn("Notes"),
+        },
+        num_rows="dynamic",
+        key=f"predictions_editor_{prediction_digest(predictions)[:12]}",
+    )
+    edited_clean = normalise_predictions_table(edited, roster, log)
+    if prediction_digest(edited_clean) != prediction_digest(predictions):
+        try:
+            save_predictions_live(edited_clean, prediction_sync, roster, log, "Prediction log edit saved to Google Sheet.")
+        except Exception as exc:
+            set_prediction_state(edited_clean, roster, log)
+            st.session_state["predictions_sheet_notice"] = f"Updated locally, but could not save to Sheet: {exc}"
+        st.rerun()
+
+    action_cols = st.columns(2)
+    if action_cols[0].button(
+        "Force save to Sheet",
+        type="primary",
+        width="stretch",
+        disabled=not prediction_sync.get("configured"),
+        key="predictions_force_save_button",
+    ):
+        try:
+            saved = save_predictions_live(
+                edited_clean,
+                prediction_sync,
+                roster,
+                log,
+                "Predictions forced saved to Google Sheet.",
+                force=True,
+            )
+            st.success(f"Saved {len(saved)} prediction(s).")
+        except Exception as exc:
+            st.error(f"Could not save predictions worksheet: {exc}")
+    action_cols[1].download_button(
+        "Download predictions CSV",
+        prediction_state_table(roster, log).to_csv(index=False),
+        file_name="endure24_predictions.csv",
+        mime="text/csv",
+        width="stretch",
+        key="predictions_download_csv",
+    )
+
+    with st.expander("Danger zone", expanded=False):
+        st.warning("Clearing predictions removes every guess and saves that clear to the Sheet.")
+        confirm_clear_predictions = st.checkbox(
+            "I understand this will clear the prediction game",
+            key="predictions_clear_confirm",
+        )
+        if st.button(
+            "Clear predictions",
+            width="stretch",
+            key="predictions_reset_button",
+            disabled=not confirm_clear_predictions,
+        ):
+            reset = pd.DataFrame(columns=PREDICTION_SHEET_COLUMNS)
+            try:
+                save_predictions_live(reset, prediction_sync, roster, log, "Predictions cleared and saved to Google Sheet.")
+            except Exception as exc:
+                set_prediction_state(reset, roster, log)
+                st.session_state["predictions_sheet_notice"] = f"Cleared locally, but could not save to Sheet: {exc}"
+            st.rerun()
+
+    st.markdown("#### Prediction Graphs")
+    if leaderboard.empty:
+        st.info("Graphs appear once at least one guess has settled.")
+    else:
+        misses = leaderboard.copy()
+        misses["label"] = misses.apply(lambda row: f"{row['player']}<br>Lap {int(row['lap_number'])}", axis=1)
+        miss_fig = px.bar(
+            misses.sort_values("miss"),
+            x="label",
+            y="miss",
+            color="player",
+            text=misses["miss"].map(lambda value: f"{float(value):.1f}"),
+            title="Closest Guess Wins",
+        )
+        miss_fig.update_layout(showlegend=False, xaxis_title="", yaxis_title="Minutes off")
+        st.plotly_chart(miss_fig, width="stretch")
+
+        scatter = px.scatter(
+            leaderboard,
+            x="actual_minutes",
+            y="predicted_minutes",
+            color="player",
+            hover_data=["runner", "lap_number", "miss"],
+            title="Guess vs Actual",
+        )
+        axis_max = max(
+            float(pd.to_numeric(leaderboard["actual_minutes"], errors="coerce").max()),
+            float(pd.to_numeric(leaderboard["predicted_minutes"], errors="coerce").max()),
+            1.0,
+        )
+        axis_min = min(
+            float(pd.to_numeric(leaderboard["actual_minutes"], errors="coerce").min()),
+            float(pd.to_numeric(leaderboard["predicted_minutes"], errors="coerce").min()),
+        )
+        scatter.add_trace(
+            go.Scatter(
+                x=[axis_min, axis_max],
+                y=[axis_min, axis_max],
+                mode="lines",
+                name="Perfect guess",
+                line={"color": "#465467", "dash": "dash"},
+            )
+        )
+        scatter.update_layout(xaxis_title="Actual minutes", yaxis_title="Guessed minutes")
+        st.plotly_chart(scatter, width="stretch")
+
+
 def main() -> None:
     inject_app_styles()
     st.title("Endure24 Race Control")
@@ -4113,8 +5096,8 @@ def main() -> None:
     st.sidebar.subheader("Race Rules")
     caps_enabled = st.sidebar.checkbox("Apply max-lap caps", value=True)
 
-    race_day_tab, forecast_tab, optimiser_tab, drinks_tab, sleep_tab, what_if_tab, exports_tab, setup_tab = st.tabs(
-        ["Race Day", "Forecast", "Optimiser", "Drinks", "Sleep", "What-if", "Exports", "Setup"]
+    race_day_tab, forecast_tab, optimiser_tab, drinks_tab, sleep_tab, predictions_tab, what_if_tab, exports_tab, setup_tab = st.tabs(
+        ["Race Day", "Forecast", "Optimiser", "Drinks", "Sleep", "Predictions", "What-if", "Exports", "Setup"]
     )
 
     with setup_tab:
@@ -4204,6 +5187,10 @@ def main() -> None:
 
     with sleep_tab:
         show_sleep_tab(roster)
+
+    with predictions_tab:
+        current_log = normalise_race_log(st.session_state.get("race_log", empty_race_log()), roster)
+        show_predictions_tab(roster, current_log)
 
     with what_if_tab:
         show_what_if_pace_override(roster, settings)
