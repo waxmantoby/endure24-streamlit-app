@@ -1534,6 +1534,151 @@ def prediction_leaderboard_table(predictions: pd.DataFrame) -> pd.DataFrame:
     )
 
 
+def clipped_display_text(value: str, max_chars: int = 34) -> str:
+    text = " ".join(str(value or "").split())
+    if not text:
+        return "-"
+    if len(text) <= max_chars:
+        return text
+    return text[: max(1, max_chars - 3)].rstrip() + "..."
+
+
+def target_status_summary(state, live_bundle: dict | None) -> tuple[str, str, float | None]:
+    if state.remaining_to_target <= 0:
+        return "Target logged", "Selected target is already in the race log.", 1.0
+
+    probability = None
+    if live_bundle:
+        probability = live_bundle.get("summary", {}).get("probability_target_laps")
+    probability = None if probability is None or pd.isna(probability) else float(probability)
+    if probability is None:
+        return "No forecast yet", "Update the race-day forecast for live target status.", None
+    if probability >= 0.7:
+        return "On track", f"{probability:.0%} chance of target laps.", probability
+    if probability >= 0.35:
+        return "Watch", f"{probability:.0%} chance of target laps.", probability
+    return "At risk", f"{probability:.0%} chance of target laps.", probability
+
+
+def fastest_recent_lap_summary(completed: pd.DataFrame, roster: pd.DataFrame, recent_laps: int = 8) -> dict[str, Any]:
+    if completed.empty:
+        return {"value": "-", "help": "No completed official laps yet.", "pace_bonus": 0.0}
+
+    recent = completed.sort_values("lap_number").tail(recent_laps).copy()
+    fastest = recent.sort_values("lap_duration_minutes").iloc[0]
+    runner = str(fastest["runner"])
+    lap_number = int(fastest["lap_number"])
+    duration = float(fastest["lap_duration_minutes"])
+    mean_lookup = runner_mean_lookup(roster)
+    expected = mean_lookup.get(runner)
+    pace_bonus = 0.0
+    help_text = f"Lap {lap_number}, fastest of last {len(recent)} official lap(s)."
+    if expected is not None and not pd.isna(expected):
+        pace_bonus = max(0.0, min(5.0, float(expected) - duration))
+        help_text += f" {float(expected) - duration:+.1f} min vs expected."
+    return {
+        "value": f"{runner} {duration:.1f}m",
+        "help": help_text,
+        "pace_bonus": pace_bonus,
+    }
+
+
+def note_fun_score(note: str, recency: int) -> float:
+    text = str(note or "").strip()
+    lower = text.lower()
+    keywords = [
+        "lol",
+        "haha",
+        "funny",
+        "rubicon",
+        "chaos",
+        "classic",
+        "oops",
+        "legend",
+        "banter",
+        "vibes",
+        "grim",
+        "beer",
+        "wine",
+        "sleep",
+        "nap",
+        "pain",
+    ]
+    keyword_bonus = sum(18 for keyword in keywords if keyword in lower)
+    punctuation_bonus = min(20, text.count("!") * 5 + text.count("?") * 2)
+    length_bonus = min(35, len(text) / 3)
+    recency_bonus = min(12, max(0, recency))
+    return float(keyword_bonus + punctuation_bonus + length_bonus + recency_bonus)
+
+
+def best_fun_note_summary(
+    log: pd.DataFrame,
+    roster: pd.DataFrame,
+    drinks_table: pd.DataFrame,
+    sleep_summary: pd.DataFrame,
+    predictions: pd.DataFrame,
+) -> dict[str, str]:
+    candidates: list[dict[str, Any]] = []
+
+    race_log = normalise_race_log(log, roster)
+    for index, row in race_log.reset_index(drop=True).iterrows():
+        note = str(row.get("notes", "") or "").strip()
+        if not note:
+            continue
+        lap = row.get("lap_number")
+        runner = str(row.get("runner", "") or "").strip()
+        source = f"Lap {int(lap)} {runner}" if pd.notna(lap) else f"Race log {runner}".strip()
+        candidates.append(
+            {
+                "note": note,
+                "source": source,
+                "score": note_fun_score(note, int(index) + 1),
+            }
+        )
+
+    for index, row in drinks_table.reset_index(drop=True).iterrows() if isinstance(drinks_table, pd.DataFrame) else []:
+        note = str(row.get("notes", "") or "").strip()
+        if note:
+            candidates.append(
+                {
+                    "note": note,
+                    "source": f"Drinks: {row.get('runner', '')}",
+                    "score": note_fun_score(note, int(index) + 1),
+                }
+            )
+
+    for index, row in sleep_summary.reset_index(drop=True).iterrows() if isinstance(sleep_summary, pd.DataFrame) else []:
+        note = str(row.get("notes", "") or "").strip()
+        if note:
+            candidates.append(
+                {
+                    "note": note,
+                    "source": f"Sleep: {row.get('runner', '')}",
+                    "score": note_fun_score(note, int(index) + 1),
+                }
+            )
+
+    for index, row in predictions.reset_index(drop=True).iterrows() if isinstance(predictions, pd.DataFrame) else []:
+        note = str(row.get("notes", "") or "").strip()
+        if note:
+            candidates.append(
+                {
+                    "note": note,
+                    "source": f"Prediction: {row.get('player', '')}",
+                    "score": note_fun_score(note, int(index) + 1),
+                }
+            )
+
+    if not candidates:
+        return {"value": "-", "help": "No notes logged yet. Add notes to laps, drinks, sleep, or predictions."}
+
+    best = sorted(candidates, key=lambda item: (item["score"], len(item["note"])), reverse=True)[0]
+    return {
+        "value": clipped_display_text(str(best["note"]), max_chars=34),
+        "help": f"{best['source']}: {clipped_display_text(str(best['note']), max_chars=90)}",
+    }
+
+
 def team_morale_summary(
     log: pd.DataFrame,
     roster: pd.DataFrame,
@@ -1545,12 +1690,12 @@ def team_morale_summary(
 ) -> dict[str, Any]:
     completed = completed_official_laps(log, roster)
     official_laps = len(completed)
-    live_summary = live_bundle["summary"] if live_bundle else {}
-    probability = live_summary.get("probability_target_laps") if live_summary else None
-    probability = None if probability is None or pd.isna(probability) else float(probability)
+    target_status, target_help, probability = target_status_summary(state, live_bundle)
     team_sleep = float(pd.to_numeric(sleep_summary.get("hours", pd.Series(dtype=float)), errors="coerce").fillna(0).sum())
     drinks_total = int(pd.to_numeric(drinks_table.get("count", pd.Series(dtype=float)), errors="coerce").fillna(0).sum())
     settled_predictions = len(prediction_leaderboard_table(predictions))
+    fastest_recent = fastest_recent_lap_summary(completed, roster)
+    fun_note = best_fun_note_summary(log, roster, drinks_table, sleep_summary, predictions)
 
     score = 35.0
     score += min(32.0, official_laps * 1.8)
@@ -1558,6 +1703,8 @@ def team_morale_summary(
     score += min(8.0, team_sleep * 0.35)
     score += min(6.0, drinks_total * 0.75)
     score += min(5.0, settled_predictions * 1.25)
+    score += min(5.0, float(fastest_recent.get("pace_bonus", 0.0)))
+    score += 3.0 if fun_note["value"] != "-" else 0.0
     if probability is not None:
         score += max(-14.0, min(14.0, (probability - 0.5) * 28.0))
     score = int(round(max(0.0, min(100.0, score))))
@@ -1580,6 +1727,12 @@ def team_morale_summary(
         "team_sleep": team_sleep,
         "drinks_total": drinks_total,
         "settled_predictions": settled_predictions,
+        "target_status": target_status,
+        "target_help": target_help,
+        "fastest_recent": fastest_recent["value"],
+        "fastest_recent_help": fastest_recent["help"],
+        "funniest_note": fun_note["value"],
+        "funniest_note_help": fun_note["help"],
     }
 
 
@@ -1776,23 +1929,29 @@ def show_race_day_fun_zone(
     state,
     live_bundle: dict | None,
 ) -> None:
-    st.markdown("#### Team Fun")
+    st.markdown("#### Team Morale Scoreboard")
+    st.caption("Not scientific. Just a live team-vibes panel from the race log, drinks, sleep, notes, and target status.")
     drinks_table = drinks_state_table(roster)
     sleep_log = sleep_state_log(roster)
     sleep_summary = sleep_summary_table(sleep_log, roster)
     predictions = prediction_state_table(roster, log)
     morale = team_morale_summary(log, roster, state, live_bundle, drinks_table, sleep_summary, predictions)
 
-    cols = st.columns(4)
     cards = [
         ("Morale score", f"{morale['score']}/100", f"{morale['label']}: {morale['help']}"),
+        ("Laps logged", str(morale["official_laps"]), f"Target {settings.target_laps} official laps"),
+        ("Target status", morale["target_status"], morale["target_help"]),
+        ("Fastest recent lap", morale["fastest_recent"], morale["fastest_recent_help"]),
         ("Team sleep bank", f"{morale['team_sleep']:.1f}h", "From the Sleep tab"),
         ("Refreshments", str(morale["drinks_total"]), "Drinks tab total; Jared is Rubicons"),
+        ("Funniest note", morale["funniest_note"], morale["funniest_note_help"]),
         ("Settled guesses", str(morale["settled_predictions"]), "Prediction game results"),
     ]
-    for col, card in zip(cols, cards):
-        with col:
-            race_mini_card(*card)
+    for row_start in range(0, len(cards), 4):
+        cols = st.columns(4)
+        for col, card in zip(cols, cards[row_start : row_start + 4]):
+            with col:
+                race_mini_card(*card)
 
     awards_col, achievements_col = st.columns([1, 1.2])
     with awards_col:
