@@ -2892,7 +2892,7 @@ def show_drinks_tab(roster: pd.DataFrame) -> None:
     st.plotly_chart(scatter, width="stretch")
 
 
-SLEEP_SHEET_COLUMNS = ["runner", "hours", "unit", "notes"]
+SLEEP_SHEET_COLUMNS = ["entry_id", "runner", "hours", "unit", "recorded_at", "notes"]
 
 
 def _open_sleep_sheet(secrets: Mapping[str, Any], sheet_id: str | None, worksheet_name: str):
@@ -2914,7 +2914,7 @@ def _open_sleep_sheet(secrets: Mapping[str, Any], sheet_id: str | None, workshee
     try:
         return spreadsheet.worksheet(worksheet_name)
     except Exception:
-        return spreadsheet.add_worksheet(title=worksheet_name, rows=200, cols=len(SLEEP_SHEET_COLUMNS))
+        return spreadsheet.add_worksheet(title=worksheet_name, rows=500, cols=len(SLEEP_SHEET_COLUMNS))
 
 
 def read_sleep_from_google_sheet(
@@ -2943,57 +2943,114 @@ def write_sleep_to_google_sheet(
     sheet.update(values)
 
 
-def normalise_sleep_table(raw: pd.DataFrame, roster: pd.DataFrame) -> pd.DataFrame:
+def _sleep_entry_id(row: pd.Series, index: int) -> str:
+    existing = str(row.get("entry_id", "") or "").strip()
+    if existing:
+        return existing
+    payload = "|".join(
+        [
+            str(index),
+            str(row.get("runner", "")),
+            str(row.get("hours", "")),
+            str(row.get("recorded_at", "")),
+            str(row.get("notes", "")),
+        ]
+    )
+    return f"sleep_{hashlib.sha1(payload.encode('utf-8')).hexdigest()[:12]}"
+
+
+def normalise_sleep_log(raw: pd.DataFrame, roster: pd.DataFrame) -> pd.DataFrame:
     runners = roster.sort_values("running_order")["runner"].astype(str).str.strip()
     runners = runners[runners.ne("")].drop_duplicates().tolist()
-    current = raw.copy() if raw is not None and not raw.empty else pd.DataFrame(columns=["runner", "hours", "notes"])
+    current = raw.copy() if raw is not None and not raw.empty else pd.DataFrame(columns=SLEEP_SHEET_COLUMNS)
     column_aliases = {
+        "id": "entry_id",
+        "log_id": "entry_id",
+        "sleep_id": "entry_id",
         "sleep": "hours",
         "sleep_hours": "hours",
         "hours_sleep": "hours",
         "hours_slept": "hours",
         "hrs": "hours",
         "count": "hours",
+        "time": "recorded_at",
+        "timestamp": "recorded_at",
+        "recorded": "recorded_at",
+        "recorded_time": "recorded_at",
+        "recorded_bst": "recorded_at",
     }
     current.columns = [
         column_aliases.get(str(column).strip().lower().replace(" ", "_").replace("-", "_"), str(column).strip().lower())
         for column in current.columns
     ]
+    if "entry_id" not in current:
+        current["entry_id"] = ""
     if "runner" not in current:
         current["runner"] = ""
     if "hours" not in current:
         current["hours"] = 0.0
+    if "unit" not in current:
+        current["unit"] = "hours"
+    if "recorded_at" not in current:
+        current["recorded_at"] = "Initial total"
     if "notes" not in current:
         current["notes"] = ""
+    current["entry_id"] = current["entry_id"].fillna("").astype(str).str.strip()
     current["runner"] = current["runner"].astype(str).str.strip()
     current["hours"] = pd.to_numeric(current["hours"], errors="coerce").fillna(0).clip(lower=0, upper=48).round(2)
-    current["notes"] = current["notes"].fillna("").astype(str)
-    current = current[current["runner"].ne("")].drop_duplicates("runner", keep="last")
-
-    existing = set(current["runner"].astype(str))
-    missing = [runner for runner in runners if runner not in existing]
-    if missing:
-        current = pd.concat(
-            [
-                current,
-                pd.DataFrame({"runner": missing, "hours": [0.0 for _ in missing], "notes": ["" for _ in missing]}),
-            ],
-            ignore_index=True,
-        )
-
-    current = current[current["runner"].isin(runners)].copy()
-    order_lookup = {runner: index for index, runner in enumerate(runners)}
-    current["_order"] = current["runner"].map(order_lookup)
-    current = current.sort_values(["_order", "runner"]).drop(columns="_order").reset_index(drop=True)
     current["unit"] = "hours"
-    return current
+    current["recorded_at"] = current["recorded_at"].fillna("Initial total").astype(str).str.strip()
+    current.loc[current["recorded_at"].eq(""), "recorded_at"] = "Initial total"
+    current["notes"] = current["notes"].fillna("").astype(str)
+    current = current[current["runner"].ne("") & current["runner"].isin(runners) & current["hours"].gt(0)].copy()
+    current = current.reset_index(drop=True)
+
+    seen: set[str] = set()
+    entry_ids: list[str] = []
+    for index, row in current.iterrows():
+        entry_id = _sleep_entry_id(row, index)
+        if entry_id in seen:
+            entry_id = f"{entry_id}_{index + 1}"
+        seen.add(entry_id)
+        entry_ids.append(entry_id)
+    current["entry_id"] = entry_ids
+    return current[SLEEP_SHEET_COLUMNS].reset_index(drop=True)
 
 
-def sleep_state_table(roster: pd.DataFrame) -> pd.DataFrame:
-    if "sleep_tracker" not in st.session_state:
-        st.session_state["sleep_tracker"] = pd.DataFrame(columns=["runner", "hours", "notes"])
-    current = normalise_sleep_table(st.session_state["sleep_tracker"], roster)
-    st.session_state["sleep_tracker"] = current[["runner", "hours", "notes"]].copy()
+def sleep_summary_table(log: pd.DataFrame, roster: pd.DataFrame) -> pd.DataFrame:
+    runners = roster.sort_values("running_order")["runner"].astype(str).str.strip()
+    runners = runners[runners.ne("")].drop_duplicates().tolist()
+    clean = normalise_sleep_log(log, roster)
+    summary = pd.DataFrame({"runner": runners})
+    if clean.empty:
+        summary["hours"] = 0.0
+        summary["entries"] = 0
+        summary["last_recorded"] = "-"
+        summary["notes"] = ""
+    else:
+        grouped = clean.groupby("runner", as_index=False).agg(
+            hours=("hours", "sum"),
+            entries=("entry_id", "count"),
+            last_recorded=("recorded_at", "last"),
+            notes=("notes", "last"),
+        )
+        summary = summary.merge(grouped, on="runner", how="left")
+        summary["hours"] = pd.to_numeric(summary["hours"], errors="coerce").fillna(0).round(2)
+        summary["entries"] = pd.to_numeric(summary["entries"], errors="coerce").fillna(0).astype(int)
+        summary["last_recorded"] = summary["last_recorded"].fillna("-").astype(str)
+        summary["notes"] = summary["notes"].fillna("").astype(str)
+    summary["unit"] = "hours"
+    return summary
+
+
+def sleep_state_log(roster: pd.DataFrame) -> pd.DataFrame:
+    if "sleep_log" not in st.session_state:
+        if "sleep_tracker" in st.session_state:
+            st.session_state["sleep_log"] = st.session_state["sleep_tracker"]
+        else:
+            st.session_state["sleep_log"] = pd.DataFrame(columns=SLEEP_SHEET_COLUMNS)
+    current = normalise_sleep_log(st.session_state["sleep_log"], roster)
+    st.session_state["sleep_log"] = current.copy()
     return current
 
 
@@ -3006,21 +3063,55 @@ def set_sleep_state(table: pd.DataFrame) -> pd.DataFrame:
                 "running_order": list(range(1, len(table) + 1)),
             }
         )
-    clean = normalise_sleep_table(table, roster)
-    st.session_state["sleep_tracker"] = clean[["runner", "hours", "notes"]].copy()
+    clean = normalise_sleep_log(table, roster)
+    st.session_state["sleep_log"] = clean.copy()
     return clean
 
 
 def sleep_sheet_payload(table: pd.DataFrame) -> pd.DataFrame:
-    clean = table.copy()
-    clean["unit"] = "hours"
-    return clean[["runner", "hours", "unit", "notes"]]
+    roster = st.session_state.get("current_roster_for_sleep")
+    if not isinstance(roster, pd.DataFrame) or roster.empty:
+        roster = pd.DataFrame(
+            {
+                "runner": table["runner"].astype(str).str.strip().tolist() if "runner" in table else [],
+                "running_order": list(range(1, len(table) + 1)),
+            }
+        )
+    return normalise_sleep_log(table, roster)
 
 
 def sleep_digest(table: pd.DataFrame) -> str:
     clean = table.copy()
+    for column in SLEEP_SHEET_COLUMNS:
+        if column not in clean:
+            clean[column] = ""
     clean["hours"] = pd.to_numeric(clean["hours"], errors="coerce").fillna(0).round(2)
-    return hashlib.sha256(clean[["runner", "hours", "notes"]].to_csv(index=False).encode("utf-8")).hexdigest()
+    return hashlib.sha256(clean[SLEEP_SHEET_COLUMNS].to_csv(index=False).encode("utf-8")).hexdigest()
+
+
+def append_sleep_log_entry(
+    log: pd.DataFrame,
+    roster: pd.DataFrame,
+    runner: str,
+    hours: float,
+    notes: str = "",
+    recorded_at: str | None = None,
+) -> pd.DataFrame:
+    clean = normalise_sleep_log(log, roster)
+    recorded = recorded_at or now_bst_label()
+    entry = pd.DataFrame(
+        [
+            {
+                "entry_id": "",
+                "runner": str(runner).strip(),
+                "hours": float(hours),
+                "unit": "hours",
+                "recorded_at": recorded,
+                "notes": str(notes or "").strip(),
+            }
+        ]
+    )
+    return normalise_sleep_log(pd.concat([clean, entry], ignore_index=True), roster)
 
 
 def sleep_sheet_context() -> dict[str, Any]:
@@ -3056,7 +3147,7 @@ def save_sleep_live(table: pd.DataFrame, sync: Mapping[str, Any], notice: str | 
     return clean
 
 
-def show_sleep_sheet_controls(table: pd.DataFrame, roster: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any]]:
+def show_sleep_sheet_controls(log: pd.DataFrame, roster: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any]]:
     sync = sleep_sheet_context()
     sheet_id = str(sync["sheet_id"])
     worksheet_name = str(sync["worksheet_name"])
@@ -3111,11 +3202,11 @@ def show_sleep_sheet_controls(table: pd.DataFrame, roster: pd.DataFrame) -> tupl
                     sheet_id=sheet_id or None,
                     worksheet_name=worksheet_name,
                 )
-                before = sleep_digest(table)
-                table = set_sleep_state(loaded)
+                before = sleep_digest(log)
+                log = set_sleep_state(loaded)
                 loaded_at = now_bst_label()
                 st.session_state["sleep_sheet_last_loaded"] = loaded_at
-                if sleep_digest(table) != before:
+                if sleep_digest(log) != before:
                     st.success(f"Sleep loaded at {loaded_at}.")
                 else:
                     st.caption(f"Sleep checked at {loaded_at}; no changes found.")
@@ -3131,7 +3222,7 @@ def show_sleep_sheet_controls(table: pd.DataFrame, roster: pd.DataFrame) -> tupl
 
         if save_now and configured:
             try:
-                table = save_sleep_live(table, sync, "Sleep saved to Google Sheet.")
+                log = save_sleep_live(log, sync, "Sleep saved to Google Sheet.")
                 st.success("Sleep saved to Google Sheet.")
             except Exception as exc:
                 st.error(f"Could not save sleep worksheet: {exc}")
@@ -3141,24 +3232,25 @@ def show_sleep_sheet_controls(table: pd.DataFrame, roster: pd.DataFrame) -> tupl
             settings_cols[0].text_input("Sheet ID", key="sleep_sheet_id", placeholder="Google Sheet ID")
             settings_cols[1].text_input("Worksheet", key="sleep_worksheet_name")
 
-    return sleep_state_table(roster), sync
+    return sleep_state_log(roster), sync
 
 
 def show_sleep_tab(roster: pd.DataFrame) -> None:
     st.subheader("Sleep")
-    st.caption("Track rough hours slept per runner. This does not affect race forecasts, runner order, or pacing assumptions.")
+    st.caption("Log sleep in increments. Totals are calculated from the log and do not affect race forecasts or runner order.")
     st.session_state["current_roster_for_sleep"] = roster.copy()
 
-    table = sleep_state_table(roster)
-    table, sleep_sync = show_sleep_sheet_controls(table, roster)
-    if table.empty:
+    log = sleep_state_log(roster)
+    log, sleep_sync = show_sleep_sheet_controls(log, roster)
+    summary = sleep_summary_table(log, roster)
+    if summary.empty:
         st.info("Add runners in Setup before tracking sleep.")
         return
 
-    total_sleep = float(table["hours"].sum())
-    average_sleep = float(table["hours"].mean()) if not table.empty else 0.0
-    most_rested = table.sort_values(["hours", "runner"], ascending=[False, True]).iloc[0]
-    least_rested = table.sort_values(["hours", "runner"], ascending=[True, True]).iloc[0]
+    total_sleep = float(summary["hours"].sum())
+    average_sleep = float(summary["hours"].mean()) if not summary.empty else 0.0
+    most_rested = summary.sort_values(["hours", "runner"], ascending=[False, True]).iloc[0]
+    least_rested = summary.sort_values(["hours", "runner"], ascending=[True, True]).iloc[0]
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Team sleep bank", f"{total_sleep:.1f}h")
@@ -3166,24 +3258,27 @@ def show_sleep_tab(roster: pd.DataFrame) -> None:
     c3.metric("Most rested", f"{most_rested['runner']} ({float(most_rested['hours']):.1f}h)")
     c4.metric("Lowest sleep", f"{least_rested['runner']} ({float(least_rested['hours']):.1f}h)")
 
-    st.markdown("#### Quick Add")
+    if log.empty:
+        st.info("No sleep blocks logged yet. Add sleep below when someone gets a rest block.")
+
+    st.markdown("#### Add Sleep Block")
     quick_cols = st.columns([1.4, 1, 1])
     runner = quick_cols[0].selectbox(
         "Runner",
-        table["runner"].astype(str).tolist(),
+        summary["runner"].astype(str).tolist(),
         key="sleep_quick_runner",
     )
     added_hours = quick_cols[1].number_input(
-        "Hours",
+        "Hours slept",
         min_value=0.25,
         max_value=12.0,
         value=1.0,
         step=0.25,
         key="sleep_quick_hours",
     )
+    sleep_note = st.text_input("Sleep note", value="", placeholder="tent, car, decent nap, interrupted", key="sleep_quick_note")
     if quick_cols[2].button("Add sleep", type="primary", width="stretch", key="sleep_add_button"):
-        updated = table.copy()
-        updated.loc[updated["runner"].astype(str) == str(runner), "hours"] += float(added_hours)
+        updated = append_sleep_log_entry(log, roster, runner, float(added_hours), sleep_note)
         try:
             save_sleep_live(updated, sleep_sync, f"Added {float(added_hours):.2f}h for {runner} and saved to Google Sheet.")
         except Exception as exc:
@@ -3191,22 +3286,31 @@ def show_sleep_tab(roster: pd.DataFrame) -> None:
             st.session_state["sleep_sheet_notice"] = f"Updated locally, but could not save to Sheet: {exc}"
         st.rerun()
 
+    st.markdown("#### Sleep Log")
+    if log.empty:
+        display_log = pd.DataFrame(columns=SLEEP_SHEET_COLUMNS)
+    else:
+        display_log = log.sort_values("recorded_at", kind="stable").reset_index(drop=True)
     edited = st.data_editor(
-        table[["runner", "hours", "unit", "notes"]],
+        display_log[SLEEP_SHEET_COLUMNS],
         hide_index=True,
         width="stretch",
         column_config={
-            "runner": st.column_config.TextColumn("Runner", disabled=True),
-            "hours": st.column_config.NumberColumn("Hours", min_value=0.0, max_value=48.0, step=0.25, format="%.2f"),
+            "entry_id": None,
+            "runner": st.column_config.SelectboxColumn("Runner", options=summary["runner"].astype(str).tolist()),
+            "hours": st.column_config.NumberColumn("Hours", min_value=0.0, max_value=12.0, step=0.25, format="%.2f"),
             "unit": st.column_config.TextColumn("Unit", disabled=True),
+            "recorded_at": st.column_config.TextColumn("Recorded"),
             "notes": st.column_config.TextColumn("Notes"),
         },
-        key=f"sleep_tracker_editor_{sleep_digest(table)[:12]}",
+        column_order=["runner", "hours", "recorded_at", "notes"],
+        num_rows="dynamic",
+        key=f"sleep_log_editor_{sleep_digest(log)[:12]}",
     )
-    edited_clean = normalise_sleep_table(edited, roster)
-    if sleep_digest(edited_clean) != sleep_digest(table):
+    edited_clean = normalise_sleep_log(edited, roster)
+    if sleep_digest(edited_clean) != sleep_digest(log):
         try:
-            save_sleep_live(edited_clean, sleep_sync, "Sleep table edit saved to Google Sheet.")
+            save_sleep_live(edited_clean, sleep_sync, "Sleep log edit saved to Google Sheet.")
         except Exception as exc:
             set_sleep_state(edited_clean)
             st.session_state["sleep_sheet_notice"] = f"Updated locally, but could not save to Sheet: {exc}"
@@ -3221,31 +3325,29 @@ def show_sleep_tab(roster: pd.DataFrame) -> None:
         key="sleep_force_save_button",
     ):
         try:
-            saved = save_sleep_live(edited, sleep_sync, "Sleep forced saved to Google Sheet.")
-            st.success(f"Saved {float(saved['hours'].sum()):.1f} team sleep hours.")
+            saved = save_sleep_live(edited_clean, sleep_sync, "Sleep log forced saved to Google Sheet.")
+            st.success(f"Saved {len(saved)} sleep log entries.")
         except Exception as exc:
             st.error(f"Could not save sleep worksheet: {exc}")
-    if action_cols[1].button("Reset sleep", width="stretch", key="sleep_reset_button"):
-        reset = table.copy()
-        reset["hours"] = 0.0
-        reset["notes"] = ""
+    if action_cols[1].button("Clear sleep log", width="stretch", key="sleep_reset_button"):
+        reset = pd.DataFrame(columns=SLEEP_SHEET_COLUMNS)
         try:
-            save_sleep_live(reset, sleep_sync, "Sleep reset and saved to Google Sheet.")
+            save_sleep_live(reset, sleep_sync, "Sleep log cleared and saved to Google Sheet.")
         except Exception as exc:
             set_sleep_state(reset)
-            st.session_state["sleep_sheet_notice"] = f"Reset locally, but could not save to Sheet: {exc}"
+            st.session_state["sleep_sheet_notice"] = f"Cleared locally, but could not save to Sheet: {exc}"
         st.rerun()
     action_cols[2].download_button(
-        "Download sleep CSV",
-        sleep_state_table(roster).to_csv(index=False),
-        file_name="endure24_sleep_tracker.csv",
+        "Download sleep log CSV",
+        sleep_state_log(roster).to_csv(index=False),
+        file_name="endure24_sleep_log.csv",
         mime="text/csv",
         width="stretch",
         key="sleep_download_csv",
     )
 
     st.markdown("#### Sleep Graphs")
-    chart_table = sleep_state_table(roster)
+    chart_table = sleep_summary_table(log, roster)
     chart_table["hours_label"] = chart_table["hours"].map(lambda value: f"{float(value):.1f}")
     bar = px.bar(
         chart_table.sort_values("hours", ascending=False),
@@ -3318,6 +3420,24 @@ def show_sleep_tab(roster: pd.DataFrame) -> None:
     )
     scatter.update_layout(xaxis_title="Running order", yaxis_title="Hours slept", showlegend=False)
     st.plotly_chart(scatter, width="stretch")
+
+    if log.empty:
+        st.info("Add sleep blocks to show the cumulative sleep log chart.")
+    else:
+        timeline = log.copy().reset_index(drop=True)
+        timeline["entry"] = timeline.index + 1
+        timeline["cumulative_hours"] = timeline.groupby("runner")["hours"].cumsum()
+        line = px.line(
+            timeline,
+            x="entry",
+            y="cumulative_hours",
+            color="runner",
+            markers=True,
+            hover_data=["hours", "recorded_at", "notes"],
+            title="Cumulative Sleep Blocks",
+        )
+        line.update_layout(xaxis_title="Sleep log entry", yaxis_title="Cumulative hours")
+        st.plotly_chart(line, width="stretch")
 
 
 def main() -> None:
