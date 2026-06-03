@@ -20,7 +20,7 @@ try:
 except Exception:  # pragma: no cover - optional dependency for live Sheet refresh.
     st_autorefresh = None
 
-from data_loader import DEFAULT_DATA_PATH, load_endure_workbook, validate_roster
+from data_loader import DEFAULT_DATA_PATH, load_endure_workbook, normalize_runner_name, validate_roster
 from optimizer import optimize_running_orders
 import race_day as race_day_module
 
@@ -108,13 +108,20 @@ def inject_app_styles() -> None:
             letter-spacing: 0;
         }
         div[data-testid="stMetric"] {
-            background: #f8fafc;
-            border: 1px solid #e3e8ef;
+            background: #f8fafc !important;
+            border: 1px solid #e3e8ef !important;
             border-radius: 8px;
             padding: 0.85rem 0.9rem;
+            color: #162235 !important;
+        }
+        div[data-testid="stMetric"] * {
+            color: #162235 !important;
         }
         div[data-testid="stMetric"] label {
-            color: #465467;
+            color: #465467 !important;
+        }
+        div[data-testid="stMetric"] [data-testid="stMetricDelta"] * {
+            color: #516173 !important;
         }
         .stTabs [data-baseweb="tab-list"] {
             gap: 0.35rem;
@@ -134,50 +141,53 @@ def inject_app_styles() -> None:
             border-radius: 8px;
             padding: 0.85rem 1rem;
             margin: 0.25rem 0 0.75rem 0;
-            background: #ffffff;
+            background: #ffffff !important;
+            color: #162235 !important;
         }
         .race-status h3 {
+            color: #162235 !important;
             font-size: 1.05rem;
             margin: 0 0 0.15rem 0;
         }
         .race-status p {
             margin: 0;
-            color: #465467;
+            color: #465467 !important;
         }
         .race-status-good {
             border-left-color: #168251;
-            background: #f3fbf7;
+            background: #f3fbf7 !important;
         }
         .race-status-watch {
             border-left-color: #c47a00;
-            background: #fff8eb;
+            background: #fff8eb !important;
         }
         .race-status-risk {
             border-left-color: #c03535;
-            background: #fff4f4;
+            background: #fff4f4 !important;
         }
         .race-mini {
             border: 1px solid #e2e8f0;
             border-radius: 8px;
             padding: 0.75rem 0.85rem;
-            background: #ffffff;
+            background: #ffffff !important;
+            color: #162235 !important;
             min-height: 5.25rem;
         }
         .race-mini-label {
-            color: #617083;
+            color: #617083 !important;
             font-size: 0.78rem;
             font-weight: 650;
             text-transform: uppercase;
         }
         .race-mini-value {
-            color: #162235;
+            color: #162235 !important;
             font-size: 1.35rem;
             font-weight: 760;
             line-height: 1.2;
             margin-top: 0.2rem;
         }
         .race-mini-help {
-            color: #617083;
+            color: #617083 !important;
             font-size: 0.82rem;
             margin-top: 0.25rem;
         }
@@ -226,21 +236,22 @@ def inject_app_styles() -> None:
             border: 1px solid #d7dde5;
             border-radius: 8px;
             padding: 0.65rem 0.75rem;
-            background: #f8fafc;
+            background: #f8fafc !important;
+            color: #162235 !important;
             min-height: 5.2rem;
         }
         .achievement-card-unlocked {
             border-color: #9ed6b9;
-            background: #edf9f2;
+            background: #edf9f2 !important;
         }
         .achievement-title {
-            color: #162235;
+            color: #162235 !important;
             font-size: 0.92rem;
             font-weight: 760;
             line-height: 1.2;
         }
         .achievement-detail {
-            color: #617083;
+            color: #617083 !important;
             font-size: 0.82rem;
             margin-top: 0.25rem;
         }
@@ -1681,6 +1692,482 @@ def edited_roster_table(roster: pd.DataFrame) -> pd.DataFrame:
             "source": st.column_config.TextColumn("Source", disabled=True),
         },
     )
+
+
+ROSTER_SHEET_COLUMNS = [
+    "runner",
+    "projected_mean_minutes",
+    "projected_sd_minutes",
+    "running_order",
+    "max_laps",
+    "available",
+    "fatigue_pct_per_lap",
+    "night_penalty_pct",
+    "notes",
+    "source",
+]
+
+
+def _roster_column_key(column: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", str(column).strip().lower()).strip("_")
+
+
+def _roster_bool_value(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    try:
+        missing = bool(pd.isna(value))
+    except Exception:
+        missing = False
+    if value is None or missing:
+        return True
+    text = str(value).strip().lower()
+    if text in {"", "true", "t", "yes", "y", "1", "available", "active"}:
+        return True
+    if text in {"false", "f", "no", "n", "0", "unavailable", "inactive"}:
+        return False
+    return bool(value)
+
+
+def _roster_empty_value(value: Any) -> bool:
+    if value is None:
+        return True
+    try:
+        if bool(pd.isna(value)):
+            return True
+    except Exception:
+        pass
+    return str(value).strip() == ""
+
+
+def roster_to_sheet_table(roster: pd.DataFrame) -> pd.DataFrame:
+    clean = roster.copy() if isinstance(roster, pd.DataFrame) else pd.DataFrame(columns=ROSTER_SHEET_COLUMNS)
+    for column in ROSTER_SHEET_COLUMNS:
+        if column not in clean:
+            clean[column] = ""
+    clean = clean[ROSTER_SHEET_COLUMNS].copy()
+    clean["runner"] = clean["runner"].fillna("").astype(str).str.strip().map(normalize_runner_name)
+    clean = clean.dropna(subset=["runner"]).copy()
+    clean = clean[clean["runner"].astype(str).str.strip().ne("")].copy()
+    clean = clean.drop_duplicates("runner", keep="first")
+
+    numeric_columns = [
+        "projected_mean_minutes",
+        "projected_sd_minutes",
+        "running_order",
+        "max_laps",
+        "fatigue_pct_per_lap",
+        "night_penalty_pct",
+    ]
+    for column in numeric_columns:
+        clean[column] = pd.to_numeric(clean[column], errors="coerce")
+    missing_order = clean["running_order"].isna()
+    if missing_order.any():
+        clean.loc[missing_order, "running_order"] = [index + 1 for index in clean.index[missing_order]]
+    clean["running_order"] = clean["running_order"].round().astype(int).clip(lower=1)
+    clean["available"] = clean["available"].map(_roster_bool_value)
+    clean["notes"] = clean["notes"].fillna("").astype(str)
+    clean["source"] = clean["source"].fillna("").astype(str)
+    clean.loc[clean["source"].str.strip().eq(""), "source"] = "this_year_roster"
+    clean = clean.sort_values(["running_order", "runner"], kind="stable").reset_index(drop=True)
+    return clean[ROSTER_SHEET_COLUMNS]
+
+
+def normalise_roster_sheet_table(raw: pd.DataFrame, fallback_roster: pd.DataFrame) -> pd.DataFrame:
+    fallback = roster_to_sheet_table(fallback_roster)
+    if fallback.empty:
+        return pd.DataFrame(columns=ROSTER_SHEET_COLUMNS)
+
+    current = raw.copy() if isinstance(raw, pd.DataFrame) and not raw.empty else pd.DataFrame(columns=ROSTER_SHEET_COLUMNS)
+    column_aliases = {
+        "name": "runner",
+        "runner_name": "runner",
+        "athlete": "runner",
+        "person": "runner",
+        "mean": "projected_mean_minutes",
+        "avg": "projected_mean_minutes",
+        "average": "projected_mean_minutes",
+        "average_minutes": "projected_mean_minutes",
+        "projected_mean": "projected_mean_minutes",
+        "projectedmeanminutes": "projected_mean_minutes",
+        "mean_minutes": "projected_mean_minutes",
+        "lap_minutes": "projected_mean_minutes",
+        "sd": "projected_sd_minutes",
+        "std": "projected_sd_minutes",
+        "std_dev": "projected_sd_minutes",
+        "standard_deviation": "projected_sd_minutes",
+        "projected_sd": "projected_sd_minutes",
+        "order": "running_order",
+        "position": "running_order",
+        "slot": "running_order",
+        "cap": "max_laps",
+        "caps": "max_laps",
+        "max": "max_laps",
+        "max_lap": "max_laps",
+        "max_laps_count": "max_laps",
+        "enabled": "available",
+        "active": "available",
+        "fatigue": "fatigue_pct_per_lap",
+        "fatigue_pct": "fatigue_pct_per_lap",
+        "fatigue_percent_per_lap": "fatigue_pct_per_lap",
+        "night": "night_penalty_pct",
+        "night_pct": "night_penalty_pct",
+        "night_penalty": "night_penalty_pct",
+        "comment": "notes",
+        "comments": "notes",
+    }
+    current.columns = [
+        column_aliases.get(_roster_column_key(column), _roster_column_key(column))
+        for column in current.columns
+    ]
+    if current.columns.duplicated().any():
+        merged = pd.DataFrame(index=current.index)
+        for column in dict.fromkeys(current.columns):
+            matching = current.loc[:, current.columns == column]
+            merged[column] = matching.replace("", pd.NA).bfill(axis=1).iloc[:, 0]
+        current = merged
+    for column in ROSTER_SHEET_COLUMNS:
+        if column not in current:
+            current[column] = ""
+
+    current["runner"] = current["runner"].fillna("").astype(str).str.strip().map(normalize_runner_name)
+    current = current.dropna(subset=["runner"]).copy()
+    current = current[current["runner"].astype(str).str.strip().ne("")].copy()
+    current = current.drop_duplicates("runner", keep="first")
+
+    fallback_by_runner = fallback.set_index("runner").to_dict("index")
+    current_by_runner = current.set_index("runner").to_dict("index") if not current.empty else {}
+    ordered_runners = fallback["runner"].astype(str).tolist()
+    for runner in current["runner"].astype(str).tolist():
+        if runner not in ordered_runners:
+            ordered_runners.append(runner)
+
+    rows: list[dict[str, Any]] = []
+    for position, runner in enumerate(ordered_runners, start=1):
+        fallback_row = fallback_by_runner.get(runner, {})
+        current_row = current_by_runner.get(runner, {})
+        row: dict[str, Any] = {"runner": runner}
+        for column in ROSTER_SHEET_COLUMNS:
+            if column == "runner":
+                continue
+            value = current_row.get(column, "")
+            if _roster_empty_value(value):
+                value = fallback_row.get(column, "")
+            row[column] = value
+        if str(row.get("source", "")).strip() == "":
+            row["source"] = "this_year_roster"
+        rows.append(row)
+
+    clean = pd.DataFrame(rows, columns=ROSTER_SHEET_COLUMNS)
+    numeric_columns = [
+        "projected_mean_minutes",
+        "projected_sd_minutes",
+        "running_order",
+        "max_laps",
+        "fatigue_pct_per_lap",
+        "night_penalty_pct",
+    ]
+    for column in numeric_columns:
+        clean[column] = pd.to_numeric(clean[column], errors="coerce")
+    missing_order = clean["running_order"].isna()
+    if missing_order.any():
+        clean.loc[missing_order, "running_order"] = [index + 1 for index in clean.index[missing_order]]
+    clean["running_order"] = clean["running_order"].round().astype(int).clip(lower=1)
+    clean["available"] = clean["available"].map(_roster_bool_value)
+    clean["fatigue_pct_per_lap"] = pd.to_numeric(clean["fatigue_pct_per_lap"], errors="coerce").fillna(0.0)
+    clean["night_penalty_pct"] = pd.to_numeric(clean["night_penalty_pct"], errors="coerce").fillna(0.0)
+    clean["notes"] = clean["notes"].fillna("").astype(str)
+    clean["source"] = clean["source"].fillna("").astype(str)
+    clean = clean.sort_values(["running_order", "runner"], kind="stable").reset_index(drop=True)
+    return clean[ROSTER_SHEET_COLUMNS]
+
+
+def roster_digest(table: pd.DataFrame) -> str:
+    return stable_table_digest(roster_to_sheet_table(table), ROSTER_SHEET_COLUMNS)
+
+
+def _open_roster_sheet(secrets: Mapping[str, Any], sheet_id: str | None, worksheet_name: str):
+    try:
+        import gspread
+        from google.oauth2.service_account import Credentials
+    except Exception as exc:  # pragma: no cover - depends on cloud packages.
+        raise RuntimeError("Install gspread and google-auth to use Google Sheets sync.") from exc
+
+    service_account = _drinks_service_account_info(secrets)
+    resolved_sheet_id = sheet_id or _drinks_secret_value(secrets, "google_sheet_id", "race_log_google_sheet_id")
+    if not service_account or not resolved_sheet_id:
+        raise RuntimeError("Google Sheets sync needs google_sheet_id and gcp_service_account in Streamlit secrets.")
+
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+    credentials = Credentials.from_service_account_info(service_account, scopes=scopes)
+    client = gspread.authorize(credentials)
+    spreadsheet = client.open_by_key(str(resolved_sheet_id))
+    try:
+        return spreadsheet.worksheet(worksheet_name)
+    except Exception:
+        return spreadsheet.add_worksheet(title=worksheet_name, rows=200, cols=len(ROSTER_SHEET_COLUMNS))
+
+
+def read_roster_from_google_sheet(
+    secrets: Mapping[str, Any],
+    sheet_id: str | None = None,
+    worksheet_name: str = "this_year_roster",
+) -> pd.DataFrame:
+    sheet = _open_roster_sheet(secrets, sheet_id, worksheet_name)
+    return pd.DataFrame(sheet.get_all_records())
+
+
+def write_roster_to_google_sheet(
+    roster: pd.DataFrame,
+    secrets: Mapping[str, Any],
+    sheet_id: str | None = None,
+    worksheet_name: str = "this_year_roster",
+) -> None:
+    sheet = _open_roster_sheet(secrets, sheet_id, worksheet_name)
+    clean = roster_to_sheet_table(roster)
+    values = [ROSTER_SHEET_COLUMNS] + clean.fillna("").astype(str).values.tolist()
+    sheet.clear()
+    sheet.update(values)
+
+
+def set_roster_state(table: pd.DataFrame, fallback_roster: pd.DataFrame) -> pd.DataFrame:
+    clean = normalise_roster_sheet_table(table, fallback_roster)
+    st.session_state["this_year_roster_tracker"] = clean.copy()
+    return clean
+
+
+def roster_state_table(fallback_roster: pd.DataFrame) -> pd.DataFrame:
+    if "this_year_roster_tracker" not in st.session_state:
+        st.session_state["this_year_roster_tracker"] = roster_to_sheet_table(fallback_roster)
+    return set_roster_state(st.session_state["this_year_roster_tracker"], fallback_roster)
+
+
+def roster_sheet_context() -> dict[str, Any]:
+    default_sheet_id = get_streamlit_secret("google_sheet_id", "race_log_google_sheet_id") or ""
+    default_sheet_id = st.session_state.get("race_day_sheet_id", default_sheet_id)
+    st.session_state.setdefault("this_year_roster_sheet_id", str(default_sheet_id))
+    st.session_state.setdefault("this_year_roster_worksheet_name", "this_year_roster")
+
+    sheet_id = str(st.session_state.get("this_year_roster_sheet_id") or default_sheet_id).strip()
+    worksheet_name = (
+        str(st.session_state.get("this_year_roster_worksheet_name") or "this_year_roster").strip()
+        or "this_year_roster"
+    )
+    return {
+        "sheet_id": sheet_id,
+        "worksheet_name": worksheet_name,
+        "configured": google_sheets_configured(st.secrets, sheet_id or None),
+    }
+
+
+def save_roster_live(
+    table: pd.DataFrame,
+    sync: Mapping[str, Any],
+    fallback_roster: pd.DataFrame,
+    notice: str | None = None,
+    force: bool = False,
+) -> pd.DataFrame:
+    clean = set_roster_state(table, fallback_roster)
+    digest = roster_digest(clean)
+    if not sync.get("configured"):
+        st.session_state["this_year_roster_save_status"] = "local"
+        st.session_state["this_year_roster_sheet_notice"] = "Saved locally. Google Sheets is not configured."
+        return clean
+
+    allowed = conflict_safe_write_allowed(
+        prefix="this_year_roster",
+        label="This year roster",
+        pending=clean,
+        pending_digest=digest,
+        read_remote=lambda: read_roster_from_google_sheet(
+            st.secrets,
+            sheet_id=sync.get("sheet_id") or None,
+            worksheet_name=str(sync.get("worksheet_name") or "this_year_roster"),
+        ),
+        remote_digest=lambda remote: roster_digest(normalise_roster_sheet_table(remote, fallback_roster)),
+        configured=bool(sync.get("configured")),
+        force=force,
+        live_reload_key="this_year_roster_live_sheet_enabled",
+        safe_baseline_digest=roster_digest(roster_to_sheet_table(fallback_roster)),
+    )
+    if not allowed:
+        st.session_state["this_year_roster_sheet_notice"] = (
+            "Roster changes kept locally. Resolve the Sheet conflict before normal saves continue."
+        )
+        return clean
+
+    write_roster_to_google_sheet(
+        clean,
+        st.secrets,
+        sheet_id=sync.get("sheet_id") or None,
+        worksheet_name=str(sync.get("worksheet_name") or "this_year_roster"),
+    )
+    saved_at = now_bst_label()
+    st.session_state["this_year_roster_sheet_last_saved"] = saved_at
+    mark_sheet_saved("this_year_roster", digest, saved_at)
+    st.session_state["this_year_roster_sheet_notice"] = notice or f"Roster saved to Google Sheet at {saved_at}."
+    return clean
+
+
+def show_roster_sheet_controls(
+    roster: pd.DataFrame,
+    fallback_roster: pd.DataFrame,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    sync = roster_sheet_context()
+    sheet_id = str(sync["sheet_id"])
+    worksheet_name = str(sync["worksheet_name"])
+    configured = bool(sync["configured"])
+
+    with st.container(border=True):
+        top_cols = st.columns([1.5, 1, 1])
+        with top_cols[0]:
+            st.markdown("#### This Year Roster Sheet")
+            if configured:
+                st.caption("Load this_year_roster from Google Sheets, or create it from the cleaned workbook defaults.")
+            else:
+                st.caption("Google sync is not configured. Edit locally here or download the CSV.")
+
+        live_reload = top_cols[1].checkbox(
+            "Auto reload",
+            value=live_reload_enabled_default("this_year_roster_live_sheet_enabled", configured),
+            help="Polls the this_year_roster worksheet while Setup is open. App saves still write immediately.",
+            key="this_year_roster_live_reload_checkbox",
+        )
+        refresh_seconds = top_cols[2].number_input(
+            "Reload every seconds",
+            min_value=10,
+            max_value=300,
+            value=live_refresh_seconds_default("this_year_roster_live_refresh_seconds"),
+            step=5,
+            key="this_year_roster_refresh_seconds_input",
+        )
+        st.session_state["this_year_roster_live_sheet_enabled"] = live_reload
+        st.session_state["this_year_roster_live_refresh_seconds"] = int(refresh_seconds)
+        show_sheet_cooldown("this_year_roster", "Roster Sheet")
+
+        if live_reload and sheet_cooldown_remaining_seconds("this_year_roster") <= 0 and st_autorefresh is not None:
+            st_autorefresh(interval=int(refresh_seconds) * 1000, key="this_year_roster_live_sheet_autorefresh")
+        elif live_reload and st_autorefresh is None:
+            st.warning("Live reload needs the streamlit-autorefresh package. Manual loading still works.")
+
+        action_cols = st.columns([1, 1, 1.2])
+        load_now = action_cols[0].button("Load roster", width="stretch", disabled=not configured)
+        save_now = action_cols[1].button("Save roster", width="stretch", disabled=not configured)
+        if configured:
+            action_cols[2].success(f"Worksheet: {worksheet_name}")
+        else:
+            action_cols[2].warning("Save disabled until secrets are set.")
+
+        seed_now = st.button(
+            "Create / refresh this_year_roster from workbook defaults",
+            width="stretch",
+            disabled=not configured,
+            help="Writes the cleaned roster generated from last year's workbook data. Use this when the Sheet is empty or needs resetting.",
+        )
+
+        conflict_load, conflict_force = show_sheet_conflict_actions(
+            "this_year_roster",
+            "Roster Sheet",
+            "endure24_pending_this_year_roster.csv",
+        )
+        load_now = load_now or conflict_load
+        if conflict_force:
+            pending = st.session_state.get("this_year_roster_pending_df")
+            try:
+                roster = save_roster_live(
+                    pending if isinstance(pending, pd.DataFrame) else roster,
+                    sync,
+                    fallback_roster,
+                    "Roster force-saved to Google Sheet.",
+                    force=True,
+                )
+                if sheet_save_status("this_year_roster") == "saved":
+                    st.success("Roster force-saved to Google Sheet.")
+                    st.rerun()
+            except Exception as exc:
+                st.error(f"Could not force-save roster worksheet: {exc}")
+
+        if seed_now and configured:
+            try:
+                roster = save_roster_live(
+                    roster_to_sheet_table(fallback_roster),
+                    sync,
+                    fallback_roster,
+                    "this_year_roster created from the cleaned workbook defaults.",
+                    force=True,
+                )
+                if sheet_save_status("this_year_roster") == "saved":
+                    st.success("this_year_roster created from the cleaned workbook defaults.")
+                    st.rerun()
+            except Exception as exc:
+                st.error(f"Could not create this_year_roster: {exc}")
+
+        if should_load_sheet_now("this_year_roster", load_now, live_reload, int(refresh_seconds)) and configured:
+            try:
+                loaded = read_roster_from_google_sheet(
+                    st.secrets,
+                    sheet_id=sheet_id or None,
+                    worksheet_name=worksheet_name,
+                )
+                if loaded.empty:
+                    loaded = roster_to_sheet_table(fallback_roster)
+                    write_roster_to_google_sheet(
+                        loaded,
+                        st.secrets,
+                        sheet_id=sheet_id or None,
+                        worksheet_name=worksheet_name,
+                    )
+                    st.session_state["this_year_roster_sheet_notice"] = (
+                        "Created this_year_roster from the cleaned workbook defaults."
+                    )
+                before = roster_digest(roster)
+                roster = set_roster_state(loaded, fallback_roster)
+                loaded_at = now_bst_label()
+                st.session_state["this_year_roster_sheet_last_loaded"] = loaded_at
+                mark_sheet_loaded("this_year_roster", roster_digest(roster), loaded_at)
+                if roster_digest(roster) != before:
+                    st.success(f"Roster loaded at {loaded_at}.")
+                    st.rerun()
+                else:
+                    st.caption(f"Roster checked at {loaded_at}; no changes found.")
+            except Exception as exc:
+                handle_sheet_load_error(
+                    "this_year_roster",
+                    "the this_year_roster worksheet",
+                    exc,
+                    "this_year_roster_live_sheet_enabled",
+                )
+
+        if st.session_state.get("this_year_roster_sheet_last_loaded"):
+            st.caption(f"Last roster load: {st.session_state['this_year_roster_sheet_last_loaded']}.")
+        if st.session_state.get("this_year_roster_sheet_last_saved"):
+            st.caption(f"Last roster save: {st.session_state['this_year_roster_sheet_last_saved']}.")
+        if st.session_state.get("this_year_roster_sheet_notice"):
+            st.success(st.session_state.pop("this_year_roster_sheet_notice"))
+
+        if save_now and configured:
+            try:
+                roster = save_roster_live(roster, sync, fallback_roster, "Roster saved to Google Sheet.")
+                if sheet_save_status("this_year_roster") == "saved":
+                    st.success("Roster saved to Google Sheet.")
+                elif sheet_save_status("this_year_roster") in {"conflict", "quota"}:
+                    st.warning("Roster changes kept locally. Resolve the Sheet warning above before normal saves continue.")
+            except Exception as exc:
+                st.error(f"Could not save roster worksheet: {exc}")
+
+        with st.expander("Roster Sheet settings", expanded=False):
+            settings_cols = st.columns([2, 1])
+            settings_cols[0].text_input("Sheet ID", key="this_year_roster_sheet_id", placeholder="Google Sheet ID")
+            settings_cols[1].text_input("Worksheet", key="this_year_roster_worksheet_name")
+            st.download_button(
+                "Download roster CSV",
+                roster_to_sheet_table(roster).to_csv(index=False),
+                file_name="endure24_this_year_roster.csv",
+                mime="text/csv",
+                width="stretch",
+            )
+
+    return roster_state_table(fallback_roster), sync
 
 
 def make_settings() -> SimulationSettings:
@@ -5484,6 +5971,17 @@ def show_pace_plan_sheet_controls(
                     sheet_id=sheet_id or None,
                     worksheet_name=worksheet_name,
                 )
+                if loaded.empty:
+                    loaded = base_pace_plan(roster, log, course)
+                    write_pace_plan_to_google_sheet(
+                        loaded,
+                        st.secrets,
+                        sheet_id=sheet_id or None,
+                        worksheet_name=worksheet_name,
+                    )
+                    st.session_state["pace_plan_sheet_notice"] = (
+                        "Created pace_plan from this_year_roster/workbook defaults."
+                    )
                 before = pace_plan_digest(pace_plan)
                 pace_plan = set_pace_plan_state(loaded, roster, log, course)
                 loaded_at = now_bst_label()
@@ -7751,7 +8249,28 @@ def main() -> None:
             "Last-year day/night and fatigue stats are shown below where the workbook has enough data, but the app "
             "does not apply them automatically."
         )
-        roster = edited_roster_table(loaded.roster)
+        roster_seed = roster_state_table(loaded.roster)
+        roster_seed, roster_sync = show_roster_sheet_controls(roster_seed, loaded.roster)
+        st.caption(
+            "The clean this_year_roster worksheet is pre-filled from last year's workbook/default assumptions. "
+            "Overwrite any row here or in Google Sheets if race-day plans change."
+        )
+        roster_edited = edited_roster_table(roster_seed)
+        roster_clean = normalise_roster_sheet_table(roster_edited, loaded.roster)
+        if roster_digest(roster_clean) != roster_digest(roster_seed):
+            try:
+                roster = save_roster_live(
+                    roster_clean,
+                    roster_sync,
+                    loaded.roster,
+                    "this_year_roster edit saved to Google Sheet.",
+                )
+            except Exception as exc:
+                roster = set_roster_state(roster_clean, loaded.roster)
+                st.session_state["this_year_roster_sheet_notice"] = f"Updated locally, but could not save to Sheet: {exc}"
+            st.rerun()
+        else:
+            roster = roster_seed
         roster_warnings, roster_errors = validate_roster(roster)
         for warning in roster_warnings:
             st.warning(warning)
