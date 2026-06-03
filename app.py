@@ -1757,9 +1757,11 @@ def show_race_control_dashboard(
         width="stretch",
     )
     show_race_day_visual_panels(log, roster, settings, course, state, caps_enabled)
-    show_race_day_fun_zone(log, roster, settings, course, state, live_bundle)
 
-    with st.expander("Fixed-order queue and runner status", expanded=False):
+
+def show_fixed_order_queue_status(log: pd.DataFrame, roster: pd.DataFrame, caps_enabled: bool) -> None:
+    st.markdown("### Fixed-order queue and runner status")
+    with st.container(border=True):
         queue = build_runner_queue(log, roster, caps_enabled=caps_enabled, queue_size=5)
         st.markdown("#### Fixed Order Queue")
         if queue.empty:
@@ -3310,11 +3312,6 @@ def show_race_day(
         caps_enabled,
         race_sync,
     )
-    show_race_day_plan_assistant(log, roster, settings, state, caps_enabled)
-    show_race_day_readiness(race_sync, warnings, errors, live_bundle, roster, settings, course, log, caps_enabled)
-    show_race_day_sync_status(race_sync)
-    show_race_day_alerts(warnings, errors)
-    show_team_brief(log, roster, settings, course, state, live_bundle, warnings, errors, caps_enabled, race_sync)
 
     st.markdown("### Lap Desk")
     show_lap_handover_strip(log, roster, course, state, caps_enabled)
@@ -3393,6 +3390,33 @@ def show_race_day(
 
     # Keep the latest validated log in session after any nested controls changed it.
     st.session_state["race_log"] = normalise_race_log(log, roster)
+
+
+def show_race_extras(
+    roster: pd.DataFrame,
+    settings: SimulationSettings,
+    course: CourseSettings,
+    caps_enabled: bool,
+) -> None:
+    st.subheader("Race Extras")
+    st.caption("Supporting race-day views: morale, awards, queues, checklist, alerts, and shareable team brief.")
+    if "race_log" not in st.session_state:
+        st.session_state["race_log"] = empty_race_log()
+
+    log = normalise_race_log(st.session_state["race_log"], roster)
+    race_sync = race_day_sheet_context()
+    warnings, errors = validate_race_log(log, roster, caps_enabled=caps_enabled)
+    state = race_state_from_log(log, roster, settings.target_laps, caps_enabled=caps_enabled)
+    forecast_state = st.session_state.get("race_day_forecast", {})
+    live_bundle = forecast_state.get("live_bundle")
+
+    show_race_day_fun_zone(log, roster, settings, course, state, live_bundle)
+    show_fixed_order_queue_status(log, roster, caps_enabled)
+    show_race_day_plan_assistant(log, roster, settings, state, caps_enabled)
+    show_race_day_readiness(race_sync, warnings, errors, live_bundle, roster, settings, course, log, caps_enabled)
+    show_race_day_sync_status(race_sync)
+    show_race_day_alerts(warnings, errors)
+    show_team_brief(log, roster, settings, course, state, live_bundle, warnings, errors, caps_enabled, race_sync)
 
 
 def show_exports_tab(
@@ -5697,8 +5721,8 @@ def main() -> None:
     st.sidebar.subheader("Race Rules")
     caps_enabled = st.sidebar.checkbox("Apply max-lap caps", value=True)
 
-    race_day_tab, forecast_tab, optimiser_tab, drinks_tab, sleep_tab, predictions_tab, what_if_tab, exports_tab, setup_tab = st.tabs(
-        ["Race Day", "Forecast", "Optimiser", "Drinks", "Sleep", "Predictions", "What-if", "Exports", "Setup"]
+    race_day_tab, race_extras_tab, forecast_tab, optimiser_tab, drinks_tab, sleep_tab, predictions_tab, what_if_tab, exports_tab, setup_tab = st.tabs(
+        ["Race Day", "Race Extras", "Forecast", "Optimiser", "Drinks", "Sleep", "Predictions", "What-if", "Exports", "Setup"]
     )
 
     with setup_tab:
@@ -5791,6 +5815,9 @@ def main() -> None:
 
     with race_day_tab:
         show_race_day(roster, settings, course, caps_enabled=caps_enabled)
+
+    with race_extras_tab:
+        show_race_extras(roster, settings, course, caps_enabled=caps_enabled)
 
     with drinks_tab:
         show_drinks_tab(roster)
