@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 import hashlib
 import html
 import importlib
@@ -63,12 +63,24 @@ ASSUMPTION_VERSION = "zero-fatigue-midnight-night-defaults-v2"
 DEFAULT_EDITABLE_GOOGLE_SHEET_URL = (
     "https://docs.google.com/spreadsheets/d/1dKvzME6TL4EJ8u_f0-l2p7ZENBwj7TUZLt0cW0T7QHo/edit?usp=sharing"
 )
+DEFAULT_ROUTE_URL = "https://www.plotaroute.com/route/3002404"
+DEFAULT_LAP_DISTANCE_KM = 4.817 * 1.609344
+DEFAULT_LAP_ASCENT_M = 331 * 0.3048
+DEFAULT_LAP_DESCENT_M = 331 * 0.3048
 RACE_TIMEZONE = "Europe/London"
 RACE_TIMEZONE_LABEL = "BST"
 DEFAULT_LIVE_REFRESH_SECONDS = 300
 OLD_LIVE_REFRESH_DEFAULT_SECONDS = {15, 60}
 DEFAULT_LIVE_RELOAD_ENABLED = False
 SHEET_API_COOLDOWN_SECONDS = 600
+
+
+@dataclass(frozen=True)
+class CourseSettings:
+    route_url: str
+    lap_distance_km: float
+    lap_ascent_m: float
+    lap_descent_m: float
 
 
 def inject_app_styles() -> None:
@@ -260,6 +272,61 @@ def format_probability(value: float | int | None) -> str:
     if value is None or pd.isna(value):
         return "-"
     return f"{float(value):.1%}"
+
+
+def format_distance_km(value: float | int | None) -> str:
+    if value is None or pd.isna(value):
+        return "-"
+    value = float(value)
+    if value >= 100:
+        return f"{value:.0f} km"
+    return f"{value:.1f} km"
+
+
+def format_elevation_m(value: float | int | None) -> str:
+    if value is None or pd.isna(value):
+        return "-"
+    return f"{float(value):.0f} m"
+
+
+def format_speed_kph(value: float | int | None) -> str:
+    if value is None or pd.isna(value):
+        return "-"
+    return f"{float(value):.1f} km/h"
+
+
+def format_pace_min_per_km(value: float | int | None) -> str:
+    if value is None or pd.isna(value):
+        return "-"
+    seconds = int(round(float(value) * 60))
+    if seconds < 0:
+        return "-"
+    minutes, seconds = divmod(seconds, 60)
+    return f"{minutes}:{seconds:02d}/km"
+
+
+def course_lap_distance_km(course: CourseSettings | None = None) -> float:
+    if course is None:
+        return float(DEFAULT_LAP_DISTANCE_KM)
+    return max(0.01, float(course.lap_distance_km))
+
+
+def lap_pace_min_per_km(minutes: float | int | None, course: CourseSettings | None = None) -> float | None:
+    if minutes is None or pd.isna(minutes):
+        return None
+    distance = course_lap_distance_km(course)
+    if distance <= 0:
+        return None
+    return float(minutes) / distance
+
+
+def lap_speed_kph(minutes: float | int | None, course: CourseSettings | None = None) -> float | None:
+    if minutes is None or pd.isna(minutes):
+        return None
+    minutes = float(minutes)
+    if minutes <= 0:
+        return None
+    return course_lap_distance_km(course) / (minutes / 60)
 
 
 def now_bst_label() -> str:
@@ -544,6 +611,80 @@ def add_clock_columns(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
     return display
 
 
+def add_course_metric_columns(log: pd.DataFrame, roster: pd.DataFrame, course: CourseSettings) -> pd.DataFrame:
+    display = normalise_race_log(log, roster)
+    display["lap_duration_minutes"] = pd.to_numeric(display["lap_duration_minutes"], errors="coerce")
+    completed = display["lap_duration_minutes"].notna() & display["finish_minute"].notna()
+    display["distance_km"] = completed.astype(float) * float(course.lap_distance_km)
+    display["ascent_m"] = completed.astype(float) * float(course.lap_ascent_m)
+    display["descent_m"] = completed.astype(float) * float(course.lap_descent_m)
+    display["pace_min_per_km"] = display["lap_duration_minutes"].map(lambda value: lap_pace_min_per_km(value, course))
+    display["speed_kph"] = display["lap_duration_minutes"].map(lambda value: lap_speed_kph(value, course))
+    return display
+
+
+def race_metric_summary(log: pd.DataFrame, roster: pd.DataFrame, course: CourseSettings) -> dict[str, Any]:
+    metrics = add_course_metric_columns(log, roster, course)
+    completed = metrics[metrics["lap_duration_minutes"].notna() & metrics["finish_minute"].notna()].copy()
+    official = completed[completed["official"].fillna(False).astype(bool)].copy() if "official" in completed else completed
+    logged_laps = len(completed)
+    official_laps = len(official)
+    logged_distance_km = float(logged_laps * course.lap_distance_km)
+    official_distance_km = float(official_laps * course.lap_distance_km)
+    logged_ascent_m = float(logged_laps * course.lap_ascent_m)
+    official_ascent_m = float(official_laps * course.lap_ascent_m)
+    logged_descent_m = float(logged_laps * course.lap_descent_m)
+    official_descent_m = float(official_laps * course.lap_descent_m)
+    total_minutes = float(official["lap_duration_minutes"].sum()) if not official.empty else 0.0
+    average_pace = total_minutes / official_distance_km if official_distance_km > 0 else None
+    average_speed = official_distance_km / (total_minutes / 60) if total_minutes > 0 else None
+    latest_completed = completed.sort_values("finish_minute").iloc[-1] if not completed.empty else None
+    latest_pace = None if latest_completed is None else lap_pace_min_per_km(latest_completed["lap_duration_minutes"], course)
+    latest_speed = None if latest_completed is None else lap_speed_kph(latest_completed["lap_duration_minutes"], course)
+    fastest = official.sort_values("pace_min_per_km").iloc[0] if not official.empty else None
+    fastest_pace = None if fastest is None else float(fastest["pace_min_per_km"])
+    fastest_runner = None if fastest is None else str(fastest["runner"])
+    return {
+        "logged_laps": logged_laps,
+        "official_laps": official_laps,
+        "logged_distance_km": logged_distance_km,
+        "official_distance_km": official_distance_km,
+        "logged_ascent_m": logged_ascent_m,
+        "official_ascent_m": official_ascent_m,
+        "logged_descent_m": logged_descent_m,
+        "official_descent_m": official_descent_m,
+        "average_pace_min_per_km": average_pace,
+        "average_speed_kph": average_speed,
+        "latest_pace_min_per_km": latest_pace,
+        "latest_speed_kph": latest_speed,
+        "fastest_pace_min_per_km": fastest_pace,
+        "fastest_runner": fastest_runner,
+    }
+
+
+def target_distance_summary(settings: SimulationSettings, course: CourseSettings) -> dict[str, float]:
+    target_laps = float(settings.target_laps)
+    return {
+        "target_distance_km": target_laps * float(course.lap_distance_km),
+        "target_ascent_m": target_laps * float(course.lap_ascent_m),
+        "target_descent_m": target_laps * float(course.lap_descent_m),
+    }
+
+
+def projected_distance_summary(live_summary: dict | None, course: CourseSettings) -> dict[str, float | None]:
+    if not live_summary:
+        return {"projected_distance_km": None, "projected_ascent_m": None, "projected_descent_m": None}
+    expected_laps = live_summary.get("expected_official_laps")
+    if expected_laps is None or pd.isna(expected_laps):
+        return {"projected_distance_km": None, "projected_ascent_m": None, "projected_descent_m": None}
+    expected_laps = float(expected_laps)
+    return {
+        "projected_distance_km": expected_laps * float(course.lap_distance_km),
+        "projected_ascent_m": expected_laps * float(course.lap_ascent_m),
+        "projected_descent_m": expected_laps * float(course.lap_descent_m),
+    }
+
+
 def final_lap_probability_figure(distribution: pd.DataFrame, title: str) -> go.Figure:
     fig = go.Figure()
     fig.add_trace(
@@ -753,12 +894,27 @@ def format_duration_short(minutes: float | int | None) -> str:
         return "-"
     value = max(0.0, float(minutes))
     if value >= 90:
-        return f"{value / 60:.1f}h"
-    return f"{value:.0f}m"
+        return f"{value / 60:.1f} h"
+    return f"{value:.0f} min"
 
 
-def pace_trend_figure(log: pd.DataFrame, roster: pd.DataFrame, recent_laps: int = 10) -> go.Figure:
-    clean = normalise_race_log(log, roster)
+def format_cap_remaining(value: Any) -> str:
+    if value is None or pd.isna(value):
+        return "Unlimited"
+    numeric = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    if pd.notna(numeric):
+        return str(int(numeric))
+    text = str(value).strip()
+    return text or "Unlimited"
+
+
+def pace_trend_figure(
+    log: pd.DataFrame,
+    roster: pd.DataFrame,
+    course: CourseSettings,
+    recent_laps: int = 10,
+) -> go.Figure:
+    clean = add_course_metric_columns(log, roster, course)
     completed = clean.dropna(subset=["lap_duration_minutes", "finish_minute"]).sort_values("lap_number").tail(recent_laps)
     completed = completed.copy()
     if completed.empty:
@@ -774,33 +930,37 @@ def pace_trend_figure(log: pd.DataFrame, roster: pd.DataFrame, recent_laps: int 
         axis=1,
     )
     completed["expected_mean"] = completed["runner"].astype(str).str.strip().map(mean_lookup)
+    completed["expected_pace"] = completed["expected_mean"].map(lambda value: lap_pace_min_per_km(value, course))
+    completed["pace_label"] = completed["pace_min_per_km"].map(format_pace_min_per_km)
+    completed["speed_label"] = completed["speed_kph"].map(format_speed_kph)
     fig = go.Figure()
     fig.add_trace(
         go.Bar(
             x=completed["lap_label"],
-            y=completed["lap_duration_minutes"],
+            y=completed["pace_min_per_km"],
             marker_color="#2f6f8f",
-            name="Actual lap",
-            hovertemplate="%{x}<br>%{y:.1f} min<extra></extra>",
+            name="Actual pace",
+            customdata=completed[["pace_label", "speed_label", "lap_duration_minutes"]],
+            hovertemplate="%{x}<br>%{customdata[0]}<br>%{customdata[1]}<br>%{customdata[2]:.1f} min lap<extra></extra>",
         )
     )
-    if completed["expected_mean"].notna().any():
+    if completed["expected_pace"].notna().any():
         fig.add_trace(
             go.Scatter(
                 x=completed["lap_label"],
-                y=completed["expected_mean"],
+                y=completed["expected_pace"],
                 mode="lines+markers",
-                name="Runner expected mean",
+                name="Runner expected pace",
                 line={"color": "#c47a00", "width": 2},
                 marker={"size": 7},
-                hovertemplate="%{y:.1f} min expected<extra></extra>",
+                hovertemplate="%{y:.2f} min/km expected<extra></extra>",
             )
         )
     fig.update_layout(
-        title=f"Recent lap pace, last {len(completed)}",
+        title=f"Recent pace per km, last {len(completed)}",
         height=315,
         margin={"l": 8, "r": 8, "t": 44, "b": 8},
-        yaxis_title="Minutes",
+        yaxis_title="Minutes per km",
         xaxis_title="",
         legend={"orientation": "h", "y": -0.22},
     )
@@ -833,7 +993,72 @@ def target_countdown_figure(state) -> go.Figure:
     return fig
 
 
-def runner_readiness_table(log: pd.DataFrame, roster: pd.DataFrame, caps_enabled: bool) -> pd.DataFrame:
+def distance_progress_figure(log: pd.DataFrame, roster: pd.DataFrame, settings: SimulationSettings, course: CourseSettings) -> go.Figure:
+    metrics = add_course_metric_columns(log, roster, course)
+    completed = metrics.dropna(subset=["finish_minute", "lap_duration_minutes"]).copy()
+    if completed.empty:
+        return go.Figure()
+    if "official" in completed:
+        completed = completed[completed["official"].fillna(False).astype(bool)].copy()
+    if completed.empty:
+        return go.Figure()
+
+    completed = completed.sort_values("finish_minute").reset_index(drop=True)
+    completed["official_laps_so_far"] = range(1, len(completed) + 1)
+    completed["distance_km_total"] = completed["official_laps_so_far"] * float(course.lap_distance_km)
+    completed["ascent_m_total"] = completed["official_laps_so_far"] * float(course.lap_ascent_m)
+    target_distance = float(settings.target_laps) * float(course.lap_distance_km)
+    target_ascent = float(settings.target_laps) * float(course.lap_ascent_m)
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=completed["finish_minute"],
+            y=completed["distance_km_total"],
+            mode="lines+markers",
+            name="Official distance",
+            line={"shape": "hv", "width": 3, "color": "#168251"},
+            customdata=completed[["runner", "lap_number", "ascent_m_total"]],
+            hovertemplate=(
+                "%{customdata[0]} lap %{customdata[1]:.0f}<br>"
+                "%{y:.1f} km logged<br>%{customdata[2]:.0f} m ascent<extra></extra>"
+            ),
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=[0, FINAL_CUTOFF_MINUTE],
+            y=[0, target_distance],
+            mode="lines",
+            name="Target distance pace",
+            line={"dash": "dash", "width": 2, "color": "#7a5c00"},
+            hovertemplate="%{y:.1f} km target pace<extra></extra>",
+        )
+    )
+    fig.add_hline(
+        y=target_distance,
+        line_dash="dot",
+        line_color="#64748b",
+        annotation_text=f"Target {format_distance_km(target_distance)} / {format_elevation_m(target_ascent)}",
+        annotation_position="top left",
+    )
+    fig.update_layout(
+        title="Official distance against target",
+        height=315,
+        margin={"l": 8, "r": 8, "t": 44, "b": 8},
+        yaxis_title="Official distance (km)",
+        legend={"orientation": "h", "y": -0.22},
+    )
+    apply_race_clock_axis(fig)
+    return fig
+
+
+def runner_readiness_table(
+    log: pd.DataFrame,
+    roster: pd.DataFrame,
+    caps_enabled: bool,
+    course: CourseSettings,
+) -> pd.DataFrame:
     status = build_runner_status_table(log, roster, caps_enabled=caps_enabled)
     if status.empty:
         return status
@@ -857,19 +1082,24 @@ def runner_readiness_table(log: pd.DataFrame, roster: pd.DataFrame, caps_enabled
 
     table = status.copy()
     table["readiness"] = table.apply(readiness, axis=1)
-    table["last_lap"] = table["last_lap_minutes"].map(lambda value: "-" if pd.isna(value) else f"{float(value):.1f}m")
-    table["rest"] = table["rest_minutes"].map(lambda value: "-" if pd.isna(value) else f"{float(value):.0f}m")
-    return table[["readiness", "runner", "completed_laps", "cap_remaining", "last_lap", "rest"]]
+    table["last_lap"] = table["last_lap_minutes"].map(lambda value: "-" if pd.isna(value) else f"{float(value):.1f} min")
+    table["last_pace"] = table["last_lap_minutes"].map(lambda value: format_pace_min_per_km(lap_pace_min_per_km(value, course)))
+    table["rest"] = table["rest_minutes"].map(lambda value: "-" if pd.isna(value) else f"{float(value):.0f} min")
+    table["distance"] = table["completed_laps"].map(lambda value: format_distance_km(float(value) * course.lap_distance_km))
+    table["ascent"] = table["completed_laps"].map(lambda value: format_elevation_m(float(value) * course.lap_ascent_m))
+    table["cap_remaining"] = table["cap_remaining"].map(format_cap_remaining)
+    return table[["readiness", "runner", "completed_laps", "distance", "ascent", "cap_remaining", "last_lap", "last_pace", "rest"]]
 
 
-def show_target_countdown_cards(state) -> None:
+def show_target_countdown_cards(state, course: CourseSettings) -> None:
     pace_needed = state.average_needed_to_start_target_lap or state.average_needed_to_target
+    pace_per_km = lap_pace_min_per_km(pace_needed, course) if pace_needed is not None else None
     cols = st.columns(4)
     cards = [
         ("Laps needed", str(state.remaining_to_target), "To hit the selected target"),
         ("To Sun 12:00", format_duration_short(LAST_START_MINUTE - float(state.elapsed_minute)), "Latest target-lap start cutoff"),
         ("To Sun 13:00", format_duration_short(FINAL_CUTOFF_MINUTE - float(state.elapsed_minute)), "Official finish cutoff"),
-        ("Required pace", f"{pace_needed:.1f}m" if pace_needed is not None else "-", "Average needed from now"),
+        ("Required pace", format_pace_min_per_km(pace_per_km), f"{pace_needed:.1f} min/lap from now" if pace_needed is not None else "Average needed from now"),
     ]
     for col, card in zip(cols, cards):
         with col:
@@ -974,6 +1204,50 @@ def make_settings() -> SimulationSettings:
     )
 
 
+def make_course_settings() -> CourseSettings:
+    st.sidebar.subheader("Course Metrics")
+    st.sidebar.caption(
+        "Metric defaults from Plotaroute route 3002404: "
+        f"{DEFAULT_LAP_DISTANCE_KM:.2f} km and {DEFAULT_LAP_ASCENT_M:.0f} m ascent/descent per lap."
+    )
+    lap_distance_km = st.sidebar.number_input(
+        "Lap distance (km)",
+        min_value=0.10,
+        max_value=50.0,
+        value=round(DEFAULT_LAP_DISTANCE_KM, 2),
+        step=0.01,
+        format="%.2f",
+        help="Override this on race day if the measured course is longer or shorter.",
+        key="course_lap_distance_km",
+    )
+    metric_cols = st.sidebar.columns(2)
+    lap_ascent_m = metric_cols[0].number_input(
+        "Ascent per lap (m)",
+        min_value=0.0,
+        max_value=2000.0,
+        value=round(DEFAULT_LAP_ASCENT_M, 0),
+        step=1.0,
+        format="%.0f",
+        key="course_lap_ascent_m",
+    )
+    lap_descent_m = metric_cols[1].number_input(
+        "Descent per lap (m)",
+        min_value=0.0,
+        max_value=2000.0,
+        value=round(DEFAULT_LAP_DESCENT_M, 0),
+        step=1.0,
+        format="%.0f",
+        key="course_lap_descent_m",
+    )
+    st.sidebar.markdown(f"[Route source]({DEFAULT_ROUTE_URL})")
+    return CourseSettings(
+        route_url=DEFAULT_ROUTE_URL,
+        lap_distance_km=float(lap_distance_km),
+        lap_ascent_m=float(lap_ascent_m),
+        lap_descent_m=float(lap_descent_m),
+    )
+
+
 def show_validation(loaded) -> None:
     st.subheader("Data Upload & Validation")
     st.dataframe(loaded.sheet_info, width="stretch", hide_index=True)
@@ -1025,7 +1299,11 @@ def show_last_year_analysis(loaded) -> None:
     st.plotly_chart(box, width="stretch")
 
 
-def show_result_metrics(summary: dict, comparison: pd.DataFrame | None = None) -> None:
+def show_result_metrics(
+    summary: dict,
+    comparison: pd.DataFrame | None = None,
+    course: CourseSettings | None = None,
+) -> None:
     row1 = st.columns(5)
     row1[0].metric("Expected laps", format_minutes(summary["expected_official_laps"]))
     row1[1].metric("Median", format_minutes(summary["median_official_laps"]))
@@ -1042,18 +1320,34 @@ def show_result_metrics(summary: dict, comparison: pd.DataFrame | None = None) -
 
     st.caption(f"Average final finish: {format_race_clock(summary['average_final_finish_minute'])}")
 
+    if course is not None:
+        expected_laps = float(summary["expected_official_laps"])
+        median_laps = float(summary["median_official_laps"])
+        target_laps = float(summary.get("target_laps", 0) or 0)
+        row3 = st.columns(4)
+        row3[0].metric("Expected distance", format_distance_km(expected_laps * course.lap_distance_km))
+        row3[1].metric("Expected climb", format_elevation_m(expected_laps * course.lap_ascent_m))
+        row3[2].metric("Median distance", format_distance_km(median_laps * course.lap_distance_km))
+        row3[3].metric("Target distance", format_distance_km(target_laps * course.lap_distance_km))
+
     if comparison is not None and not comparison.empty:
         capped = comparison.loc[comparison["scenario"] == "Caps enabled", "expected_official_laps"].iloc[0]
         uncapped = comparison.loc[comparison["scenario"] == "Caps disabled", "expected_official_laps"].iloc[0]
         st.info(f"Caps impact: {capped - uncapped:+.2f} expected laps versus the uncapped simulation.")
 
 
-def show_charts(sim_output: dict, summary_bundle: dict, uncapped_summary: dict | None, comparison: pd.DataFrame | None) -> None:
+def show_charts(
+    sim_output: dict,
+    summary_bundle: dict,
+    uncapped_summary: dict | None,
+    comparison: pd.DataFrame | None,
+    course: CourseSettings,
+) -> None:
     simulations = sim_output["simulations"]
     distribution = summary_bundle["final_lap_distribution"]
 
     st.subheader("Results Dashboard")
-    show_result_metrics(summary_bundle["summary"], comparison)
+    show_result_metrics(summary_bundle["summary"], comparison, course)
 
     c1, c2 = st.columns(2)
     with c1:
@@ -1201,13 +1495,26 @@ def show_charts(sim_output: dict, summary_bundle: dict, uncapped_summary: dict |
         st.dataframe(comparison, width="stretch", hide_index=True)
 
 
-def show_downloads(sim_output: dict, summary_bundle: dict, comparison: pd.DataFrame | None) -> None:
+def show_downloads(
+    sim_output: dict,
+    summary_bundle: dict,
+    comparison: pd.DataFrame | None,
+    course: CourseSettings,
+) -> None:
     st.subheader("Export Results")
     summary_df = pd.DataFrame([summary_bundle["summary"]])
+    summary_df["expected_distance_km"] = summary_df["expected_official_laps"] * float(course.lap_distance_km)
+    summary_df["expected_ascent_m"] = summary_df["expected_official_laps"] * float(course.lap_ascent_m)
+    summary_df["expected_descent_m"] = summary_df["expected_official_laps"] * float(course.lap_descent_m)
+    summary_df["target_distance_km"] = summary_df["target_laps"] * float(course.lap_distance_km)
+    summary_df["target_ascent_m"] = summary_df["target_laps"] * float(course.lap_ascent_m)
     simulation_export = add_clock_columns(
         sim_output["simulations"],
         ["final_elapsed_minute", "final_lap_start_minute", "final_lap_finish_minute"],
     )
+    simulation_export["final_distance_km"] = simulation_export["official_laps"] * float(course.lap_distance_km)
+    simulation_export["final_ascent_m"] = simulation_export["official_laps"] * float(course.lap_ascent_m)
+    simulation_export["final_descent_m"] = simulation_export["official_laps"] * float(course.lap_descent_m)
     st.download_button(
         "Download simulation rows CSV",
         simulation_export.to_csv(index=False),
@@ -1222,7 +1529,12 @@ def show_downloads(sim_output: dict, summary_bundle: dict, comparison: pd.DataFr
     )
     st.download_button(
         "Download runner expected laps CSV",
-        summary_bundle["expected_runner_laps"].to_csv(index=False),
+        summary_bundle["expected_runner_laps"]
+        .assign(
+            expected_distance_km=lambda df: df["expected_laps"] * float(course.lap_distance_km),
+            expected_ascent_m=lambda df: df["expected_laps"] * float(course.lap_ascent_m),
+        )
+        .to_csv(index=False),
         file_name="endure24_runner_expected_laps.csv",
         mime="text/csv",
     )
@@ -1246,8 +1558,13 @@ def get_streamlit_secret(*keys: str):
     return None
 
 
-def format_race_log_for_display(log: pd.DataFrame, roster: pd.DataFrame, caps_enabled: bool) -> pd.DataFrame:
-    display = normalise_race_log(log, roster)
+def format_race_log_for_display(
+    log: pd.DataFrame,
+    roster: pd.DataFrame,
+    caps_enabled: bool,
+    course: CourseSettings,
+) -> pd.DataFrame:
+    display = add_course_metric_columns(log, roster, course)
     display = add_clock_columns(display, ["start_minute", "finish_minute"])
     review = race_order_review(display, roster, caps_enabled=caps_enabled)
     if not review.empty:
@@ -1266,6 +1583,10 @@ def format_race_log_for_display(log: pd.DataFrame, roster: pd.DataFrame, caps_en
         axis=1,
     )
     display["lap_duration_minutes"] = pd.to_numeric(display["lap_duration_minutes"], errors="coerce").round(1)
+    display["distance_km"] = pd.to_numeric(display["distance_km"], errors="coerce").round(2)
+    display["ascent_m"] = pd.to_numeric(display["ascent_m"], errors="coerce").round(0)
+    display["pace"] = display["pace_min_per_km"].map(format_pace_min_per_km)
+    display["speed"] = display["speed_kph"].map(format_speed_kph)
     columns = [
         "lap_number",
         "runner",
@@ -1274,6 +1595,10 @@ def format_race_log_for_display(log: pd.DataFrame, roster: pd.DataFrame, caps_en
         "start_time",
         "finish_time",
         "lap_duration_minutes",
+        "distance_km",
+        "ascent_m",
+        "pace",
+        "speed",
         "notes",
     ]
     return display[[column for column in columns if column in display.columns]]
@@ -1332,6 +1657,7 @@ def show_race_control_dashboard(
     log: pd.DataFrame,
     roster: pd.DataFrame,
     settings: SimulationSettings,
+    course: CourseSettings,
     state,
     baseline_output: dict | None,
     live_output: dict | None,
@@ -1377,8 +1703,12 @@ def show_race_control_dashboard(
     last_lap_value = "-"
     last_lap_help = "No completed laps yet"
     if latest_completed is not None:
-        last_lap_value = f"{latest_completed['runner']} {float(latest_completed['lap_duration_minutes']):.1f}m"
-        last_lap_help = f"Finished {format_race_clock(latest_completed['finish_minute'])}"
+        lap_minutes = float(latest_completed["lap_duration_minutes"])
+        last_lap_value = f"{latest_completed['runner']} {format_pace_min_per_km(lap_pace_min_per_km(lap_minutes, course))}"
+        last_lap_help = (
+            f"{lap_minutes:.1f} min lap, {format_speed_kph(lap_speed_kph(lap_minutes, course))}, "
+            f"finished {format_race_clock(latest_completed['finish_minute'])}"
+        )
 
     runner_label = "Current" if state.current_lap_in_progress else "Fixed next"
     runner_value = state.in_progress_runner if state.current_lap_in_progress else (state.next_runner or "None")
@@ -1387,7 +1717,7 @@ def show_race_control_dashboard(
     recommended_next = queue_next_runner(fair_queue) or state.next_runner or "No eligible runner"
 
     pace_needed = state.average_needed_to_start_target_lap or state.average_needed_to_target
-    pace_value = f"{pace_needed:.1f}m" if pace_needed is not None else "Hit"
+    pace_value = f"{pace_needed:.1f} min/lap" if pace_needed is not None else "Hit"
     pace_help = (
         "Avg needed to start target lap by Sunday 12:00 BST"
         if state.average_needed_to_start_target_lap
@@ -1396,6 +1726,10 @@ def show_race_control_dashboard(
     if state.remaining_to_target <= 0:
         pace_help = "Target already logged"
 
+    metric_summary = race_metric_summary(log, roster, course)
+    projected_metrics = projected_distance_summary(live_summary, course)
+    pace_per_km = lap_pace_min_per_km(pace_needed, course) if pace_needed is not None else None
+
     cards = [
         ("Official laps", str(state.current_laps), f"Target {settings.target_laps}"),
         ("Target chance", format_probability(live_summary["probability_target_laps"]) if live_summary else "-", "Run forecast for live probability"),
@@ -1403,8 +1737,12 @@ def show_race_control_dashboard(
         (runner_label, runner_value, runner_help),
         ("Recommended next", recommended_next, "Fair live rotation"),
         ("Last lap", last_lap_value, last_lap_help),
-        ("Pace needed", pace_value, pace_help),
+        ("Pace needed", format_pace_min_per_km(pace_per_km) if pace_per_km is not None else pace_value, pace_help),
         ("Sheet", sheet_label, "Google sync state"),
+        ("Distance logged", format_distance_km(metric_summary["official_distance_km"]), "Official completed distance"),
+        ("Climb logged", format_elevation_m(metric_summary["official_ascent_m"]), "Official ascent; descent is similar"),
+        ("Avg pace", format_pace_min_per_km(metric_summary["average_pace_min_per_km"]), format_speed_kph(metric_summary["average_speed_kph"])),
+        ("Projected distance", format_distance_km(projected_metrics["projected_distance_km"]), "From actual-adjusted expected laps"),
     ]
     for row_start in range(0, len(cards), 4):
         cols = st.columns(4)
@@ -1418,8 +1756,8 @@ def show_race_control_dashboard(
         race_progress_figure(actual_progress, target_progress, baseline_output, live_output, state.elapsed_minute),
         width="stretch",
     )
-    show_race_day_visual_panels(log, roster, state, caps_enabled)
-    show_race_day_fun_zone(log, roster, settings, state, live_bundle)
+    show_race_day_visual_panels(log, roster, settings, course, state, caps_enabled)
+    show_race_day_fun_zone(log, roster, settings, course, state, live_bundle)
 
     with st.expander("Fixed-order queue and runner status", expanded=False):
         queue = build_runner_queue(log, roster, caps_enabled=caps_enabled, queue_size=5)
@@ -1462,14 +1800,16 @@ def show_race_control_dashboard(
 def show_race_day_visual_panels(
     log: pd.DataFrame,
     roster: pd.DataFrame,
+    settings: SimulationSettings,
+    course: CourseSettings,
     state,
     caps_enabled: bool,
 ) -> None:
     st.markdown("#### Live Visuals")
-    show_target_countdown_cards(state)
+    show_target_countdown_cards(state, course)
     left, right = st.columns([1.15, 0.85])
     with left:
-        pace_fig = pace_trend_figure(log, roster, recent_laps=10)
+        pace_fig = pace_trend_figure(log, roster, course, recent_laps=10)
         if pace_fig.data:
             st.plotly_chart(pace_fig, width="stretch")
         else:
@@ -1477,7 +1817,13 @@ def show_race_day_visual_panels(
     with right:
         st.plotly_chart(target_countdown_figure(state), width="stretch")
 
-    readiness = runner_readiness_table(log, roster, caps_enabled)
+    distance_fig = distance_progress_figure(log, roster, settings, course)
+    if distance_fig.data:
+        st.plotly_chart(distance_fig, width="stretch")
+    else:
+        st.info("Distance and climb chart appears after the first completed official lap.")
+
+    readiness = runner_readiness_table(log, roster, caps_enabled, course)
     if readiness.empty:
         st.info("Runner readiness appears once the roster is available.")
     else:
@@ -1489,8 +1835,11 @@ def show_race_day_visual_panels(
                 "readiness": "Readiness",
                 "runner": "Runner",
                 "completed_laps": st.column_config.NumberColumn("Laps", format="%d"),
+                "distance": "Distance",
+                "ascent": "Climb",
                 "cap_remaining": "Cap left",
                 "last_lap": "Last",
+                "last_pace": "Pace",
                 "rest": "Rest",
             },
         )
@@ -1560,7 +1909,12 @@ def target_status_summary(state, live_bundle: dict | None) -> tuple[str, str, fl
     return "At risk", f"{probability:.0%} chance of target laps.", probability
 
 
-def fastest_recent_lap_summary(completed: pd.DataFrame, roster: pd.DataFrame, recent_laps: int = 8) -> dict[str, Any]:
+def fastest_recent_lap_summary(
+    completed: pd.DataFrame,
+    roster: pd.DataFrame,
+    course: CourseSettings,
+    recent_laps: int = 8,
+) -> dict[str, Any]:
     if completed.empty:
         return {"value": "-", "help": "No completed official laps yet.", "pace_bonus": 0.0}
 
@@ -1572,12 +1926,14 @@ def fastest_recent_lap_summary(completed: pd.DataFrame, roster: pd.DataFrame, re
     mean_lookup = runner_mean_lookup(roster)
     expected = mean_lookup.get(runner)
     pace_bonus = 0.0
-    help_text = f"Lap {lap_number}, fastest of last {len(recent)} official lap(s)."
+    pace_text = format_pace_min_per_km(lap_pace_min_per_km(duration, course))
+    speed_text = format_speed_kph(lap_speed_kph(duration, course))
+    help_text = f"Lap {lap_number}, fastest of last {len(recent)} official lap(s), {pace_text}, {speed_text}."
     if expected is not None and not pd.isna(expected):
         pace_bonus = max(0.0, min(5.0, float(expected) - duration))
         help_text += f" {float(expected) - duration:+.1f} min vs expected."
     return {
-        "value": f"{runner} {duration:.1f}m",
+        "value": f"{runner} {pace_text}",
         "help": help_text,
         "pace_bonus": pace_bonus,
     }
@@ -1682,6 +2038,7 @@ def best_fun_note_summary(
 def team_morale_summary(
     log: pd.DataFrame,
     roster: pd.DataFrame,
+    course: CourseSettings,
     state,
     live_bundle: dict | None,
     drinks_table: pd.DataFrame,
@@ -1694,7 +2051,7 @@ def team_morale_summary(
     team_sleep = float(pd.to_numeric(sleep_summary.get("hours", pd.Series(dtype=float)), errors="coerce").fillna(0).sum())
     drinks_total = int(pd.to_numeric(drinks_table.get("count", pd.Series(dtype=float)), errors="coerce").fillna(0).sum())
     settled_predictions = len(prediction_leaderboard_table(predictions))
-    fastest_recent = fastest_recent_lap_summary(completed, roster)
+    fastest_recent = fastest_recent_lap_summary(completed, roster, course)
     fun_note = best_fun_note_summary(log, roster, drinks_table, sleep_summary, predictions)
 
     score = 35.0
@@ -1926,6 +2283,7 @@ def show_race_day_fun_zone(
     log: pd.DataFrame,
     roster: pd.DataFrame,
     settings: SimulationSettings,
+    course: CourseSettings,
     state,
     live_bundle: dict | None,
 ) -> None:
@@ -1935,7 +2293,7 @@ def show_race_day_fun_zone(
     sleep_log = sleep_state_log(roster)
     sleep_summary = sleep_summary_table(sleep_log, roster)
     predictions = prediction_state_table(roster, log)
-    morale = team_morale_summary(log, roster, state, live_bundle, drinks_table, sleep_summary, predictions)
+    morale = team_morale_summary(log, roster, course, state, live_bundle, drinks_table, sleep_summary, predictions)
 
     cards = [
         ("Morale score", f"{morale['score']}/100", f"{morale['label']}: {morale['help']}"),
@@ -2081,6 +2439,7 @@ def show_race_day_readiness(
     live_bundle: dict | None,
     roster: pd.DataFrame,
     settings: SimulationSettings,
+    course: CourseSettings,
     log: pd.DataFrame,
     caps_enabled: bool,
 ) -> None:
@@ -2094,14 +2453,22 @@ def show_race_day_readiness(
     else:
         log_state = "Clean"
     forecast_state = "Live" if live_bundle else "Run forecast"
+    metric_summary = race_metric_summary(log, roster, course)
+    course_state = f"{format_distance_km(course.lap_distance_km)} / {format_elevation_m(course.lap_ascent_m)}"
 
     with st.container(border=True):
         st.markdown("#### Race-Day Checklist")
-        cols = st.columns(4)
+        cols = st.columns(5)
         cols[0].metric("Google Sheet", sheet_state)
         cols[1].metric("Auto reload", live_state)
         cols[2].metric("Race log", log_state)
         cols[3].metric("Forecast", forecast_state)
+        cols[4].metric("Course", course_state, help="Lap distance and climb from the sidebar override.")
+        st.caption(
+            f"Official work so far: {format_distance_km(metric_summary['official_distance_km'])}, "
+            f"{format_elevation_m(metric_summary['official_ascent_m'])} climbed, "
+            f"average {format_pace_min_per_km(metric_summary['average_pace_min_per_km'])}."
+        )
 
         action_cols = st.columns([1, 2])
         forecast_disabled = bool(errors)
@@ -2124,6 +2491,7 @@ def show_race_day_readiness(
 def show_lap_handover_strip(
     log: pd.DataFrame,
     roster: pd.DataFrame,
+    course: CourseSettings,
     state,
     caps_enabled: bool,
 ) -> None:
@@ -2132,8 +2500,9 @@ def show_lap_handover_strip(
         last_value = "None logged"
         last_help = "Use Add Race Entry when the first lap comes in."
     else:
-        last_value = f"{latest_completed['runner']} {float(latest_completed['lap_duration_minutes']):.1f}m"
-        last_help = f"Finished {format_race_clock(latest_completed['finish_minute'])}"
+        lap_minutes = float(latest_completed["lap_duration_minutes"])
+        last_value = f"{latest_completed['runner']} {format_pace_min_per_km(lap_pace_min_per_km(lap_minutes, course))}"
+        last_help = f"{lap_minutes:.1f} min, {format_speed_kph(lap_speed_kph(lap_minutes, course))}, finished {format_race_clock(latest_completed['finish_minute'])}"
 
     if state.current_lap_in_progress:
         on_course_value = str(state.in_progress_runner or "-")
@@ -2155,7 +2524,7 @@ def show_lap_handover_strip(
         ("Last completed", last_value, last_help),
         ("On course", on_course_value, on_course_help),
         ("Recommended next", recommended_next, "Used as the default runner below."),
-        ("Logger action", action_value, action_help),
+        ("Lap route", format_distance_km(course.lap_distance_km), f"{format_elevation_m(course.lap_ascent_m)} climb per lap"),
     ]
     for col, card in zip(cols, cards):
         with col:
@@ -2166,6 +2535,7 @@ def build_team_brief(
     log: pd.DataFrame,
     roster: pd.DataFrame,
     settings: SimulationSettings,
+    course: CourseSettings,
     state,
     live_bundle: dict | None,
     warnings: list[str],
@@ -2177,6 +2547,7 @@ def build_team_brief(
     fair_queue = build_live_fair_queue(log, roster, caps_enabled=caps_enabled, queue_size=1)
     recommended_next = queue_next_runner(fair_queue) or state.next_runner or "No eligible runner"
     live_summary = live_bundle["summary"] if live_bundle else None
+    metric_summary = race_metric_summary(log, roster, course)
 
     if errors:
         status = f"Fix now: {len(errors)} issue(s)"
@@ -2196,9 +2567,12 @@ def build_team_brief(
     if latest_completed is None:
         last_line = "Last lap: none logged"
     else:
+        last_minutes = float(latest_completed["lap_duration_minutes"])
         last_line = (
             f"Last lap: {latest_completed['runner']} "
-            f"{float(latest_completed['lap_duration_minutes']):.1f}m, "
+            f"{last_minutes:.1f} min, "
+            f"{format_pace_min_per_km(lap_pace_min_per_km(last_minutes, course))}, "
+            f"{format_speed_kph(lap_speed_kph(last_minutes, course))}, "
             f"finished {format_race_clock(latest_completed['finish_minute'])}"
         )
 
@@ -2217,7 +2591,20 @@ def build_team_brief(
     elif pace_needed is None:
         pace_line = "Pace needed: not available"
     else:
-        pace_line = f"Pace needed: {pace_needed:.1f} min/lap"
+        pace_line = (
+            f"Pace needed: {pace_needed:.1f} min/lap "
+            f"({format_pace_min_per_km(lap_pace_min_per_km(pace_needed, course))})"
+        )
+
+    distance_line = (
+        f"Distance/climb: {format_distance_km(metric_summary['official_distance_km'])} official, "
+        f"{format_elevation_m(metric_summary['official_ascent_m'])} climbed, "
+        f"{format_pace_min_per_km(metric_summary['average_pace_min_per_km'])} average pace"
+    )
+    route_line = (
+        f"Course: {format_distance_km(course.lap_distance_km)} per lap, "
+        f"{format_elevation_m(course.lap_ascent_m)} ascent / {format_elevation_m(course.lap_descent_m)} descent"
+    )
 
     sheet_line = (
         "Sheet: "
@@ -2233,8 +2620,10 @@ def build_team_brief(
             runner_line,
             f"Recommended next: {recommended_next}",
             last_line,
+            distance_line,
             forecast_line,
             pace_line,
+            route_line,
             sheet_line,
         ]
     )
@@ -2244,6 +2633,7 @@ def show_team_brief(
     log: pd.DataFrame,
     roster: pd.DataFrame,
     settings: SimulationSettings,
+    course: CourseSettings,
     state,
     live_bundle: dict | None,
     warnings: list[str],
@@ -2251,7 +2641,7 @@ def show_team_brief(
     caps_enabled: bool,
     sync: Mapping[str, Any],
 ) -> None:
-    brief = build_team_brief(log, roster, settings, state, live_bundle, warnings, errors, caps_enabled, sync)
+    brief = build_team_brief(log, roster, settings, course, state, live_bundle, warnings, errors, caps_enabled, sync)
     with st.container(border=True):
         st.markdown("#### Team Brief")
         st.code(brief, language="text")
@@ -2312,8 +2702,10 @@ def latest_completed_lap(log: pd.DataFrame, roster: pd.DataFrame) -> dict | None
 
 def format_runner_queue_for_display(queue: pd.DataFrame) -> pd.DataFrame:
     display = queue.copy()
-    display["last_lap"] = display["last_lap_minutes"].map(lambda value: "-" if pd.isna(value) else f"{float(value):.1f}m")
-    display["rest"] = display["rest_minutes"].map(lambda value: "-" if pd.isna(value) else f"{float(value):.0f}m")
+    display["last_lap"] = display["last_lap_minutes"].map(lambda value: "-" if pd.isna(value) else f"{float(value):.1f} min")
+    display["rest"] = display["rest_minutes"].map(lambda value: "-" if pd.isna(value) else f"{float(value):.0f} min")
+    if "cap_remaining" in display:
+        display["cap_remaining"] = display["cap_remaining"].map(format_cap_remaining)
     columns = ["role", "runner", "completed_laps", "cap_remaining", "last_lap", "rest", "order_status", "reason"]
     return display[[column for column in columns if column in display.columns]]
 
@@ -2877,7 +3269,12 @@ def update_race_day_forecast(
     return baseline_bundle, live_bundle
 
 
-def show_race_day(roster: pd.DataFrame, settings: SimulationSettings, caps_enabled: bool) -> None:
+def show_race_day(
+    roster: pd.DataFrame,
+    settings: SimulationSettings,
+    course: CourseSettings,
+    caps_enabled: bool,
+) -> None:
     st.subheader("Race Day")
     if st.session_state.get("race_day_notice"):
         st.success(st.session_state.pop("race_day_notice"))
@@ -2899,6 +3296,7 @@ def show_race_day(roster: pd.DataFrame, settings: SimulationSettings, caps_enabl
         log,
         roster,
         settings,
+        course,
         state,
         baseline_output,
         live_output,
@@ -2909,19 +3307,19 @@ def show_race_day(roster: pd.DataFrame, settings: SimulationSettings, caps_enabl
         race_sync,
     )
     show_race_day_plan_assistant(log, roster, settings, state, caps_enabled)
-    show_race_day_readiness(race_sync, warnings, errors, live_bundle, roster, settings, log, caps_enabled)
+    show_race_day_readiness(race_sync, warnings, errors, live_bundle, roster, settings, course, log, caps_enabled)
     show_race_day_sync_status(race_sync)
     show_race_day_alerts(warnings, errors)
-    show_team_brief(log, roster, settings, state, live_bundle, warnings, errors, caps_enabled, race_sync)
+    show_team_brief(log, roster, settings, course, state, live_bundle, warnings, errors, caps_enabled, race_sync)
 
     st.markdown("### Lap Desk")
-    show_lap_handover_strip(log, roster, state, caps_enabled)
+    show_lap_handover_strip(log, roster, course, state, caps_enabled)
     c1, c2 = st.columns([1, 1])
     with c1:
         log = show_race_log_entry(log, roster, caps_enabled, race_sync)
     with c2:
         st.markdown("#### Latest Laps")
-        display_log = format_race_log_for_display(log, roster, caps_enabled)
+        display_log = format_race_log_for_display(log, roster, caps_enabled, course)
         if display_log.empty:
             st.info("No race laps logged yet.")
         else:
@@ -2937,6 +3335,10 @@ def show_race_day(roster: pd.DataFrame, settings: SimulationSettings, caps_enabl
                     "start_time": "Start",
                     "finish_time": "Finish",
                     "lap_duration_minutes": st.column_config.NumberColumn("Mins", format="%.1f"),
+                    "distance_km": st.column_config.NumberColumn("km", format="%.2f"),
+                    "ascent_m": st.column_config.NumberColumn("Climb m", format="%.0f"),
+                    "pace": "Pace",
+                    "speed": "Speed",
                     "notes": "Notes",
                 },
             )
@@ -2992,19 +3394,57 @@ def show_race_day(roster: pd.DataFrame, settings: SimulationSettings, caps_enabl
     st.session_state["race_log"] = normalise_race_log(log, roster)
 
 
-def show_exports_tab(sim_output: dict | None, summary_bundle: dict | None, comparison: pd.DataFrame | None) -> None:
+def show_exports_tab(
+    sim_output: dict | None,
+    summary_bundle: dict | None,
+    comparison: pd.DataFrame | None,
+    course: CourseSettings,
+) -> None:
     if sim_output is None or summary_bundle is None:
         st.info("Run a forecast first to enable simulation exports.")
     else:
-        show_downloads(sim_output, summary_bundle, comparison)
+        show_downloads(sim_output, summary_bundle, comparison, course)
 
     if "race_log" in st.session_state:
+        raw_log = normalise_race_log(st.session_state["race_log"], pd.DataFrame({"runner": []}))
         st.download_button(
             "Download current race log CSV",
-            normalise_race_log(st.session_state["race_log"], pd.DataFrame({"runner": []})).to_csv(index=False),
+            raw_log.to_csv(index=False),
             file_name="endure24_current_race_log.csv",
             mime="text/csv",
         )
+        metric_log = raw_log.copy()
+        completed = metric_log["lap_duration_minutes"].notna() & metric_log["finish_minute"].notna()
+        metric_log["distance_km"] = completed.astype(float) * float(course.lap_distance_km)
+        metric_log["ascent_m"] = completed.astype(float) * float(course.lap_ascent_m)
+        metric_log["descent_m"] = completed.astype(float) * float(course.lap_descent_m)
+        metric_log["pace_min_per_km"] = metric_log["lap_duration_minutes"].map(lambda value: lap_pace_min_per_km(value, course))
+        metric_log["pace"] = metric_log["pace_min_per_km"].map(format_pace_min_per_km)
+        metric_log["speed_kph"] = metric_log["lap_duration_minutes"].map(lambda value: lap_speed_kph(value, course))
+        metric_log["speed"] = metric_log["speed_kph"].map(format_speed_kph)
+        st.download_button(
+            "Download metric race log CSV",
+            metric_log.to_csv(index=False),
+            file_name="endure24_current_race_log_metric.csv",
+            mime="text/csv",
+        )
+
+    course_df = pd.DataFrame(
+        [
+            {
+                "route_url": course.route_url,
+                "lap_distance_km": round(float(course.lap_distance_km), 3),
+                "lap_ascent_m": round(float(course.lap_ascent_m), 1),
+                "lap_descent_m": round(float(course.lap_descent_m), 1),
+            }
+        ]
+    )
+    st.download_button(
+        "Download course settings CSV",
+        course_df.to_csv(index=False),
+        file_name="endure24_course_settings_metric.csv",
+        mime="text/csv",
+    )
 
 
 def split_order(order: str) -> list[str]:
@@ -5252,6 +5692,7 @@ def main() -> None:
 
     loaded = load_data_cached(workbook_bytes, source_label, ASSUMPTION_VERSION)
     settings = make_settings()
+    course = make_course_settings()
     st.sidebar.subheader("Race Rules")
     caps_enabled = st.sidebar.checkbox("Apply max-lap caps", value=True)
 
@@ -5262,6 +5703,14 @@ def main() -> None:
     with setup_tab:
         show_validation(loaded)
         show_last_year_analysis(loaded)
+
+        st.subheader("Course Metrics")
+        st.caption("These drive Race Day distance, pace, speed, and climb calculations. Override them in the sidebar on race day.")
+        metric_cols = st.columns(4)
+        metric_cols[0].metric("Lap distance", format_distance_km(course.lap_distance_km))
+        metric_cols[1].metric("Lap ascent", format_elevation_m(course.lap_ascent_m))
+        metric_cols[2].metric("Lap descent", format_elevation_m(course.lap_descent_m))
+        metric_cols[3].markdown(f"[Route source]({course.route_url})")
 
         st.subheader("This Year Assumptions")
         st.info(
@@ -5331,6 +5780,7 @@ def main() -> None:
                 st.session_state["summary_bundle"],
                 st.session_state.get("uncapped_summary"),
                 st.session_state.get("comparison"),
+                course,
             )
         else:
             st.info("Run the Monte Carlo forecast to populate the dashboard.")
@@ -5339,7 +5789,7 @@ def main() -> None:
         show_optimizer(roster, settings)
 
     with race_day_tab:
-        show_race_day(roster, settings, caps_enabled=caps_enabled)
+        show_race_day(roster, settings, course, caps_enabled=caps_enabled)
 
     with drinks_tab:
         show_drinks_tab(roster)
@@ -5359,6 +5809,7 @@ def main() -> None:
             st.session_state.get("sim_output"),
             st.session_state.get("summary_bundle"),
             st.session_state.get("comparison"),
+            course,
         )
 
 
