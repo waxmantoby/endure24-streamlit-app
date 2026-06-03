@@ -25,6 +25,7 @@ import race_day as race_day_module
 race_day_module = importlib.reload(race_day_module)
 from race_day import (
     GOOGLE_SHEET_TEMPLATE_COLUMNS,
+    RACE_LOG_COLUMNS,
     append_manual_lap,
     build_progress_actuals,
     build_live_fair_queue,
@@ -156,6 +157,41 @@ def inject_app_styles() -> None:
             font-size: 0.82rem;
             margin-top: 0.25rem;
         }
+        .status-strip {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.45rem;
+            margin: 0.25rem 0 0.8rem 0;
+        }
+        .status-chip {
+            border: 1px solid #d7dde5;
+            border-radius: 999px;
+            padding: 0.28rem 0.62rem;
+            font-size: 0.82rem;
+            font-weight: 650;
+            background: #ffffff;
+            color: #243244;
+        }
+        .status-chip-good {
+            border-color: #9ed6b9;
+            background: #edf9f2;
+            color: #135d3b;
+        }
+        .status-chip-watch {
+            border-color: #f0cc7b;
+            background: #fff8e6;
+            color: #765000;
+        }
+        .status-chip-risk {
+            border-color: #f2aaa6;
+            background: #fff0ef;
+            color: #8d2822;
+        }
+        .status-chip-muted {
+            border-color: #d7dde5;
+            background: #f8fafc;
+            color: #516173;
+        }
         @media (max-width: 760px) {
             .block-container {
                 padding-left: 0.75rem;
@@ -277,6 +313,163 @@ def handle_sheet_load_error(prefix: str, label: str, exc: Exception, live_reload
         )
     else:
         st.error(f"Could not load {label}: {exc}")
+
+
+def is_google_quota_error(exc: Exception) -> bool:
+    message = str(exc)
+    return "429" in message or "Quota exceeded" in message
+
+
+def stable_table_digest(table: pd.DataFrame, columns: list[str] | None = None) -> str:
+    clean = table.copy() if isinstance(table, pd.DataFrame) else pd.DataFrame()
+    if columns is not None:
+        for column in columns:
+            if column not in clean:
+                clean[column] = ""
+        clean = clean[columns]
+    clean = clean.fillna("").astype(str)
+    return hashlib.sha256(clean.to_csv(index=False).encode("utf-8")).hexdigest()
+
+
+def mark_sheet_loaded(prefix: str, digest: str, loaded_at: str) -> None:
+    st.session_state[f"{prefix}_last_loaded_digest"] = digest
+    st.session_state[f"{prefix}_last_known_sheet_digest"] = digest
+    st.session_state[f"{prefix}_last_loaded_at"] = loaded_at
+    st.session_state.pop(f"{prefix}_sheet_conflict", None)
+    st.session_state.pop(f"{prefix}_pending_df", None)
+    st.session_state.pop(f"{prefix}_pending_digest", None)
+
+
+def mark_sheet_saved(prefix: str, digest: str, saved_at: str) -> None:
+    st.session_state[f"{prefix}_last_saved_digest"] = digest
+    st.session_state[f"{prefix}_last_known_sheet_digest"] = digest
+    st.session_state[f"{prefix}_last_saved_at"] = saved_at
+    st.session_state[f"{prefix}_save_status"] = "saved"
+    st.session_state.pop(f"{prefix}_sheet_conflict", None)
+    st.session_state.pop(f"{prefix}_pending_df", None)
+    st.session_state.pop(f"{prefix}_pending_digest", None)
+
+
+def mark_sheet_pending(prefix: str, pending: pd.DataFrame, digest: str, reason: str, status: str = "conflict") -> None:
+    st.session_state[f"{prefix}_pending_df"] = pending.copy()
+    st.session_state[f"{prefix}_pending_digest"] = digest
+    st.session_state[f"{prefix}_sheet_conflict"] = reason
+    st.session_state[f"{prefix}_save_status"] = status
+
+
+def sheet_save_status(prefix: str) -> str:
+    return str(st.session_state.get(f"{prefix}_save_status", ""))
+
+
+def worksheet_freshness_label(prefix: str, current_digest: str, configured: bool) -> tuple[str, str]:
+    if sheet_cooldown_remaining_seconds(prefix) > 0:
+        return "risk", "Quota pause"
+    if st.session_state.get(f"{prefix}_sheet_conflict"):
+        return "risk", "Conflict"
+    if st.session_state.get(f"{prefix}_pending_df") is not None:
+        return "watch", "Pending save"
+    if not configured:
+        return "muted", "Local only"
+    known_digest = st.session_state.get(f"{prefix}_last_known_sheet_digest")
+    if known_digest and known_digest == current_digest:
+        return "good", "Fresh"
+    return "watch", "Stale"
+
+
+def render_status_chips(chips: list[tuple[str, str, str]]) -> None:
+    parts = []
+    for label, level, value in chips:
+        css_level = level if level in {"good", "watch", "risk", "muted"} else "muted"
+        parts.append(
+            f'<span class="status-chip status-chip-{css_level}">'
+            f"{html.escape(label)}: {html.escape(value)}</span>"
+        )
+    st.markdown(f'<div class="status-strip">{"".join(parts)}</div>', unsafe_allow_html=True)
+
+
+def conflict_safe_write_allowed(
+    prefix: str,
+    label: str,
+    pending: pd.DataFrame,
+    pending_digest: str,
+    read_remote,
+    remote_digest,
+    configured: bool,
+    force: bool,
+    live_reload_key: str,
+    safe_baseline_digest: str | None = None,
+) -> bool:
+    if not configured or force:
+        return True
+
+    try:
+        remote = read_remote()
+        remote_current_digest = remote_digest(remote)
+    except Exception as exc:
+        if is_google_quota_error(exc):
+            st.session_state[f"{prefix}_sheet_cooldown_until"] = current_epoch_seconds() + SHEET_API_COOLDOWN_SECONDS
+            st.session_state[live_reload_key] = False
+            mark_sheet_pending(
+                prefix,
+                pending,
+                pending_digest,
+                f"{label} was kept locally because Google Sheets quota was hit before saving.",
+                status="quota",
+            )
+            return False
+        raise
+
+    expected_digest = (
+        st.session_state.get(f"{prefix}_last_known_sheet_digest")
+        or st.session_state.get(f"{prefix}_last_loaded_digest")
+        or st.session_state.get(f"{prefix}_last_saved_digest")
+    )
+    st.session_state[f"{prefix}_last_checked_digest"] = remote_current_digest
+    if remote_current_digest == pending_digest:
+        st.session_state[f"{prefix}_last_known_sheet_digest"] = remote_current_digest
+        return True
+    if expected_digest is None and safe_baseline_digest and remote_current_digest == safe_baseline_digest:
+        st.session_state[f"{prefix}_last_known_sheet_digest"] = remote_current_digest
+        return True
+    if expected_digest is None or remote_current_digest != expected_digest:
+        mark_sheet_pending(
+            prefix,
+            pending,
+            pending_digest,
+            f"{label} changed in Google Sheets since this app last loaded it.",
+            status="conflict",
+        )
+        st.session_state[f"{prefix}_last_known_sheet_digest"] = remote_current_digest
+        return False
+    return True
+
+
+def show_sheet_conflict_actions(prefix: str, label: str, csv_filename: str) -> tuple[bool, bool]:
+    pending = st.session_state.get(f"{prefix}_pending_df")
+    reason = st.session_state.get(f"{prefix}_sheet_conflict")
+    if pending is None and not reason:
+        return False, False
+
+    if reason:
+        st.warning(
+            f"{label}: {reason} Load the Sheet to accept the shared version, or Force Save Mine to overwrite it."
+        )
+    else:
+        st.warning(f"{label}: local changes are pending.")
+
+    action_cols = st.columns(3)
+    load_requested = action_cols[0].button("Load Sheet", key=f"{prefix}_conflict_load", width="stretch")
+    force_requested = action_cols[1].button("Force Save Mine", key=f"{prefix}_conflict_force", width="stretch")
+    csv = pending.to_csv(index=False) if isinstance(pending, pd.DataFrame) else ""
+    action_cols[2].download_button(
+        "Download Pending CSV",
+        csv,
+        file_name=csv_filename,
+        mime="text/csv",
+        key=f"{prefix}_pending_download",
+        width="stretch",
+    )
+    return load_requested, force_requested
 
 
 def format_race_clock(minute: float | int | None) -> str:
@@ -444,8 +637,20 @@ def race_progress_figure(
 
     if elapsed_minute > 0:
         fig.add_vline(x=float(elapsed_minute), line_color="#64748b", line_dash="solid", opacity=0.45)
-    fig.add_vline(x=LAST_START_MINUTE, line_dash="dash", line_color="#c03535")
-    fig.add_vline(x=FINAL_CUTOFF_MINUTE, line_dash="dot", line_color="#c03535")
+    fig.add_vline(
+        x=LAST_START_MINUTE,
+        line_dash="dash",
+        line_color="#c03535",
+        annotation_text="Sun 12 start cutoff",
+        annotation_position="top left",
+    )
+    fig.add_vline(
+        x=FINAL_CUTOFF_MINUTE,
+        line_dash="dot",
+        line_color="#c03535",
+        annotation_text="Sun 13 finish cutoff",
+        annotation_position="top right",
+    )
 
     max_laps = float(target_progress["completed_laps"].max()) if not target_progress.empty else 0.0
     for source in [actual_progress, _path_quantiles_or_empty(baseline_output), _path_quantiles_or_empty(live_output)]:
@@ -454,8 +659,8 @@ def race_progress_figure(
                 if column in source:
                     max_laps = max(max_laps, float(pd.to_numeric(source[column], errors="coerce").max()))
     fig.update_layout(
-        title="Progress vs plan",
-        height=390,
+        title="Official laps vs target plan",
+        height=360,
         margin={"l": 8, "r": 8, "t": 46, "b": 8},
         legend={"orientation": "h", "y": -0.18},
         yaxis_title="Official laps",
@@ -510,6 +715,134 @@ def _path_quantiles_or_empty(sim_output: dict | None) -> pd.DataFrame:
     if not isinstance(quantiles, pd.DataFrame):
         return pd.DataFrame()
     return quantiles
+
+
+def format_duration_short(minutes: float | int | None) -> str:
+    if minutes is None or pd.isna(minutes):
+        return "-"
+    value = max(0.0, float(minutes))
+    if value >= 90:
+        return f"{value / 60:.1f}h"
+    return f"{value:.0f}m"
+
+
+def pace_trend_figure(log: pd.DataFrame, roster: pd.DataFrame, recent_laps: int = 10) -> go.Figure:
+    clean = normalise_race_log(log, roster)
+    completed = clean.dropna(subset=["lap_duration_minutes", "finish_minute"]).sort_values("lap_number").tail(recent_laps)
+    completed = completed.copy()
+    if completed.empty:
+        return go.Figure()
+
+    pace_lookup = roster.copy()
+    pace_lookup["runner"] = pace_lookup["runner"].astype(str).str.strip()
+    pace_lookup["projected_mean_minutes"] = pd.to_numeric(pace_lookup["projected_mean_minutes"], errors="coerce")
+    mean_lookup = pace_lookup.drop_duplicates("runner").set_index("runner")["projected_mean_minutes"].to_dict()
+
+    completed["lap_label"] = completed.apply(
+        lambda row: f"Lap {int(row['lap_number'])}<br>{html.escape(str(row['runner']))}",
+        axis=1,
+    )
+    completed["expected_mean"] = completed["runner"].astype(str).str.strip().map(mean_lookup)
+    fig = go.Figure()
+    fig.add_trace(
+        go.Bar(
+            x=completed["lap_label"],
+            y=completed["lap_duration_minutes"],
+            marker_color="#2f6f8f",
+            name="Actual lap",
+            hovertemplate="%{x}<br>%{y:.1f} min<extra></extra>",
+        )
+    )
+    if completed["expected_mean"].notna().any():
+        fig.add_trace(
+            go.Scatter(
+                x=completed["lap_label"],
+                y=completed["expected_mean"],
+                mode="lines+markers",
+                name="Runner expected mean",
+                line={"color": "#c47a00", "width": 2},
+                marker={"size": 7},
+                hovertemplate="%{y:.1f} min expected<extra></extra>",
+            )
+        )
+    fig.update_layout(
+        title=f"Recent lap pace, last {len(completed)}",
+        height=315,
+        margin={"l": 8, "r": 8, "t": 44, "b": 8},
+        yaxis_title="Minutes",
+        xaxis_title="",
+        legend={"orientation": "h", "y": -0.22},
+    )
+    return fig
+
+
+def target_countdown_figure(state) -> go.Figure:
+    countdown = pd.DataFrame(
+        [
+            {"cutoff": "Start cutoff", "minutes_left": max(0.0, LAST_START_MINUTE - float(state.elapsed_minute))},
+            {"cutoff": "Finish cutoff", "minutes_left": max(0.0, FINAL_CUTOFF_MINUTE - float(state.elapsed_minute))},
+        ]
+    )
+    fig = px.bar(
+        countdown,
+        x="minutes_left",
+        y="cutoff",
+        orientation="h",
+        text=countdown["minutes_left"].map(format_duration_short),
+        color="cutoff",
+        title="Cutoff countdown",
+    )
+    fig.update_layout(
+        height=250,
+        margin={"l": 8, "r": 8, "t": 44, "b": 8},
+        xaxis_title="Minutes left",
+        yaxis_title="",
+        showlegend=False,
+    )
+    return fig
+
+
+def runner_readiness_table(log: pd.DataFrame, roster: pd.DataFrame, caps_enabled: bool) -> pd.DataFrame:
+    status = build_runner_status_table(log, roster, caps_enabled=caps_enabled)
+    if status.empty:
+        return status
+
+    def readiness(row: pd.Series) -> str:
+        if str(row.get("role", "")) == "Running":
+            return "On course"
+        cap_remaining = row.get("cap_remaining")
+        cap_value = pd.to_numeric(pd.Series([cap_remaining]), errors="coerce").iloc[0]
+        if pd.notna(cap_value) and int(cap_value) <= 0:
+            return "Capped"
+        rest = row.get("rest_minutes")
+        if pd.isna(rest):
+            return "Fresh"
+        rest = float(rest)
+        if rest >= 120:
+            return "Ready"
+        if rest >= 60:
+            return "Soon"
+        return "Just ran"
+
+    table = status.copy()
+    table["readiness"] = table.apply(readiness, axis=1)
+    table["last_lap"] = table["last_lap_minutes"].map(lambda value: "-" if pd.isna(value) else f"{float(value):.1f}m")
+    table["rest"] = table["rest_minutes"].map(lambda value: "-" if pd.isna(value) else f"{float(value):.0f}m")
+    return table[["readiness", "runner", "completed_laps", "cap_remaining", "last_lap", "rest"]]
+
+
+def show_target_countdown_cards(state) -> None:
+    pace_needed = state.average_needed_to_start_target_lap or state.average_needed_to_target
+    cols = st.columns(4)
+    cards = [
+        ("Laps needed", str(state.remaining_to_target), "To hit the selected target"),
+        ("To Sun 12:00", format_duration_short(LAST_START_MINUTE - float(state.elapsed_minute)), "Latest target-lap start cutoff"),
+        ("To Sun 13:00", format_duration_short(FINAL_CUTOFF_MINUTE - float(state.elapsed_minute)), "Official finish cutoff"),
+        ("Required pace", f"{pace_needed:.1f}m" if pace_needed is not None else "-", "Average needed from now"),
+    ]
+    for col, card in zip(cols, cards):
+        with col:
+            race_mini_card(*card)
 
 
 def edited_roster_table(roster: pd.DataFrame) -> pd.DataFrame:
@@ -917,7 +1250,7 @@ def format_race_log_for_display(log: pd.DataFrame, roster: pd.DataFrame, caps_en
 
 def race_log_digest(log: pd.DataFrame) -> str:
     clean = log.copy()
-    return hashlib.sha256(clean.to_csv(index=False).encode("utf-8")).hexdigest()
+    return stable_table_digest(clean, RACE_LOG_COLUMNS)
 
 
 def set_race_log(log: pd.DataFrame, roster: pd.DataFrame) -> pd.DataFrame:
@@ -975,6 +1308,7 @@ def show_race_control_dashboard(
     warnings: list[str],
     errors: list[str],
     caps_enabled: bool,
+    sync: Mapping[str, Any],
 ) -> None:
     live_summary = live_bundle["summary"] if live_bundle else None
     status_level, status_title, status_body = race_day_status_summary(state, live_summary, warnings, errors)
@@ -990,6 +1324,24 @@ def show_race_control_dashboard(
         unsafe_allow_html=True,
     )
 
+    clean_log = normalise_race_log(log, roster)
+    race_log_level = "risk" if errors else ("watch" if warnings else "good")
+    race_log_label = "Fix now" if errors else ("Watch" if warnings else "Clean")
+    forecast_level = "good" if live_bundle and not st.session_state.get("race_log_changed") and not errors else "watch"
+    forecast_label = "Fresh" if forecast_level == "good" else "Stale"
+    sheet_level, sheet_label = worksheet_freshness_label(
+        "race_day",
+        race_log_digest(clean_log),
+        bool(sync.get("configured")),
+    )
+    render_status_chips(
+        [
+            ("Race log", race_log_level, race_log_label),
+            ("Forecast", forecast_level, forecast_label),
+            ("Sheet sync", sheet_level, sheet_label),
+        ]
+    )
+
     latest_completed = latest_completed_lap(log, roster)
     last_lap_value = "-"
     last_lap_help = "No completed laps yet"
@@ -997,9 +1349,11 @@ def show_race_control_dashboard(
         last_lap_value = f"{latest_completed['runner']} {float(latest_completed['lap_duration_minutes']):.1f}m"
         last_lap_help = f"Finished {format_race_clock(latest_completed['finish_minute'])}"
 
-    runner_label = "Current" if state.current_lap_in_progress else "Next"
-    runner_value = state.next_runner or "None"
-    runner_help = "On course now" if state.current_lap_in_progress else "Fixed planned order"
+    runner_label = "Current" if state.current_lap_in_progress else "Fixed next"
+    runner_value = state.in_progress_runner if state.current_lap_in_progress else (state.next_runner or "None")
+    runner_help = "On course now" if state.current_lap_in_progress else "Pre-race order continuation"
+    fair_queue = build_live_fair_queue(log, roster, caps_enabled=caps_enabled, queue_size=1)
+    recommended_next = queue_next_runner(fair_queue) or state.next_runner or "No eligible runner"
 
     pace_needed = state.average_needed_to_start_target_lap or state.average_needed_to_target
     pace_value = f"{pace_needed:.1f}m" if pace_needed is not None else "Hit"
@@ -1016,12 +1370,14 @@ def show_race_control_dashboard(
         ("Target chance", format_probability(live_summary["probability_target_laps"]) if live_summary else "-", "Run forecast for live probability"),
         ("Projected final", format_minutes(live_summary["expected_official_laps"]) if live_summary else "-", "Actual-adjusted forecast"),
         (runner_label, runner_value, runner_help),
+        ("Recommended next", recommended_next, "Fair live rotation"),
         ("Last lap", last_lap_value, last_lap_help),
         ("Pace needed", pace_value, pace_help),
+        ("Sheet", sheet_label, "Google sync state"),
     ]
-    for row_start in range(0, len(cards), 3):
-        cols = st.columns(3)
-        for col, card in zip(cols, cards[row_start : row_start + 3]):
+    for row_start in range(0, len(cards), 4):
+        cols = st.columns(4)
+        for col, card in zip(cols, cards[row_start : row_start + 4]):
             with col:
                 race_mini_card(*card)
 
@@ -1031,6 +1387,7 @@ def show_race_control_dashboard(
         race_progress_figure(actual_progress, target_progress, baseline_output, live_output, state.elapsed_minute),
         width="stretch",
     )
+    show_race_day_visual_panels(log, roster, state, caps_enabled)
 
     with st.expander("Fixed-order queue and runner status", expanded=False):
         queue = build_runner_queue(log, roster, caps_enabled=caps_enabled, queue_size=5)
@@ -1061,6 +1418,43 @@ def show_race_control_dashboard(
             hide_index=True,
             column_config={
                 "role": "Status",
+                "runner": "Runner",
+                "completed_laps": st.column_config.NumberColumn("Laps", format="%d"),
+                "cap_remaining": "Cap left",
+                "last_lap": "Last",
+                "rest": "Rest",
+            },
+        )
+
+
+def show_race_day_visual_panels(
+    log: pd.DataFrame,
+    roster: pd.DataFrame,
+    state,
+    caps_enabled: bool,
+) -> None:
+    st.markdown("#### Live Visuals")
+    show_target_countdown_cards(state)
+    left, right = st.columns([1.15, 0.85])
+    with left:
+        pace_fig = pace_trend_figure(log, roster, recent_laps=10)
+        if pace_fig.data:
+            st.plotly_chart(pace_fig, width="stretch")
+        else:
+            st.info("Pace trend appears after the first completed lap.")
+    with right:
+        st.plotly_chart(target_countdown_figure(state), width="stretch")
+
+    readiness = runner_readiness_table(log, roster, caps_enabled)
+    if readiness.empty:
+        st.info("Runner readiness appears once the roster is available.")
+    else:
+        st.dataframe(
+            readiness,
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "readiness": "Readiness",
                 "runner": "Runner",
                 "completed_laps": st.column_config.NumberColumn("Laps", format="%d"),
                 "cap_remaining": "Cap left",
@@ -1501,13 +1895,36 @@ def save_race_log_live(
     caps_enabled: bool,
     sync: Mapping[str, Any],
     notice: str | None = None,
+    force: bool = False,
 ) -> pd.DataFrame:
     warnings, errors = validate_race_log(log, roster, caps_enabled=caps_enabled)
     if errors:
         raise ValueError("; ".join(errors[:3]))
 
     clean = set_race_log(log, roster)
+    digest = race_log_digest(clean)
     if sync.get("configured"):
+        allowed = conflict_safe_write_allowed(
+            prefix="race_day",
+            label="Race log",
+            pending=clean,
+            pending_digest=digest,
+            read_remote=lambda: read_race_log_from_google_sheet(
+                st.secrets,
+                sheet_id=sync.get("sheet_id") or None,
+                worksheet_name=str(sync.get("worksheet_name") or "race_log"),
+            ),
+            remote_digest=lambda remote: race_log_digest(normalise_race_log(remote, roster)),
+            configured=bool(sync.get("configured")),
+            force=force,
+            live_reload_key="race_day_live_sheet_enabled",
+            safe_baseline_digest=race_log_digest(empty_race_log()),
+        )
+        if not allowed:
+            st.session_state["race_day_notice"] = (
+                "Race log kept locally. Resolve the Sheet conflict in Live Sheet controls before normal saves continue."
+            )
+            return clean
         write_race_log_to_google_sheet(
             clean,
             st.secrets,
@@ -1516,8 +1933,10 @@ def save_race_log_live(
         )
         saved_at = now_bst_label()
         st.session_state["race_day_sheet_last_saved"] = saved_at
+        mark_sheet_saved("race_day", digest, saved_at)
         st.session_state["race_day_notice"] = notice or f"Race log saved to Google Sheet at {saved_at}."
     else:
+        st.session_state["race_day_save_status"] = "local"
         st.session_state["race_day_notice"] = "Race log saved locally. Google Sheets write access is not configured."
     if warnings:
         st.session_state["race_day_warnings_after_save"] = warnings
@@ -1576,6 +1995,36 @@ def show_google_sheet_controls(
         else:
             action_cols[2].warning("Save disabled until secrets are set.")
 
+        conflict_load, conflict_force = show_sheet_conflict_actions(
+            "race_day",
+            "Race log Sheet",
+            "endure24_pending_race_log.csv",
+        )
+        load_now = load_now or conflict_load
+        if conflict_force:
+            pending = st.session_state.get("race_day_pending_df")
+            try:
+                log = save_race_log_live(
+                    pending if isinstance(pending, pd.DataFrame) else log,
+                    roster,
+                    caps_enabled,
+                    sync,
+                    "Race log force-saved to the Sheet.",
+                    force=True,
+                )
+                if sheet_save_status("race_day") == "saved":
+                    st.success("Race log force-saved to the Sheet.")
+                    st.rerun()
+            except ValueError:
+                warnings, errors = validate_race_log(
+                    pending if isinstance(pending, pd.DataFrame) else log,
+                    roster,
+                    caps_enabled=caps_enabled,
+                )
+                show_race_day_alerts(warnings, errors)
+            except Exception as exc:
+                st.error(f"Could not force-save the Sheet: {exc}")
+
         should_load_sheet = should_load_sheet_now("race_day", load_now, live_reload, int(refresh_seconds))
         if should_load_sheet:
             try:
@@ -1594,6 +2043,7 @@ def show_google_sheet_controls(
                     log = set_race_log(loaded, roster)
                     loaded_at = now_bst_label()
                     st.session_state["editable_google_sheet_last_loaded"] = loaded_at
+                    mark_sheet_loaded("race_day", race_log_digest(log), loaded_at)
                     if st.session_state.get("race_log_changed"):
                         st.session_state["race_day_notice"] = f"Race log loaded at {loaded_at}."
                         st.rerun()
@@ -1611,7 +2061,10 @@ def show_google_sheet_controls(
         if save_now:
             try:
                 log = save_race_log_live(log, roster, caps_enabled, sync, "Race log saved to the Sheet.")
-                st.success("Race log saved to the Sheet.")
+                if sheet_save_status("race_day") == "saved":
+                    st.success("Race log saved to the Sheet.")
+                elif sheet_save_status("race_day") in {"conflict", "quota"}:
+                    st.warning("Race log kept locally. Resolve the Sheet warning above before normal saves continue.")
                 if st.session_state.get("race_day_warnings_after_save"):
                     show_race_day_alerts(st.session_state.pop("race_day_warnings_after_save"), [])
             except ValueError:
@@ -1795,8 +2248,7 @@ def show_race_log_entry(
             height=120,
             placeholder="runner,start_time,finish_time,lap_duration_minutes,notes\nToby,Sat 12:00 BST,Sat 12:41 BST,41,clean lap",
         )
-        paste_col_1, paste_col_2 = st.columns(2)
-        if paste_col_1.button("Append pasted rows", width="stretch"):
+        if st.button("Append pasted rows", width="stretch"):
             try:
                 pasted_log = parse_pasted_laps(pasted, roster)
                 if not pasted_log.empty:
@@ -1815,20 +2267,26 @@ def show_race_log_entry(
             except Exception as exc:
                 st.error(f"Could not import pasted rows: {exc}")
 
-        if paste_col_2.button("Replace with pasted table", width="stretch"):
-            try:
-                candidate = parse_pasted_laps(pasted, roster)
-                warnings, errors = validate_race_log(candidate, roster, caps_enabled=caps_enabled)
-                if errors:
-                    show_race_day_alerts(warnings, errors)
-                else:
-                    try:
-                        log = save_race_log_live(candidate, roster, caps_enabled, sync, "Race log replaced and saved.")
-                        st.rerun()
-                    except Exception as exc:
-                        st.error(f"Pasted table was valid, but could not save to the Sheet: {exc}")
-            except Exception as exc:
-                st.error(f"Could not import pasted table: {exc}")
+        with st.expander("Replace full race log", expanded=False):
+            st.warning("This replaces every logged lap with the pasted table.")
+            confirm_replace = st.checkbox(
+                "I understand this will replace the current race log",
+                key="race_replace_confirm",
+            )
+            if st.button("Replace with pasted table", width="stretch", disabled=not confirm_replace):
+                try:
+                    candidate = parse_pasted_laps(pasted, roster)
+                    warnings, errors = validate_race_log(candidate, roster, caps_enabled=caps_enabled)
+                    if errors:
+                        show_race_day_alerts(warnings, errors)
+                    else:
+                        try:
+                            log = save_race_log_live(candidate, roster, caps_enabled, sync, "Race log replaced and saved.")
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(f"Pasted table was valid, but could not save to the Sheet: {exc}")
+                except Exception as exc:
+                    st.error(f"Could not import pasted table: {exc}")
 
     return log
 
@@ -1883,12 +2341,15 @@ def show_race_log_backup(
             except Exception as exc:
                 st.error(f"Could not save undo to the Sheet: {exc}")
 
-    if st.button("Clear race log"):
-        try:
-            log = save_race_log_live(empty_race_log(), roster, caps_enabled, sync, "Race log cleared and saved.")
-            st.rerun()
-        except Exception as exc:
-            st.error(f"Could not clear and save the race log: {exc}")
+    with st.expander("Danger zone", expanded=False):
+        st.warning("Clearing the race log removes every lap from the app and, after save, from the Sheet.")
+        confirm_clear = st.checkbox("I understand this will clear the full race log", key="race_clear_confirm")
+        if st.button("Clear race log", disabled=not confirm_clear, width="stretch"):
+            try:
+                log = save_race_log_live(empty_race_log(), roster, caps_enabled, sync, "Race log cleared and saved.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Could not clear and save the race log: {exc}")
     return log
 
 
@@ -1942,6 +2403,7 @@ def show_race_day(roster: pd.DataFrame, settings: SimulationSettings, caps_enabl
         warnings,
         errors,
         caps_enabled,
+        race_sync,
     )
     show_race_day_plan_assistant(log, roster, settings, state, caps_enabled)
     show_race_day_readiness(race_sync, warnings, errors, live_bundle, roster, settings, log, caps_enabled)
@@ -2672,7 +3134,7 @@ def drinks_sheet_payload(table: pd.DataFrame) -> pd.DataFrame:
 
 
 def drinks_digest(table: pd.DataFrame) -> str:
-    return hashlib.sha256(table[["runner", "count", "notes"]].to_csv(index=False).encode("utf-8")).hexdigest()
+    return stable_table_digest(table, ["runner", "count", "notes"])
 
 
 def drinks_sheet_context() -> dict[str, Any]:
@@ -2690,10 +3152,42 @@ def drinks_sheet_context() -> dict[str, Any]:
     }
 
 
-def save_drinks_live(table: pd.DataFrame, sync: Mapping[str, Any], notice: str | None = None) -> pd.DataFrame:
+def save_drinks_live(
+    table: pd.DataFrame,
+    sync: Mapping[str, Any],
+    notice: str | None = None,
+    force: bool = False,
+) -> pd.DataFrame:
     clean = set_drinks_state(table)
+    digest = drinks_digest(clean)
     if not sync.get("configured"):
+        st.session_state["drinks_save_status"] = "local"
         st.session_state["drinks_sheet_notice"] = "Saved locally. Google Sheets is not configured."
+        return clean
+
+    roster = st.session_state.get("current_roster_for_drinks")
+    if not isinstance(roster, pd.DataFrame) or roster.empty:
+        roster = pd.DataFrame({"runner": clean["runner"].astype(str).tolist(), "running_order": list(range(1, len(clean) + 1))})
+    allowed = conflict_safe_write_allowed(
+        prefix="drinks",
+        label="Drinks",
+        pending=clean,
+        pending_digest=digest,
+        read_remote=lambda: read_drinks_from_google_sheet(
+            st.secrets,
+            sheet_id=sync.get("sheet_id") or None,
+            worksheet_name=str(sync.get("worksheet_name") or "drinks"),
+        ),
+        remote_digest=lambda remote: drinks_digest(normalise_drinks_table(remote, roster)),
+        configured=bool(sync.get("configured")),
+        force=force,
+        live_reload_key="drinks_live_sheet_enabled",
+        safe_baseline_digest=drinks_digest(normalise_drinks_table(pd.DataFrame(), roster)),
+    )
+    if not allowed:
+        st.session_state["drinks_sheet_notice"] = (
+            "Drink changes kept locally. Resolve the Sheet conflict before normal saves continue."
+        )
         return clean
 
     write_drinks_to_google_sheet(
@@ -2704,6 +3198,7 @@ def save_drinks_live(table: pd.DataFrame, sync: Mapping[str, Any], notice: str |
     )
     saved_at = now_bst_label()
     st.session_state["drinks_sheet_last_saved"] = saved_at
+    mark_sheet_saved("drinks", digest, saved_at)
     st.session_state["drinks_sheet_notice"] = notice or f"Drinks saved to Google Sheet at {saved_at}."
     return clean
 
@@ -2756,6 +3251,27 @@ def show_drinks_sheet_controls(table: pd.DataFrame, roster: pd.DataFrame) -> tup
         else:
             action_cols[2].warning("Save disabled until secrets are set.")
 
+        conflict_load, conflict_force = show_sheet_conflict_actions(
+            "drinks",
+            "Drinks Sheet",
+            "endure24_pending_drinks.csv",
+        )
+        load_now = load_now or conflict_load
+        if conflict_force:
+            pending = st.session_state.get("drinks_pending_df")
+            try:
+                table = save_drinks_live(
+                    pending if isinstance(pending, pd.DataFrame) else table,
+                    sync,
+                    "Drinks force-saved to Google Sheet.",
+                    force=True,
+                )
+                if sheet_save_status("drinks") == "saved":
+                    st.success("Drinks force-saved to Google Sheet.")
+                    st.rerun()
+            except Exception as exc:
+                st.error(f"Could not force-save drinks worksheet: {exc}")
+
         if should_load_sheet_now("drinks", load_now, live_reload, int(refresh_seconds)) and configured:
             try:
                 loaded = read_drinks_from_google_sheet(
@@ -2767,6 +3283,7 @@ def show_drinks_sheet_controls(table: pd.DataFrame, roster: pd.DataFrame) -> tup
                 table = set_drinks_state(loaded)
                 loaded_at = now_bst_label()
                 st.session_state["drinks_sheet_last_loaded"] = loaded_at
+                mark_sheet_loaded("drinks", drinks_digest(table), loaded_at)
                 if drinks_digest(table) != before:
                     st.success(f"Drinks loaded at {loaded_at}.")
                 else:
@@ -2784,7 +3301,10 @@ def show_drinks_sheet_controls(table: pd.DataFrame, roster: pd.DataFrame) -> tup
         if save_now and configured:
             try:
                 table = save_drinks_live(table, sync, "Drinks saved to Google Sheet.")
-                st.success("Drinks saved to Google Sheet.")
+                if sheet_save_status("drinks") == "saved":
+                    st.success("Drinks saved to Google Sheet.")
+                elif sheet_save_status("drinks") in {"conflict", "quota"}:
+                    st.warning("Drink changes kept locally. Resolve the Sheet warning above before normal saves continue.")
             except Exception as exc:
                 st.error(f"Could not save drinks worksheet: {exc}")
 
@@ -2861,7 +3381,7 @@ def show_drinks_tab(roster: pd.DataFrame) -> None:
             st.session_state["drinks_sheet_notice"] = f"Updated locally, but could not save to Sheet: {exc}"
         st.rerun()
 
-    action_cols = st.columns(3)
+    action_cols = st.columns(2)
     if action_cols[0].button(
         "Force save to Sheet",
         type="primary",
@@ -2869,27 +3389,31 @@ def show_drinks_tab(roster: pd.DataFrame) -> None:
         disabled=not drinks_sync.get("configured"),
     ):
         try:
-            saved = save_drinks_live(edited, drinks_sync, "Drinks forced saved to Google Sheet.")
+            saved = save_drinks_live(edited, drinks_sync, "Drinks forced saved to Google Sheet.", force=True)
             st.success(f"Saved {int(saved['count'].sum())} total logged items.")
         except Exception as exc:
             st.error(f"Could not save drinks worksheet: {exc}")
-    if action_cols[1].button("Reset drinks", width="stretch"):
-        reset = table.copy()
-        reset["count"] = 0
-        reset["notes"] = ""
-        try:
-            save_drinks_live(reset, drinks_sync, "Drinks reset and saved to Google Sheet.")
-        except Exception as exc:
-            set_drinks_state(reset)
-            st.session_state["drinks_sheet_notice"] = f"Reset locally, but could not save to Sheet: {exc}"
-        st.rerun()
-    action_cols[2].download_button(
+    action_cols[1].download_button(
         "Download drinks CSV",
         drinks_state_table(roster).to_csv(index=False),
         file_name="endure24_drinks_tracker.csv",
         mime="text/csv",
         width="stretch",
     )
+
+    with st.expander("Danger zone", expanded=False):
+        st.warning("Resetting drinks sets every count to zero and saves that reset to the Sheet.")
+        confirm_reset = st.checkbox("I understand this will reset all drinks counts", key="drinks_reset_confirm")
+        if st.button("Reset drinks", width="stretch", disabled=not confirm_reset):
+            reset = table.copy()
+            reset["count"] = 0
+            reset["notes"] = ""
+            try:
+                save_drinks_live(reset, drinks_sync, "Drinks reset and saved to Google Sheet.")
+            except Exception as exc:
+                set_drinks_state(reset)
+                st.session_state["drinks_sheet_notice"] = f"Reset locally, but could not save to Sheet: {exc}"
+            st.rerun()
 
     st.markdown("#### Silly Graphs")
     chart_table = drinks_state_table(roster)
@@ -3194,10 +3718,42 @@ def sleep_sheet_context() -> dict[str, Any]:
     }
 
 
-def save_sleep_live(table: pd.DataFrame, sync: Mapping[str, Any], notice: str | None = None) -> pd.DataFrame:
+def save_sleep_live(
+    table: pd.DataFrame,
+    sync: Mapping[str, Any],
+    notice: str | None = None,
+    force: bool = False,
+) -> pd.DataFrame:
     clean = set_sleep_state(table)
+    digest = sleep_digest(clean)
     if not sync.get("configured"):
+        st.session_state["sleep_save_status"] = "local"
         st.session_state["sleep_sheet_notice"] = "Saved locally. Google Sheets is not configured."
+        return clean
+
+    roster = st.session_state.get("current_roster_for_sleep")
+    if not isinstance(roster, pd.DataFrame) or roster.empty:
+        roster = pd.DataFrame({"runner": clean["runner"].astype(str).tolist(), "running_order": list(range(1, len(clean) + 1))})
+    allowed = conflict_safe_write_allowed(
+        prefix="sleep",
+        label="Sleep",
+        pending=clean,
+        pending_digest=digest,
+        read_remote=lambda: read_sleep_from_google_sheet(
+            st.secrets,
+            sheet_id=sync.get("sheet_id") or None,
+            worksheet_name=str(sync.get("worksheet_name") or "sleep"),
+        ),
+        remote_digest=lambda remote: sleep_digest(normalise_sleep_log(remote, roster)),
+        configured=bool(sync.get("configured")),
+        force=force,
+        live_reload_key="sleep_live_sheet_enabled",
+        safe_baseline_digest=sleep_digest(normalise_sleep_log(pd.DataFrame(), roster)),
+    )
+    if not allowed:
+        st.session_state["sleep_sheet_notice"] = (
+            "Sleep changes kept locally. Resolve the Sheet conflict before normal saves continue."
+        )
         return clean
 
     write_sleep_to_google_sheet(
@@ -3208,6 +3764,7 @@ def save_sleep_live(table: pd.DataFrame, sync: Mapping[str, Any], notice: str | 
     )
     saved_at = now_bst_label()
     st.session_state["sleep_sheet_last_saved"] = saved_at
+    mark_sheet_saved("sleep", digest, saved_at)
     st.session_state["sleep_sheet_notice"] = notice or f"Sleep saved to Google Sheet at {saved_at}."
     return clean
 
@@ -3261,6 +3818,27 @@ def show_sleep_sheet_controls(log: pd.DataFrame, roster: pd.DataFrame) -> tuple[
         else:
             action_cols[2].warning("Save disabled until secrets are set.")
 
+        conflict_load, conflict_force = show_sheet_conflict_actions(
+            "sleep",
+            "Sleep Sheet",
+            "endure24_pending_sleep.csv",
+        )
+        load_now = load_now or conflict_load
+        if conflict_force:
+            pending = st.session_state.get("sleep_pending_df")
+            try:
+                log = save_sleep_live(
+                    pending if isinstance(pending, pd.DataFrame) else log,
+                    sync,
+                    "Sleep log force-saved to Google Sheet.",
+                    force=True,
+                )
+                if sheet_save_status("sleep") == "saved":
+                    st.success("Sleep log force-saved to Google Sheet.")
+                    st.rerun()
+            except Exception as exc:
+                st.error(f"Could not force-save sleep worksheet: {exc}")
+
         if should_load_sheet_now("sleep", load_now, live_reload, int(refresh_seconds)) and configured:
             try:
                 loaded = read_sleep_from_google_sheet(
@@ -3272,6 +3850,7 @@ def show_sleep_sheet_controls(log: pd.DataFrame, roster: pd.DataFrame) -> tuple[
                 log = set_sleep_state(loaded)
                 loaded_at = now_bst_label()
                 st.session_state["sleep_sheet_last_loaded"] = loaded_at
+                mark_sheet_loaded("sleep", sleep_digest(log), loaded_at)
                 if sleep_digest(log) != before:
                     st.success(f"Sleep loaded at {loaded_at}.")
                 else:
@@ -3289,7 +3868,10 @@ def show_sleep_sheet_controls(log: pd.DataFrame, roster: pd.DataFrame) -> tuple[
         if save_now and configured:
             try:
                 log = save_sleep_live(log, sync, "Sleep saved to Google Sheet.")
-                st.success("Sleep saved to Google Sheet.")
+                if sheet_save_status("sleep") == "saved":
+                    st.success("Sleep saved to Google Sheet.")
+                elif sheet_save_status("sleep") in {"conflict", "quota"}:
+                    st.warning("Sleep changes kept locally. Resolve the Sheet warning above before normal saves continue.")
             except Exception as exc:
                 st.error(f"Could not save sleep worksheet: {exc}")
 
@@ -3382,7 +3964,7 @@ def show_sleep_tab(roster: pd.DataFrame) -> None:
             st.session_state["sleep_sheet_notice"] = f"Updated locally, but could not save to Sheet: {exc}"
         st.rerun()
 
-    action_cols = st.columns(3)
+    action_cols = st.columns(2)
     if action_cols[0].button(
         "Force save to Sheet",
         type="primary",
@@ -3391,19 +3973,11 @@ def show_sleep_tab(roster: pd.DataFrame) -> None:
         key="sleep_force_save_button",
     ):
         try:
-            saved = save_sleep_live(edited_clean, sleep_sync, "Sleep log forced saved to Google Sheet.")
+            saved = save_sleep_live(edited_clean, sleep_sync, "Sleep log forced saved to Google Sheet.", force=True)
             st.success(f"Saved {len(saved)} sleep log entries.")
         except Exception as exc:
             st.error(f"Could not save sleep worksheet: {exc}")
-    if action_cols[1].button("Clear sleep log", width="stretch", key="sleep_reset_button"):
-        reset = pd.DataFrame(columns=SLEEP_SHEET_COLUMNS)
-        try:
-            save_sleep_live(reset, sleep_sync, "Sleep log cleared and saved to Google Sheet.")
-        except Exception as exc:
-            set_sleep_state(reset)
-            st.session_state["sleep_sheet_notice"] = f"Cleared locally, but could not save to Sheet: {exc}"
-        st.rerun()
-    action_cols[2].download_button(
+    action_cols[1].download_button(
         "Download sleep log CSV",
         sleep_state_log(roster).to_csv(index=False),
         file_name="endure24_sleep_log.csv",
@@ -3411,6 +3985,18 @@ def show_sleep_tab(roster: pd.DataFrame) -> None:
         width="stretch",
         key="sleep_download_csv",
     )
+
+    with st.expander("Danger zone", expanded=False):
+        st.warning("Clearing sleep removes every logged sleep block and saves that clear to the Sheet.")
+        confirm_clear_sleep = st.checkbox("I understand this will clear the full sleep log", key="sleep_clear_confirm")
+        if st.button("Clear sleep log", width="stretch", key="sleep_reset_button", disabled=not confirm_clear_sleep):
+            reset = pd.DataFrame(columns=SLEEP_SHEET_COLUMNS)
+            try:
+                save_sleep_live(reset, sleep_sync, "Sleep log cleared and saved to Google Sheet.")
+            except Exception as exc:
+                set_sleep_state(reset)
+                st.session_state["sleep_sheet_notice"] = f"Cleared locally, but could not save to Sheet: {exc}"
+            st.rerun()
 
     st.markdown("#### Sleep Graphs")
     chart_table = sleep_summary_table(log, roster)
