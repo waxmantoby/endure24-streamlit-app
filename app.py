@@ -68,6 +68,9 @@ EVENT_LONGITUDE = -1.16803
 WEATHER_CACHE_SECONDS = 30 * 60
 WEATHER_STALE_FALLBACK_SECONDS = 12 * 60 * 60
 WEATHER_CACHE_PATH = Path(__file__).with_name(".weather_cache") / "open_meteo_forecast.json"
+WEATHER_USER_AGENT = "BrokenRunnersRaceControl/1.0 github.com/waxmantoby/endure24-streamlit-app"
+OPEN_METEO_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+MET_NORWAY_FORECAST_URL = "https://api.met.no/weatherapi/locationforecast/2.0/complete"
 DEFAULT_EDITABLE_GOOGLE_SHEET_URL = (
     "https://docs.google.com/spreadsheets/d/1dKvzME6TL4EJ8u_f0-l2p7ZENBwj7TUZLt0cW0T7QHo/edit?usp=sharing"
 )
@@ -741,6 +744,80 @@ def weather_code_label(code: Any) -> str:
     return labels.get(int(numeric), f"Code {int(numeric)}")
 
 
+WEATHER_NUMERIC_COLUMNS = [
+    "temperature_2m",
+    "apparent_temperature",
+    "relative_humidity_2m",
+    "precipitation_probability",
+    "precipitation",
+    "weather_code",
+    "wind_speed_10m",
+    "wind_gusts_10m",
+]
+
+
+def clean_weather_frame(forecast: pd.DataFrame, timezone: str = RACE_TIMEZONE) -> pd.DataFrame:
+    if forecast.empty or "time" not in forecast:
+        return pd.DataFrame()
+    clean = forecast.copy()
+    clean["time"] = pd.to_datetime(clean["time"], errors="coerce")
+    if clean["time"].dt.tz is None:
+        clean["time"] = clean["time"].dt.tz_localize(timezone, nonexistent="shift_forward", ambiguous="NaT")
+    else:
+        clean["time"] = clean["time"].dt.tz_convert(timezone)
+    clean = clean.dropna(subset=["time"]).copy()
+    for column in WEATHER_NUMERIC_COLUMNS:
+        if column in clean:
+            clean[column] = pd.to_numeric(clean[column], errors="coerce")
+        else:
+            clean[column] = pd.NA
+    if "condition" not in clean:
+        clean["condition"] = clean["weather_code"].map(weather_code_label)
+    clean["condition"] = clean["condition"].fillna("-").astype(str)
+    return clean[["time", *WEATHER_NUMERIC_COLUMNS, "condition"]].sort_values("time").reset_index(drop=True)
+
+
+def met_no_symbol_label(symbol_code: Any) -> str:
+    symbol = str(symbol_code or "").lower().replace("_", " ").strip()
+    if not symbol:
+        return "-"
+    if "thunder" in symbol:
+        return "Thunderstorm"
+    if "heavyrain" in symbol or "heavy rain" in symbol:
+        return "Heavy rain"
+    if "rainshowers" in symbol or "rain showers" in symbol:
+        return "Rain showers"
+    if "lightrain" in symbol or "light rain" in symbol:
+        return "Light rain"
+    if "rain" in symbol:
+        return "Rain"
+    if "snow" in symbol or "sleet" in symbol:
+        return "Snow"
+    if "fog" in symbol:
+        return "Fog"
+    if "cloudy" in symbol and "partly" in symbol:
+        return "Partly cloudy"
+    if "cloudy" in symbol:
+        return "Cloudy"
+    if "fair" in symbol or "clearsky" in symbol or "clear sky" in symbol:
+        return "Clear"
+    return symbol.title()
+
+
+def met_no_rain_probability(symbol_code: Any, precipitation: Any) -> float:
+    amount = pd.to_numeric(pd.Series([precipitation]), errors="coerce").iloc[0]
+    symbol = str(symbol_code or "").lower()
+    if pd.notna(amount) and float(amount) >= 1.0:
+        return 85.0
+    if pd.notna(amount) and float(amount) > 0:
+        return 65.0
+    if "rain" in symbol or "sleet" in symbol or "snow" in symbol:
+        return 55.0
+    if "cloudy" in symbol:
+        return 20.0
+    return 5.0
+
+
 @st.cache_data(ttl=WEATHER_CACHE_SECONDS, show_spinner=False)
 def fetch_open_meteo_forecast(latitude: float, longitude: float, timezone: str) -> tuple[pd.DataFrame, str]:
     params = {
@@ -764,30 +841,57 @@ def fetch_open_meteo_forecast(latitude: float, longitude: float, timezone: str) 
         "wind_speed_unit": "kmh",
         "precipitation_unit": "mm",
     }
-    response = requests.get("https://api.open-meteo.com/v1/forecast", params=params, timeout=12)
+    response = requests.get(
+        OPEN_METEO_FORECAST_URL,
+        params=params,
+        timeout=12,
+        headers={"User-Agent": WEATHER_USER_AGENT},
+    )
     response.raise_for_status()
     payload = response.json()
 
     hourly = payload.get("hourly", {})
-    forecast = pd.DataFrame(hourly)
-    if forecast.empty or "time" not in forecast:
-        return pd.DataFrame(), now_bst_label()
-    forecast["time"] = pd.to_datetime(forecast["time"]).dt.tz_localize(RACE_TIMEZONE, nonexistent="shift_forward", ambiguous="NaT")
-    numeric_columns = [
-        "temperature_2m",
-        "apparent_temperature",
-        "relative_humidity_2m",
-        "precipitation_probability",
-        "precipitation",
-        "weather_code",
-        "wind_speed_10m",
-        "wind_gusts_10m",
-    ]
-    for column in numeric_columns:
-        if column in forecast:
-            forecast[column] = pd.to_numeric(forecast[column], errors="coerce")
-    forecast["condition"] = forecast.get("weather_code", pd.Series(dtype=float)).map(weather_code_label)
+    forecast = clean_weather_frame(pd.DataFrame(hourly), timezone)
     return forecast, now_bst_label()
+
+
+@st.cache_data(ttl=WEATHER_CACHE_SECONDS, show_spinner=False)
+def fetch_met_no_forecast(latitude: float, longitude: float, timezone: str) -> tuple[pd.DataFrame, str]:
+    params = {"lat": round(float(latitude), 5), "lon": round(float(longitude), 5)}
+    response = requests.get(
+        MET_NORWAY_FORECAST_URL,
+        params=params,
+        timeout=12,
+        headers={"User-Agent": WEATHER_USER_AGENT},
+    )
+    response.raise_for_status()
+    payload = response.json()
+    rows: list[dict[str, Any]] = []
+    for entry in payload.get("properties", {}).get("timeseries", []):
+        data = entry.get("data", {})
+        instant = data.get("instant", {}).get("details", {})
+        next_hour = data.get("next_1_hours") or data.get("next_6_hours") or data.get("next_12_hours") or {}
+        next_details = next_hour.get("details", {})
+        symbol_code = next_hour.get("summary", {}).get("symbol_code", "")
+        wind_speed = pd.to_numeric(pd.Series([instant.get("wind_speed")]), errors="coerce").iloc[0]
+        wind_gust = pd.to_numeric(pd.Series([instant.get("wind_speed_of_gust")]), errors="coerce").iloc[0]
+        precipitation = next_details.get("precipitation_amount", 0)
+        temperature = instant.get("air_temperature")
+        rows.append(
+            {
+                "time": entry.get("time"),
+                "temperature_2m": temperature,
+                "apparent_temperature": temperature,
+                "relative_humidity_2m": instant.get("relative_humidity"),
+                "precipitation_probability": met_no_rain_probability(symbol_code, precipitation),
+                "precipitation": precipitation,
+                "weather_code": pd.NA,
+                "wind_speed_10m": None if pd.isna(wind_speed) else float(wind_speed) * 3.6,
+                "wind_gusts_10m": None if pd.isna(wind_gust) else float(wind_gust) * 3.6,
+                "condition": met_no_symbol_label(symbol_code),
+            }
+        )
+    return clean_weather_frame(pd.DataFrame(rows), timezone), now_bst_label()
 
 
 def is_weather_quota_error(exc: Exception) -> bool:
@@ -811,7 +915,7 @@ def read_weather_file_cache(
     longitude: float,
     timezone: str,
     max_age_seconds: int = WEATHER_STALE_FALLBACK_SECONDS,
-) -> tuple[pd.DataFrame, str, int] | None:
+) -> tuple[pd.DataFrame, str, int, str] | None:
     try:
         if not WEATHER_CACHE_PATH.exists():
             return None
@@ -830,27 +934,21 @@ def read_weather_file_cache(
         weather = pd.DataFrame(records)
         if weather.empty or "time" not in weather:
             return None
-        weather["time"] = pd.to_datetime(weather["time"], errors="coerce", utc=True).dt.tz_convert(RACE_TIMEZONE)
-        for column in [
-            "temperature_2m",
-            "apparent_temperature",
-            "relative_humidity_2m",
-            "precipitation_probability",
-            "precipitation",
-            "weather_code",
-            "wind_speed_10m",
-            "wind_gusts_10m",
-        ]:
-            if column in weather:
-                weather[column] = pd.to_numeric(weather[column], errors="coerce")
-        if "condition" not in weather and "weather_code" in weather:
-            weather["condition"] = weather["weather_code"].map(weather_code_label)
-        return weather, str(payload.get("fetched_at", "-")), age_seconds
+        weather = clean_weather_frame(weather, timezone)
+        provider = str(payload.get("provider") or "Cached weather")
+        return weather, str(payload.get("fetched_at", "-")), age_seconds, provider
     except Exception:
         return None
 
 
-def write_weather_file_cache(latitude: float, longitude: float, timezone: str, weather: pd.DataFrame, fetched_at: str) -> None:
+def write_weather_file_cache(
+    latitude: float,
+    longitude: float,
+    timezone: str,
+    weather: pd.DataFrame,
+    fetched_at: str,
+    provider: str,
+) -> None:
     if weather.empty:
         return
     try:
@@ -864,6 +962,7 @@ def write_weather_file_cache(latitude: float, longitude: float, timezone: str, w
             "latitude": float(latitude),
             "longitude": float(longitude),
             "timezone": timezone,
+            "provider": provider,
             "fetched_at": fetched_at,
             "fetched_epoch": current_epoch_seconds(),
             "records": serializable.to_dict("records"),
@@ -877,78 +976,152 @@ def write_weather_file_cache(latitude: float, longitude: float, timezone: str, w
 def load_weather_forecast_guarded(latitude: float, longitude: float, timezone: str) -> dict[str, Any]:
     cached = read_weather_file_cache(latitude, longitude, timezone)
     if cached is not None:
-        weather, fetched_at, age_seconds = cached
+        weather, fetched_at, age_seconds, provider = cached
         if age_seconds < WEATHER_CACHE_SECONDS:
             return {
                 "weather": weather,
                 "fetched_at": fetched_at,
                 "status": "cached",
-                "message": f"Using cached weather from {fetched_at}. Next API refresh is allowed in about {max(1, int((WEATHER_CACHE_SECONDS - age_seconds + 59) // 60))} minute(s).",
+                "provider": provider,
+                "message": (
+                    f"Using cached {provider} weather from {fetched_at}. Next API refresh is allowed in about "
+                    f"{max(1, int((WEATHER_CACHE_SECONDS - age_seconds + 59) // 60))} minute(s)."
+                ),
                 "age_seconds": age_seconds,
             }
 
     remaining = weather_cooldown_remaining_seconds()
     if remaining > 0:
+        try:
+            weather, fetched_at = fetch_met_no_forecast(latitude, longitude, timezone)
+            if weather.empty:
+                raise ValueError("MET Norway returned no hourly forecast")
+            provider = "MET Norway"
+            write_weather_file_cache(latitude, longitude, timezone, weather, fetched_at, provider)
+            return {
+                "weather": weather,
+                "fetched_at": fetched_at,
+                "status": "backup",
+                "provider": provider,
+                "message": (
+                    "Open-Meteo is in cooldown, so weather refreshed from the MET Norway backup "
+                    f"at {fetched_at}."
+                ),
+                "age_seconds": 0,
+            }
+        except Exception as backup_exc:
+            backup_message = str(backup_exc)
+
         if cached is not None:
-            weather, fetched_at, age_seconds = cached
+            weather, fetched_at, age_seconds, provider = cached
             return {
                 "weather": weather,
                 "fetched_at": fetched_at,
                 "status": "quota",
-                "message": f"Open-Meteo is rate limiting requests. Using cached weather from {fetched_at}; retry in about {max(1, int((remaining + 59) // 60))} minute(s).",
+                "provider": provider,
+                "message": (
+                    f"Open-Meteo is rate limiting requests and MET Norway did not refresh. Using cached "
+                    f"{provider} weather from {fetched_at}; retry in about "
+                    f"{max(1, int((remaining + 59) // 60))} minute(s)."
+                ),
                 "age_seconds": age_seconds,
             }
         return {
             "weather": pd.DataFrame(),
             "fetched_at": "-",
             "status": "quota",
-            "message": f"Open-Meteo is rate limiting requests. Weather will retry in about {max(1, int((remaining + 59) // 60))} minute(s).",
+            "provider": "-",
+            "message": (
+                f"Open-Meteo is rate limiting requests and the MET Norway backup also failed "
+                f"({backup_message}). Weather will retry in about {max(1, int((remaining + 59) // 60))} minute(s)."
+            ),
             "age_seconds": None,
         }
 
     try:
         weather, fetched_at = fetch_open_meteo_forecast(latitude, longitude, timezone)
-        write_weather_file_cache(latitude, longitude, timezone, weather, fetched_at)
+        if weather.empty:
+            raise ValueError("Open-Meteo returned no hourly forecast")
+        provider = "Open-Meteo"
+        write_weather_file_cache(latitude, longitude, timezone, weather, fetched_at, provider)
         return {
             "weather": weather,
             "fetched_at": fetched_at,
             "status": "live",
-            "message": f"Weather refreshed from Open-Meteo at {fetched_at}.",
+            "provider": provider,
+            "message": f"Weather refreshed from {provider} at {fetched_at}.",
             "age_seconds": 0,
         }
     except Exception as exc:
         if is_weather_quota_error(exc):
             st.session_state["weather_api_cooldown_until"] = current_epoch_seconds() + WEATHER_CACHE_SECONDS
+        try:
+            weather, fetched_at = fetch_met_no_forecast(latitude, longitude, timezone)
+            if weather.empty:
+                raise ValueError("MET Norway returned no hourly forecast")
+            provider = "MET Norway"
+            write_weather_file_cache(latitude, longitude, timezone, weather, fetched_at, provider)
+            status = "backup" if is_weather_quota_error(exc) else "live"
+            message = (
+                f"Open-Meteo is rate limited, so weather refreshed from the {provider} backup at {fetched_at}."
+                if is_weather_quota_error(exc)
+                else f"Open-Meteo did not refresh, so weather refreshed from {provider} at {fetched_at}."
+            )
+            return {
+                "weather": weather,
+                "fetched_at": fetched_at,
+                "status": status,
+                "provider": provider,
+                "message": message,
+                "age_seconds": 0,
+            }
+        except Exception as backup_exc:
+            backup_message = str(backup_exc)
+
+        if is_weather_quota_error(exc):
             if cached is not None:
-                weather, fetched_at, age_seconds = cached
+                weather, fetched_at, age_seconds, provider = cached
                 return {
                     "weather": weather,
                     "fetched_at": fetched_at,
                     "status": "quota",
-                    "message": f"Open-Meteo returned too many requests. Using cached weather from {fetched_at}; retry in about {WEATHER_CACHE_SECONDS // 60} minute(s).",
+                    "provider": provider,
+                    "message": (
+                        f"Open-Meteo returned too many requests and MET Norway did not refresh. Using cached "
+                        f"{provider} weather from {fetched_at}; retry in about {WEATHER_CACHE_SECONDS // 60} minute(s)."
+                    ),
                     "age_seconds": age_seconds,
                 }
             return {
                 "weather": pd.DataFrame(),
                 "fetched_at": "-",
                 "status": "quota",
-                "message": f"Open-Meteo returned too many requests. Weather is paused for about {WEATHER_CACHE_SECONDS // 60} minute(s) to avoid hammering the API.",
+                "provider": "-",
+                "message": (
+                    f"Open-Meteo returned too many requests and MET Norway also failed ({backup_message}). "
+                    f"Weather is paused for about {WEATHER_CACHE_SECONDS // 60} minute(s)."
+                ),
                 "age_seconds": None,
             }
         if cached is not None:
-            weather, fetched_at, age_seconds = cached
+            weather, fetched_at, age_seconds, provider = cached
             return {
                 "weather": weather,
                 "fetched_at": fetched_at,
                 "status": "stale",
-                "message": f"Could not refresh weather, so using cached weather from {fetched_at}.",
+                "provider": provider,
+                "message": (
+                    f"Could not refresh weather from Open-Meteo or MET Norway, so using cached "
+                    f"{provider} weather from {fetched_at}."
+                ),
                 "age_seconds": age_seconds,
             }
         return {
             "weather": pd.DataFrame(),
             "fetched_at": "-",
             "status": "error",
-            "message": f"Weather forecast is unavailable right now: {exc}",
+            "provider": "-",
+            "message": f"Weather forecast is unavailable right now: Open-Meteo failed ({exc}); MET Norway failed ({backup_message}).",
             "age_seconds": None,
         }
 
@@ -6565,8 +6738,11 @@ def show_weather_tab(roster: pd.DataFrame, course: CourseSettings) -> None:
     weather = weather_bundle["weather"]
     fetched_at = weather_bundle["fetched_at"]
     weather_status = weather_bundle["status"]
+    weather_provider = weather_bundle.get("provider", "-")
     if weather_status == "live":
         st.success(weather_bundle["message"])
+    elif weather_status == "backup":
+        st.warning(weather_bundle["message"])
     elif weather_status == "cached":
         st.info(weather_bundle["message"])
     elif weather_status in {"quota", "stale"}:
@@ -6574,7 +6750,7 @@ def show_weather_tab(roster: pd.DataFrame, course: CourseSettings) -> None:
     else:
         st.error(weather_bundle["message"])
 
-    st.caption(f"Weather source: Open-Meteo. Last successful API/cache refresh: {fetched_at}.")
+    st.caption(f"Weather source shown: {weather_provider}. Last successful API/cache refresh: {fetched_at}.")
     if not sequence:
         st.warning("Set at least one active runner in the Run Plan tab to forecast weather-adjusted laps.")
         return
