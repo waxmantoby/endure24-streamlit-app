@@ -6,6 +6,7 @@ import html
 import importlib
 import json
 from pathlib import Path
+import re
 from typing import Any, Mapping
 
 import pandas as pd
@@ -5010,6 +5011,655 @@ def save_run_plan_live(
     return clean
 
 
+PACE_PLAN_SHEET_COLUMNS = [
+    "runner",
+    "source",
+    "next_run_minutes",
+    "next_run_pace",
+    "workbook_minutes",
+    "last_lap_minutes",
+    "effective_minutes",
+    "effective_pace",
+    "updated_at",
+    "notes",
+]
+PACE_PLAN_SOURCE_OPTIONS = ["workbook", "last_lap", "manual"]
+
+
+def _open_pace_plan_sheet(secrets: Mapping[str, Any], sheet_id: str | None, worksheet_name: str):
+    try:
+        import gspread
+        from google.oauth2.service_account import Credentials
+    except Exception as exc:  # pragma: no cover - depends on cloud packages.
+        raise RuntimeError("Install gspread and google-auth to use Google Sheets sync.") from exc
+
+    service_account = _drinks_service_account_info(secrets)
+    resolved_sheet_id = sheet_id or _drinks_secret_value(secrets, "google_sheet_id", "race_log_google_sheet_id")
+    if not service_account or not resolved_sheet_id:
+        raise RuntimeError("Google Sheets sync needs google_sheet_id and gcp_service_account in Streamlit secrets.")
+
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+    credentials = Credentials.from_service_account_info(service_account, scopes=scopes)
+    client = gspread.authorize(credentials)
+    spreadsheet = client.open_by_key(str(resolved_sheet_id))
+    try:
+        return spreadsheet.worksheet(worksheet_name)
+    except Exception:
+        return spreadsheet.add_worksheet(title=worksheet_name, rows=200, cols=len(PACE_PLAN_SHEET_COLUMNS))
+
+
+def read_pace_plan_from_google_sheet(
+    secrets: Mapping[str, Any],
+    sheet_id: str | None = None,
+    worksheet_name: str = "pace_plan",
+) -> pd.DataFrame:
+    sheet = _open_pace_plan_sheet(secrets, sheet_id, worksheet_name)
+    return pd.DataFrame(sheet.get_all_records())
+
+
+def write_pace_plan_to_google_sheet(
+    pace_plan: pd.DataFrame,
+    secrets: Mapping[str, Any],
+    sheet_id: str | None = None,
+    worksheet_name: str = "pace_plan",
+) -> None:
+    sheet = _open_pace_plan_sheet(secrets, sheet_id, worksheet_name)
+    clean = pace_plan.copy()
+    for column in PACE_PLAN_SHEET_COLUMNS:
+        if column not in clean:
+            clean[column] = ""
+    clean = clean[PACE_PLAN_SHEET_COLUMNS]
+    values = [PACE_PLAN_SHEET_COLUMNS] + clean.fillna("").astype(str).values.tolist()
+    sheet.clear()
+    sheet.update(values)
+
+
+def pace_plan_source_value(value: Any) -> str:
+    text = str(value or "").strip().lower().replace(" ", "_").replace("-", "_")
+    aliases = {
+        "": "workbook",
+        "base": "workbook",
+        "default": "workbook",
+        "xlsx": "workbook",
+        "workbook_average": "workbook",
+        "original": "workbook",
+        "last": "last_lap",
+        "lastlap": "last_lap",
+        "last_lap_time": "last_lap",
+        "actual": "last_lap",
+        "manual_next_run": "manual",
+        "next_run": "manual",
+        "override": "manual",
+        "pace": "manual",
+    }
+    return aliases.get(text, text if text in PACE_PLAN_SOURCE_OPTIONS else "workbook")
+
+
+def parse_pace_minutes_per_km(value: Any) -> float | None:
+    if value is None or pd.isna(value):
+        return None
+    text = str(value).strip().lower()
+    if not text:
+        return None
+    text = text.replace("/km", "").replace("per km", "").replace("min/km", "").strip()
+    text = re.sub(r"[^0-9:.]", "", text)
+    if not text:
+        return None
+    if ":" in text:
+        parts = text.split(":")
+        if len(parts) != 2:
+            return None
+        try:
+            minutes = float(parts[0])
+            seconds = float(parts[1])
+        except ValueError:
+            return None
+        if minutes < 0 or seconds < 0 or seconds >= 60:
+            return None
+        return minutes + seconds / 60
+    try:
+        numeric = float(text)
+    except ValueError:
+        return None
+    if numeric <= 0:
+        return None
+    return numeric
+
+
+def parse_manual_next_run_minutes(row: pd.Series, course: CourseSettings) -> float | None:
+    minutes = parse_duration_minutes(row.get("next_run_minutes"))
+    if minutes is not None and float(minutes) > 0:
+        return float(minutes)
+    pace = parse_pace_minutes_per_km(row.get("next_run_pace"))
+    if pace is None:
+        return None
+    return float(pace) * course_lap_distance_km(course)
+
+
+def last_lap_minutes_lookup(log: pd.DataFrame, roster: pd.DataFrame) -> dict[str, float]:
+    completed = completed_official_laps(log, roster)
+    if completed.empty:
+        return {}
+    completed = completed.dropna(subset=["lap_duration_minutes"]).sort_values(["runner", "lap_number"])
+    latest = completed.groupby("runner", as_index=False).tail(1)
+    latest["lap_duration_minutes"] = pd.to_numeric(latest["lap_duration_minutes"], errors="coerce")
+    latest = latest.dropna(subset=["lap_duration_minutes"])
+    return latest.set_index("runner")["lap_duration_minutes"].astype(float).to_dict()
+
+
+def base_pace_plan(roster: pd.DataFrame, log: pd.DataFrame, course: CourseSettings) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    last_lookup = last_lap_minutes_lookup(log, roster)
+    clean = roster.sort_values("running_order").copy()
+    clean["runner"] = clean["runner"].astype(str).str.strip()
+    clean["projected_mean_minutes"] = pd.to_numeric(clean["projected_mean_minutes"], errors="coerce")
+    for row in clean[clean["runner"].ne("")].itertuples(index=False):
+        runner = str(row.runner).strip()
+        workbook_minutes = pd.to_numeric(pd.Series([row.projected_mean_minutes]), errors="coerce").iloc[0]
+        if pd.isna(workbook_minutes):
+            continue
+        last_minutes = last_lookup.get(runner, pd.NA)
+        effective = float(workbook_minutes)
+        rows.append(
+            {
+                "runner": runner,
+                "source": "workbook",
+                "next_run_minutes": "",
+                "next_run_pace": "",
+                "workbook_minutes": round(float(workbook_minutes), 2),
+                "last_lap_minutes": "" if pd.isna(last_minutes) else round(float(last_minutes), 2),
+                "effective_minutes": round(effective, 2),
+                "effective_pace": format_pace_min_per_km(lap_pace_min_per_km(effective, course)),
+                "updated_at": "",
+                "notes": "",
+            }
+        )
+    return pd.DataFrame(rows, columns=PACE_PLAN_SHEET_COLUMNS)
+
+
+def normalise_pace_plan_table(
+    raw: pd.DataFrame,
+    roster: pd.DataFrame,
+    log: pd.DataFrame,
+    course: CourseSettings,
+) -> pd.DataFrame:
+    base = base_pace_plan(roster, log, course)
+    if base.empty:
+        return pd.DataFrame(columns=PACE_PLAN_SHEET_COLUMNS)
+
+    current = raw.copy() if raw is not None and not raw.empty else pd.DataFrame(columns=PACE_PLAN_SHEET_COLUMNS)
+    column_aliases = {
+        "name": "runner",
+        "runner_name": "runner",
+        "use": "source",
+        "forecast_source": "source",
+        "next_minutes": "next_run_minutes",
+        "next_run_time": "next_run_minutes",
+        "manual_minutes": "next_run_minutes",
+        "manual_time": "next_run_minutes",
+        "next_pace": "next_run_pace",
+        "manual_pace": "next_run_pace",
+        "pace_min_per_km": "next_run_pace",
+        "workbook": "workbook_minutes",
+        "base_minutes": "workbook_minutes",
+        "last_lap": "last_lap_minutes",
+        "last_minutes": "last_lap_minutes",
+        "effective": "effective_minutes",
+        "forecast_minutes": "effective_minutes",
+        "timestamp": "updated_at",
+    }
+    current.columns = [
+        column_aliases.get(str(column).strip().lower().replace(" ", "_").replace("-", "_"), str(column).strip().lower())
+        for column in current.columns
+    ]
+    for column in PACE_PLAN_SHEET_COLUMNS:
+        if column not in current:
+            current[column] = ""
+    current["runner"] = current["runner"].fillna("").astype(str).str.strip()
+    current = current[current["runner"].ne("")].copy()
+    source_by_runner = current.drop_duplicates("runner").set_index("runner").to_dict("index") if not current.empty else {}
+
+    rows: list[dict[str, Any]] = []
+    for base_row in base.to_dict("records"):
+        runner = str(base_row["runner"]).strip()
+        raw_row = pd.Series(source_by_runner.get(runner, {}))
+        raw_source = str(raw_row.get("source", "") or "").strip()
+        source = pace_plan_source_value(raw_source or base_row["source"])
+        workbook_minutes = pd.to_numeric(pd.Series([base_row["workbook_minutes"]]), errors="coerce").iloc[0]
+        last_lap_minutes = pd.to_numeric(pd.Series([base_row["last_lap_minutes"]]), errors="coerce").iloc[0]
+        manual_minutes = parse_manual_next_run_minutes(raw_row, course)
+        next_run_minutes = raw_row.get("next_run_minutes", "")
+        next_run_pace_raw = raw_row.get("next_run_pace", "")
+        next_run_minutes_text = "" if pd.isna(next_run_minutes) else str(next_run_minutes).strip()
+        next_run_pace = "" if pd.isna(next_run_pace_raw) else str(next_run_pace_raw).strip()
+        parsed_next_run_minutes = parse_duration_minutes(next_run_minutes)
+        manual_input_present = bool(next_run_minutes_text or next_run_pace)
+        if manual_minutes is not None and (not raw_source or source == "workbook") and manual_input_present:
+            source = "manual"
+
+        if source == "manual" and manual_minutes is not None:
+            effective = manual_minutes
+        elif source == "last_lap" and pd.notna(last_lap_minutes) and float(last_lap_minutes) > 0:
+            effective = float(last_lap_minutes)
+        else:
+            if source == "manual" and manual_minutes is None:
+                source = "workbook"
+            if source == "last_lap" and pd.isna(last_lap_minutes):
+                source = "workbook"
+            effective = float(workbook_minutes)
+
+        notes = str(raw_row.get("notes", "") or "")
+        updated_at = str(raw_row.get("updated_at", "") or "")
+        rows.append(
+            {
+                "runner": runner,
+                "source": source,
+                "next_run_minutes": "" if parsed_next_run_minutes is None else round(float(parsed_next_run_minutes), 2),
+                "next_run_pace": next_run_pace,
+                "workbook_minutes": round(float(workbook_minutes), 2),
+                "last_lap_minutes": "" if pd.isna(last_lap_minutes) else round(float(last_lap_minutes), 2),
+                "effective_minutes": round(float(effective), 2),
+                "effective_pace": format_pace_min_per_km(lap_pace_min_per_km(effective, course)),
+                "updated_at": updated_at,
+                "notes": notes,
+            }
+        )
+    return pd.DataFrame(rows, columns=PACE_PLAN_SHEET_COLUMNS)
+
+
+def pace_plan_digest(table: pd.DataFrame) -> str:
+    clean = table.copy() if isinstance(table, pd.DataFrame) else pd.DataFrame(columns=PACE_PLAN_SHEET_COLUMNS)
+    for column in PACE_PLAN_SHEET_COLUMNS:
+        if column not in clean:
+            clean[column] = ""
+    return stable_table_digest(clean[PACE_PLAN_SHEET_COLUMNS], PACE_PLAN_SHEET_COLUMNS)
+
+
+def effective_pace_digest(table: pd.DataFrame) -> str:
+    if table is None or table.empty:
+        return ""
+    columns = ["runner", "source", "effective_minutes"]
+    clean = table.copy()
+    for column in columns:
+        if column not in clean:
+            clean[column] = ""
+    return stable_table_digest(clean[columns], columns)
+
+
+def set_pace_plan_state(table: pd.DataFrame, roster: pd.DataFrame, log: pd.DataFrame, course: CourseSettings) -> pd.DataFrame:
+    clean = normalise_pace_plan_table(table, roster, log, course)
+    old_effective = st.session_state.get("pace_plan_effective_digest")
+    new_effective = effective_pace_digest(clean)
+    if old_effective and old_effective != new_effective:
+        st.session_state["pace_plan_changed"] = True
+        for key in ["race_day_forecast", "sim_output", "summary_bundle", "uncapped_summary", "comparison"]:
+            st.session_state.pop(key, None)
+    st.session_state["pace_plan_effective_digest"] = new_effective
+    st.session_state["pace_plan_tracker"] = clean.copy()
+    return clean
+
+
+def pace_plan_state_table(roster: pd.DataFrame, log: pd.DataFrame, course: CourseSettings) -> pd.DataFrame:
+    if "pace_plan_tracker" not in st.session_state:
+        st.session_state["pace_plan_tracker"] = base_pace_plan(roster, log, course)
+    return set_pace_plan_state(st.session_state["pace_plan_tracker"], roster, log, course)
+
+
+def apply_pace_plan_to_roster(roster: pd.DataFrame, pace_plan: pd.DataFrame) -> pd.DataFrame:
+    adjusted = roster.copy()
+    if pace_plan is None or pace_plan.empty:
+        adjusted["pace_plan_source"] = "workbook"
+        adjusted["pace_plan_effective_minutes"] = pd.to_numeric(adjusted["projected_mean_minutes"], errors="coerce")
+        return adjusted
+    lookup = pace_plan.drop_duplicates("runner").set_index("runner")
+    adjusted["runner"] = adjusted["runner"].astype(str).str.strip()
+    adjusted["pace_plan_source"] = adjusted["runner"].map(lookup["source"].to_dict()).fillna("workbook")
+    adjusted["pace_plan_effective_minutes"] = adjusted["runner"].map(lookup["effective_minutes"].to_dict())
+    adjusted["pace_plan_workbook_minutes"] = adjusted["runner"].map(lookup["workbook_minutes"].to_dict())
+    adjusted["pace_plan_last_lap_minutes"] = adjusted["runner"].map(lookup["last_lap_minutes"].to_dict())
+    adjusted["pace_plan_next_run_pace"] = adjusted["runner"].map(lookup["next_run_pace"].to_dict()).fillna("")
+    effective = pd.to_numeric(adjusted["pace_plan_effective_minutes"], errors="coerce")
+    adjusted.loc[effective.gt(0), "projected_mean_minutes"] = effective[effective.gt(0)]
+    return adjusted
+
+
+def pace_plan_sheet_context() -> dict[str, Any]:
+    default_sheet_id = get_streamlit_secret("google_sheet_id", "race_log_google_sheet_id") or ""
+    default_sheet_id = st.session_state.get("race_day_sheet_id", default_sheet_id)
+    st.session_state.setdefault("pace_plan_sheet_id", str(default_sheet_id))
+    st.session_state.setdefault("pace_plan_worksheet_name", "pace_plan")
+
+    sheet_id = str(st.session_state.get("pace_plan_sheet_id") or default_sheet_id).strip()
+    worksheet_name = str(st.session_state.get("pace_plan_worksheet_name") or "pace_plan").strip() or "pace_plan"
+    return {
+        "sheet_id": sheet_id,
+        "worksheet_name": worksheet_name,
+        "configured": google_sheets_configured(st.secrets, sheet_id or None),
+    }
+
+
+def save_pace_plan_live(
+    table: pd.DataFrame,
+    sync: Mapping[str, Any],
+    roster: pd.DataFrame,
+    log: pd.DataFrame,
+    course: CourseSettings,
+    notice: str | None = None,
+    force: bool = False,
+) -> pd.DataFrame:
+    clean = set_pace_plan_state(table, roster, log, course)
+    clean["updated_at"] = clean["updated_at"].fillna("").astype(str)
+    clean.loc[clean["updated_at"].eq(""), "updated_at"] = now_bst_label()
+    clean = set_pace_plan_state(clean, roster, log, course)
+    digest = pace_plan_digest(clean)
+    if not sync.get("configured"):
+        st.session_state["pace_plan_save_status"] = "local"
+        st.session_state["pace_plan_sheet_notice"] = "Saved locally. Google Sheets is not configured."
+        return clean
+
+    allowed = conflict_safe_write_allowed(
+        prefix="pace_plan",
+        label="Pace plan",
+        pending=clean,
+        pending_digest=digest,
+        read_remote=lambda: read_pace_plan_from_google_sheet(
+            st.secrets,
+            sheet_id=sync.get("sheet_id") or None,
+            worksheet_name=str(sync.get("worksheet_name") or "pace_plan"),
+        ),
+        remote_digest=lambda remote: pace_plan_digest(normalise_pace_plan_table(remote, roster, log, course)),
+        configured=bool(sync.get("configured")),
+        force=force,
+        live_reload_key="pace_plan_live_sheet_enabled",
+        safe_baseline_digest=pace_plan_digest(base_pace_plan(roster, log, course)),
+    )
+    if not allowed:
+        st.session_state["pace_plan_sheet_notice"] = (
+            "Pace plan changes kept locally. Resolve the Sheet conflict before normal saves continue."
+        )
+        return clean
+
+    write_pace_plan_to_google_sheet(
+        clean,
+        st.secrets,
+        sheet_id=sync.get("sheet_id") or None,
+        worksheet_name=str(sync.get("worksheet_name") or "pace_plan"),
+    )
+    saved_at = now_bst_label()
+    st.session_state["pace_plan_sheet_last_saved"] = saved_at
+    mark_sheet_saved("pace_plan", digest, saved_at)
+    st.session_state["pace_plan_sheet_notice"] = notice or f"Pace plan saved to Google Sheet at {saved_at}."
+    return clean
+
+
+def pace_plan_summary(table: pd.DataFrame) -> dict[str, int]:
+    clean = table.copy() if isinstance(table, pd.DataFrame) else pd.DataFrame(columns=PACE_PLAN_SHEET_COLUMNS)
+    clean["source"] = clean.get("source", pd.Series(dtype=str)).map(pace_plan_source_value)
+    return {
+        "manual": int(clean["source"].eq("manual").sum()),
+        "last_lap": int(clean["source"].eq("last_lap").sum()),
+        "workbook": int(clean["source"].eq("workbook").sum()),
+    }
+
+
+def show_pace_plan_sheet_controls(
+    pace_plan: pd.DataFrame,
+    roster: pd.DataFrame,
+    log: pd.DataFrame,
+    course: CourseSettings,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    sync = pace_plan_sheet_context()
+    sheet_id = str(sync["sheet_id"])
+    worksheet_name = str(sync["worksheet_name"])
+    configured = bool(sync["configured"])
+
+    with st.container(border=True):
+        top_cols = st.columns([1.5, 1, 1])
+        with top_cols[0]:
+            st.markdown("#### Live Pace Plan Sheet")
+            if configured:
+                st.caption("This is the shared next-run pace assumption used by forecasts and weather timing.")
+            else:
+                st.caption("Google sync is not configured. Local editing and CSV download still work.")
+
+        live_reload = top_cols[1].checkbox(
+            "Auto reload",
+            value=live_reload_enabled_default("pace_plan_live_sheet_enabled", configured),
+            help="Polls the pace_plan worksheet while this tab is open. App saves still write immediately.",
+            key="pace_plan_live_reload_checkbox",
+        )
+        refresh_seconds = top_cols[2].number_input(
+            "Reload every seconds",
+            min_value=10,
+            max_value=300,
+            value=live_refresh_seconds_default("pace_plan_live_refresh_seconds"),
+            step=5,
+            key="pace_plan_refresh_seconds_input",
+        )
+        st.session_state["pace_plan_live_sheet_enabled"] = live_reload
+        st.session_state["pace_plan_live_refresh_seconds"] = int(refresh_seconds)
+        show_sheet_cooldown("pace_plan", "Pace Plan Sheet")
+
+        if live_reload and sheet_cooldown_remaining_seconds("pace_plan") <= 0 and st_autorefresh is not None:
+            st_autorefresh(interval=int(refresh_seconds) * 1000, key="pace_plan_live_sheet_autorefresh")
+        elif live_reload and st_autorefresh is None:
+            st.warning("Live reload needs the streamlit-autorefresh package. Manual loading still works.")
+
+        action_cols = st.columns([1, 1, 1.2])
+        load_now = action_cols[0].button("Load paces", width="stretch", disabled=not configured)
+        save_now = action_cols[1].button("Save paces", width="stretch", disabled=not configured)
+        if configured:
+            action_cols[2].success(f"Worksheet: {worksheet_name}")
+        else:
+            action_cols[2].warning("Save disabled until secrets are set.")
+
+        conflict_load, conflict_force = show_sheet_conflict_actions(
+            "pace_plan",
+            "Pace Plan Sheet",
+            "endure24_pending_pace_plan.csv",
+        )
+        load_now = load_now or conflict_load
+        if conflict_force:
+            pending = st.session_state.get("pace_plan_pending_df")
+            try:
+                pace_plan = save_pace_plan_live(
+                    pending if isinstance(pending, pd.DataFrame) else pace_plan,
+                    sync,
+                    roster,
+                    log,
+                    course,
+                    "Pace plan force-saved to Google Sheet.",
+                    force=True,
+                )
+                if sheet_save_status("pace_plan") == "saved":
+                    st.success("Pace plan force-saved to Google Sheet.")
+                    st.rerun()
+            except Exception as exc:
+                st.error(f"Could not force-save pace plan worksheet: {exc}")
+
+        if should_load_sheet_now("pace_plan", load_now, live_reload, int(refresh_seconds)) and configured:
+            try:
+                loaded = read_pace_plan_from_google_sheet(
+                    st.secrets,
+                    sheet_id=sheet_id or None,
+                    worksheet_name=worksheet_name,
+                )
+                before = pace_plan_digest(pace_plan)
+                pace_plan = set_pace_plan_state(loaded, roster, log, course)
+                loaded_at = now_bst_label()
+                st.session_state["pace_plan_sheet_last_loaded"] = loaded_at
+                mark_sheet_loaded("pace_plan", pace_plan_digest(pace_plan), loaded_at)
+                if pace_plan_digest(pace_plan) != before:
+                    st.success(f"Pace plan loaded at {loaded_at}.")
+                    st.rerun()
+                else:
+                    st.caption(f"Pace plan checked at {loaded_at}; no changes found.")
+            except Exception as exc:
+                handle_sheet_load_error("pace_plan", "the pace plan worksheet", exc, "pace_plan_live_sheet_enabled")
+
+        if st.session_state.get("pace_plan_sheet_last_loaded"):
+            st.caption(f"Last pace load: {st.session_state['pace_plan_sheet_last_loaded']}.")
+        if st.session_state.get("pace_plan_sheet_last_saved"):
+            st.caption(f"Last pace save: {st.session_state['pace_plan_sheet_last_saved']}.")
+        if st.session_state.get("pace_plan_sheet_notice"):
+            st.success(st.session_state.pop("pace_plan_sheet_notice"))
+
+        if save_now and configured:
+            try:
+                pace_plan = save_pace_plan_live(pace_plan, sync, roster, log, course, "Pace plan saved to Google Sheet.")
+                if sheet_save_status("pace_plan") == "saved":
+                    st.success("Pace plan saved to Google Sheet.")
+                elif sheet_save_status("pace_plan") in {"conflict", "quota"}:
+                    st.warning("Pace plan changes kept locally. Resolve the Sheet warning above before normal saves continue.")
+            except Exception as exc:
+                st.error(f"Could not save pace plan worksheet: {exc}")
+
+        with st.expander("Pace Plan Sheet settings", expanded=False):
+            settings_cols = st.columns([2, 1])
+            settings_cols[0].text_input("Sheet ID", key="pace_plan_sheet_id", placeholder="Google Sheet ID")
+            settings_cols[1].text_input("Worksheet", key="pace_plan_worksheet_name")
+
+    return pace_plan_state_table(roster, log, course), sync
+
+
+def show_pace_plan_tab(roster: pd.DataFrame, log: pd.DataFrame, course: CourseSettings) -> pd.DataFrame:
+    st.subheader("Pace Plan")
+    st.caption(
+        "Shared next-run pace assumptions. Forecasts use the Effective minutes column as each runner's current mean "
+        "until you change it again."
+    )
+    pace_plan = pace_plan_state_table(roster, log, course)
+    pace_plan, sync = show_pace_plan_sheet_controls(pace_plan, roster, log, course)
+    if pace_plan.empty:
+        st.info("Add runners in Setup before editing the pace plan.")
+        return pace_plan
+
+    summary = pace_plan_summary(pace_plan)
+    current_roster = apply_pace_plan_to_roster(roster, pace_plan)
+    delta = pd.to_numeric(pace_plan["effective_minutes"], errors="coerce") - pd.to_numeric(
+        pace_plan["workbook_minutes"],
+        errors="coerce",
+    )
+    metric_cols = st.columns(5)
+    metric_cols[0].metric("Manual overrides", str(summary["manual"]))
+    metric_cols[1].metric("Using last lap", str(summary["last_lap"]))
+    metric_cols[2].metric("Using workbook", str(summary["workbook"]))
+    metric_cols[3].metric("Average shift", f"{delta.mean():+.1f} min" if not delta.dropna().empty else "-")
+    metric_cols[4].metric("Worksheet", str(sync.get("worksheet_name") or "pace_plan"))
+
+    st.markdown("#### Runner Next-Run Assumptions")
+    display = pace_plan.copy()
+    edited = st.data_editor(
+        display[PACE_PLAN_SHEET_COLUMNS],
+        hide_index=True,
+        width="stretch",
+        num_rows="fixed",
+        column_config={
+            "runner": st.column_config.TextColumn("Runner", disabled=True),
+            "source": st.column_config.SelectboxColumn(
+                "Use",
+                options=PACE_PLAN_SOURCE_OPTIONS,
+                help="workbook = original XLSX mean, last_lap = latest completed lap, manual = next-run override.",
+            ),
+            "next_run_minutes": st.column_config.TextColumn(
+                "I think next run is",
+                help="Manual full-lap time. Accepts 34.5, 34:30, or 34 min 30 sec.",
+            ),
+            "next_run_pace": st.column_config.TextColumn(
+                "Or pace",
+                help="Manual pace per km, e.g. 4:45/km. Used when Use is manual, or when this is filled in.",
+            ),
+            "workbook_minutes": st.column_config.NumberColumn("XLSX avg", disabled=True, format="%.1f"),
+            "last_lap_minutes": st.column_config.NumberColumn("Last lap", disabled=True, format="%.1f"),
+            "effective_minutes": st.column_config.NumberColumn("Forecast avg", disabled=True, format="%.1f"),
+            "effective_pace": st.column_config.TextColumn("Forecast pace", disabled=True),
+            "updated_at": st.column_config.TextColumn("Updated", disabled=True),
+            "notes": st.column_config.TextColumn("Notes"),
+        },
+        key=f"pace_plan_editor_{pace_plan_digest(pace_plan)[:12]}",
+    )
+    edited_clean = normalise_pace_plan_table(edited, roster, log, course)
+    if pace_plan_digest(edited_clean) != pace_plan_digest(pace_plan):
+        try:
+            save_pace_plan_live(edited_clean, sync, roster, log, course, "Pace plan edit saved to Google Sheet.")
+        except Exception as exc:
+            set_pace_plan_state(edited_clean, roster, log, course)
+            st.session_state["pace_plan_sheet_notice"] = f"Updated locally, but could not save to Sheet: {exc}"
+        st.rerun()
+
+    action_cols = st.columns(4)
+    if action_cols[0].button("Use workbook averages", width="stretch", key="pace_plan_use_workbook"):
+        reset = base_pace_plan(roster, log, course)
+        try:
+            save_pace_plan_live(reset, sync, roster, log, course, "Pace plan reset to workbook averages.")
+        except Exception as exc:
+            set_pace_plan_state(reset, roster, log, course)
+            st.session_state["pace_plan_sheet_notice"] = f"Reset locally, but could not save to Sheet: {exc}"
+        st.rerun()
+
+    if action_cols[1].button("Use latest lap times", width="stretch", key="pace_plan_use_latest_laps"):
+        latest = pace_plan_state_table(roster, log, course)
+        has_last = pd.to_numeric(latest["last_lap_minutes"], errors="coerce").gt(0)
+        latest.loc[has_last, "source"] = "last_lap"
+        latest.loc[~has_last, "source"] = "workbook"
+        try:
+            save_pace_plan_live(latest, sync, roster, log, course, "Pace plan updated from latest lap times.")
+        except Exception as exc:
+            set_pace_plan_state(latest, roster, log, course)
+            st.session_state["pace_plan_sheet_notice"] = f"Updated locally, but could not save to Sheet: {exc}"
+        st.rerun()
+
+    if action_cols[2].button(
+        "Force save to Sheet",
+        width="stretch",
+        disabled=not sync.get("configured"),
+        key="pace_plan_force_save_button",
+    ):
+        try:
+            saved = save_pace_plan_live(edited_clean, sync, roster, log, course, "Pace plan forced saved to Google Sheet.", force=True)
+            st.success(f"Saved {len(saved)} pace-plan row(s).")
+        except Exception as exc:
+            st.error(f"Could not force-save pace plan: {exc}")
+
+    action_cols[3].download_button(
+        "Download pace CSV",
+        pace_plan_state_table(roster, log, course).to_csv(index=False),
+        file_name="endure24_pace_plan.csv",
+        mime="text/csv",
+        width="stretch",
+        key="pace_plan_download_csv",
+    )
+
+    with st.expander("Current forecast roster", expanded=False):
+        view = current_roster.sort_values("running_order")[
+            [
+                "runner",
+                "pace_plan_source",
+                "pace_plan_workbook_minutes",
+                "pace_plan_last_lap_minutes",
+                "pace_plan_effective_minutes",
+                "projected_mean_minutes",
+                "projected_sd_minutes",
+            ]
+        ].copy()
+        st.dataframe(
+            view,
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "runner": "Runner",
+                "pace_plan_source": "Source",
+                "pace_plan_workbook_minutes": st.column_config.NumberColumn("XLSX avg", format="%.1f"),
+                "pace_plan_last_lap_minutes": st.column_config.NumberColumn("Last lap", format="%.1f"),
+                "pace_plan_effective_minutes": st.column_config.NumberColumn("Forecast avg", format="%.1f"),
+                "projected_mean_minutes": st.column_config.NumberColumn("Roster mean now", format="%.1f"),
+                "projected_sd_minutes": st.column_config.NumberColumn("SD", format="%.1f"),
+            },
+        )
+
+    return pace_plan_state_table(roster, log, course)
+
+
 def _open_drinks_sheet(secrets: Mapping[str, Any], sheet_id: str | None, worksheet_name: str):
     try:
         import gspread
@@ -7053,6 +7703,7 @@ def main() -> None:
     (
         race_day_tab,
         run_plan_tab,
+        pace_plan_tab,
         weather_tab,
         race_extras_tab,
         forecast_tab,
@@ -7067,6 +7718,7 @@ def main() -> None:
         [
             "Race Day",
             "Run Plan",
+            "Pace Plan",
             "Weather",
             "Race Extras",
             "Forecast",
@@ -7110,15 +7762,28 @@ def main() -> None:
             combined = roster.merge(loaded.last_year_stats, on="runner", how="left")
             st.dataframe(combined, width="stretch", hide_index=True)
 
+    current_log_for_pace = normalise_race_log(st.session_state.get("race_log", empty_race_log()), roster)
+    pace_plan = pace_plan_state_table(roster, current_log_for_pace, course)
+    forecast_roster = apply_pace_plan_to_roster(roster, pace_plan)
+    forecast_roster_warnings, forecast_roster_errors = validate_roster(forecast_roster)
+
     with forecast_tab:
         st.subheader("Forecast")
+        pace_counts = pace_plan_summary(pace_plan)
+        st.caption(
+            "Using Pace Plan assumptions: "
+            f"{pace_counts['manual']} manual, {pace_counts['last_lap']} last-lap, "
+            f"{pace_counts['workbook']} workbook."
+        )
         run_uncapped_comparison = st.checkbox("Also run uncapped comparison", value=True)
         if st.button("Run Monte Carlo simulation", type="primary"):
-            if roster_errors:
-                st.error("Fix roster errors before running the simulation.")
+            if roster_errors or forecast_roster_errors:
+                st.error("Fix roster or pace-plan errors before running the simulation.")
+                for error in forecast_roster_errors:
+                    st.error(error)
             else:
                 with st.spinner("Running simulations..."):
-                    sim_output = simulate_many(roster, settings, caps_enabled=caps_enabled)
+                    sim_output = simulate_many(forecast_roster, settings, caps_enabled=caps_enabled)
                     summary_bundle = summarize_results(sim_output, settings.target_laps)
                     uncapped_summary = None
                     comparison = None
@@ -7127,7 +7792,7 @@ def main() -> None:
                             settings,
                             random_seed=None if settings.random_seed is None else settings.random_seed + 1,
                         )
-                        uncapped_output = simulate_many(roster, uncapped_settings, caps_enabled=False)
+                        uncapped_output = simulate_many(forecast_roster, uncapped_settings, caps_enabled=False)
                         uncapped_summary = summarize_results(uncapped_output, settings.target_laps)
                         comparison = pd.DataFrame(
                             [
@@ -7166,19 +7831,22 @@ def main() -> None:
             st.info("Run the Monte Carlo forecast to populate the dashboard.")
 
     with optimiser_tab:
-        show_optimizer(roster, settings)
+        show_optimizer(forecast_roster, settings)
 
     with race_day_tab:
-        show_race_day(roster, settings, course, caps_enabled=caps_enabled)
+        show_race_day(forecast_roster, settings, course, caps_enabled=caps_enabled)
 
     with run_plan_tab:
         show_run_plan_tab(roster)
 
+    with pace_plan_tab:
+        pace_plan = show_pace_plan_tab(roster, current_log_for_pace, course)
+
     with weather_tab:
-        show_weather_tab(roster, course)
+        show_weather_tab(forecast_roster, course)
 
     with race_extras_tab:
-        show_race_extras(roster, settings, course, caps_enabled=caps_enabled)
+        show_race_extras(forecast_roster, settings, course, caps_enabled=caps_enabled)
 
     with drinks_tab:
         show_drinks_tab(roster)
@@ -7187,11 +7855,11 @@ def main() -> None:
         show_sleep_tab(roster)
 
     with predictions_tab:
-        current_log = normalise_race_log(st.session_state.get("race_log", empty_race_log()), roster)
-        show_predictions_tab(roster, current_log)
+        current_log = normalise_race_log(st.session_state.get("race_log", empty_race_log()), forecast_roster)
+        show_predictions_tab(forecast_roster, current_log)
 
     with what_if_tab:
-        show_what_if_pace_override(roster, settings)
+        show_what_if_pace_override(forecast_roster, settings)
 
     with exports_tab:
         show_exports_tab(
