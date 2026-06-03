@@ -64,7 +64,7 @@ DEFAULT_EDITABLE_GOOGLE_SHEET_URL = (
     "https://docs.google.com/spreadsheets/d/1dKvzME6TL4EJ8u_f0-l2p7ZENBwj7TUZLt0cW0T7QHo/edit?usp=sharing"
 )
 DEFAULT_ROUTE_URL = "https://www.plotaroute.com/route/3002404"
-DEFAULT_LAP_DISTANCE_KM = 4.817 * 1.609344
+DEFAULT_LAP_DISTANCE_KM = 8.0
 DEFAULT_LAP_ASCENT_M = 331 * 0.3048
 DEFAULT_LAP_DESCENT_M = 331 * 0.3048
 RACE_TIMEZONE = "Europe/London"
@@ -1207,8 +1207,8 @@ def make_settings() -> SimulationSettings:
 def make_course_settings() -> CourseSettings:
     st.sidebar.subheader("Course Metrics")
     st.sidebar.caption(
-        "Metric defaults from Plotaroute route 3002404: "
-        f"{DEFAULT_LAP_DISTANCE_KM:.2f} km and {DEFAULT_LAP_ASCENT_M:.0f} m ascent/descent per lap."
+        "Default lap distance is set to 8.00 km. Plotaroute route 3002404 lists "
+        f"{DEFAULT_LAP_ASCENT_M:.0f} m ascent/descent per lap."
     )
     lap_distance_km = st.sidebar.number_input(
         "Lap distance (km)",
