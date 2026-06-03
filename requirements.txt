@@ -5,5 +5,6 @@ numpy>=1.24
 scipy>=1.10
 plotly>=5.18
 openpyxl>=3.1
+requests>=2.31
 gspread>=6.0
 google-auth>=2.0

@@ -11,6 +11,7 @@ from typing import Any, Mapping
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+import requests
 import streamlit as st
 
 try:
@@ -60,6 +61,11 @@ from simulation_engine import (
 st.set_page_config(page_title="Endure24 Relay Monte Carlo", layout="wide")
 
 ASSUMPTION_VERSION = "zero-fatigue-midnight-night-defaults-v2"
+TEAM_NAME = "Broken Runners Running Club"
+EVENT_LOCATION_NAME = "Wasing Park, Wasing Lane, Berkshire, RG7 4LY"
+EVENT_LATITUDE = 51.38132
+EVENT_LONGITUDE = -1.16803
+WEATHER_CACHE_SECONDS = 30 * 60
 DEFAULT_EDITABLE_GOOGLE_SHEET_URL = (
     "https://docs.google.com/spreadsheets/d/1dKvzME6TL4EJ8u_f0-l2p7ZENBwj7TUZLt0cW0T7QHo/edit?usp=sharing"
 )
@@ -683,6 +689,215 @@ def projected_distance_summary(live_summary: dict | None, course: CourseSettings
         "projected_ascent_m": expected_laps * float(course.lap_ascent_m),
         "projected_descent_m": expected_laps * float(course.lap_descent_m),
     }
+
+
+def default_race_start_date() -> pd.Timestamp:
+    today = pd.Timestamp.now(tz=RACE_TIMEZONE).date()
+    days_until_saturday = (5 - today.weekday()) % 7
+    return pd.Timestamp(today + pd.Timedelta(days=days_until_saturday))
+
+
+def race_start_timestamp(start_date: Any) -> pd.Timestamp:
+    date_value = pd.Timestamp(start_date).date()
+    return pd.Timestamp(f"{date_value.isoformat()} 12:00", tz=RACE_TIMEZONE)
+
+
+def weather_code_label(code: Any) -> str:
+    labels = {
+        0: "Clear",
+        1: "Mainly clear",
+        2: "Partly cloudy",
+        3: "Overcast",
+        45: "Fog",
+        48: "Rime fog",
+        51: "Light drizzle",
+        53: "Drizzle",
+        55: "Heavy drizzle",
+        56: "Freezing drizzle",
+        57: "Freezing drizzle",
+        61: "Light rain",
+        63: "Rain",
+        65: "Heavy rain",
+        66: "Freezing rain",
+        67: "Freezing rain",
+        71: "Light snow",
+        73: "Snow",
+        75: "Heavy snow",
+        77: "Snow grains",
+        80: "Rain showers",
+        81: "Rain showers",
+        82: "Heavy showers",
+        85: "Snow showers",
+        86: "Heavy snow showers",
+        95: "Thunderstorm",
+        96: "Thunderstorm hail",
+        99: "Thunderstorm hail",
+    }
+    numeric = pd.to_numeric(pd.Series([code]), errors="coerce").iloc[0]
+    if pd.isna(numeric):
+        return "-"
+    return labels.get(int(numeric), f"Code {int(numeric)}")
+
+
+@st.cache_data(ttl=WEATHER_CACHE_SECONDS, show_spinner=False)
+def fetch_open_meteo_forecast(latitude: float, longitude: float, timezone: str) -> tuple[pd.DataFrame, str]:
+    params = {
+        "latitude": float(latitude),
+        "longitude": float(longitude),
+        "hourly": ",".join(
+            [
+                "temperature_2m",
+                "apparent_temperature",
+                "relative_humidity_2m",
+                "precipitation_probability",
+                "precipitation",
+                "weather_code",
+                "wind_speed_10m",
+                "wind_gusts_10m",
+            ]
+        ),
+        "forecast_days": 7,
+        "timezone": timezone,
+        "temperature_unit": "celsius",
+        "wind_speed_unit": "kmh",
+        "precipitation_unit": "mm",
+    }
+    response = requests.get("https://api.open-meteo.com/v1/forecast", params=params, timeout=12)
+    response.raise_for_status()
+    payload = response.json()
+
+    hourly = payload.get("hourly", {})
+    forecast = pd.DataFrame(hourly)
+    if forecast.empty or "time" not in forecast:
+        return pd.DataFrame(), now_bst_label()
+    forecast["time"] = pd.to_datetime(forecast["time"]).dt.tz_localize(RACE_TIMEZONE, nonexistent="shift_forward", ambiguous="NaT")
+    numeric_columns = [
+        "temperature_2m",
+        "apparent_temperature",
+        "relative_humidity_2m",
+        "precipitation_probability",
+        "precipitation",
+        "weather_code",
+        "wind_speed_10m",
+        "wind_gusts_10m",
+    ]
+    for column in numeric_columns:
+        if column in forecast:
+            forecast[column] = pd.to_numeric(forecast[column], errors="coerce")
+    forecast["condition"] = forecast.get("weather_code", pd.Series(dtype=float)).map(weather_code_label)
+    return forecast, now_bst_label()
+
+
+def weather_row_for_time(weather: pd.DataFrame, timestamp: pd.Timestamp) -> dict[str, Any] | None:
+    if weather.empty or "time" not in weather:
+        return None
+    target = pd.Timestamp(timestamp)
+    if target.tzinfo is None:
+        target = target.tz_localize(RACE_TIMEZONE)
+    differences = (weather["time"] - target).abs()
+    if differences.empty:
+        return None
+    nearest_index = differences.idxmin()
+    return weather.loc[nearest_index].to_dict()
+
+
+def weather_lap_adjustment_pct(weather_row: dict[str, Any] | None) -> float:
+    if not weather_row:
+        return 0.0
+    apparent = pd.to_numeric(pd.Series([weather_row.get("apparent_temperature")]), errors="coerce").iloc[0]
+    rain_probability = pd.to_numeric(pd.Series([weather_row.get("precipitation_probability")]), errors="coerce").iloc[0]
+    precipitation = pd.to_numeric(pd.Series([weather_row.get("precipitation")]), errors="coerce").iloc[0]
+    wind = pd.to_numeric(pd.Series([weather_row.get("wind_speed_10m")]), errors="coerce").iloc[0]
+    gusts = pd.to_numeric(pd.Series([weather_row.get("wind_gusts_10m")]), errors="coerce").iloc[0]
+
+    penalty = 0.0
+    if pd.notna(apparent) and apparent > 18:
+        penalty += min(6.0, (float(apparent) - 18.0) * 0.6)
+    if pd.notna(apparent) and apparent < 5:
+        penalty += min(4.0, (5.0 - float(apparent)) * 0.4)
+    if pd.notna(rain_probability) and rain_probability > 50:
+        penalty += min(4.0, (float(rain_probability) - 50.0) * 0.06)
+    if pd.notna(precipitation) and precipitation > 0.2:
+        penalty += min(6.0, float(precipitation) * 1.5)
+    if pd.notna(wind) and wind > 20:
+        penalty += min(4.0, (float(wind) - 20.0) * 0.25)
+    if pd.notna(gusts) and gusts > 35:
+        penalty += min(3.0, (float(gusts) - 35.0) * 0.15)
+    return round(max(0.0, penalty), 2)
+
+
+def runner_mean_minutes_lookup(roster: pd.DataFrame) -> dict[str, float]:
+    clean = roster.copy()
+    clean["runner"] = clean["runner"].astype(str).str.strip()
+    clean["projected_mean_minutes"] = pd.to_numeric(clean["projected_mean_minutes"], errors="coerce")
+    return clean.dropna(subset=["projected_mean_minutes"]).drop_duplicates("runner").set_index("runner")[
+        "projected_mean_minutes"
+    ].to_dict()
+
+
+def build_weather_lap_forecast(
+    log: pd.DataFrame,
+    roster: pd.DataFrame,
+    run_plan: pd.DataFrame,
+    weather: pd.DataFrame,
+    course: CourseSettings,
+    race_start: pd.Timestamp,
+    forecast_laps: int,
+) -> pd.DataFrame:
+    sequence = run_plan_sequence(run_plan)
+    if not sequence:
+        return pd.DataFrame()
+
+    clean_log = normalise_race_log(log, roster)
+    state = race_state_from_log(clean_log, roster, target_laps=max(1, forecast_laps), caps_enabled=False)
+    mean_lookup = runner_mean_minutes_lookup(roster)
+    last_lap_number = int(clean_log["lap_number"].max()) if not clean_log.empty else 0
+    elapsed = float(state.elapsed_minute)
+    sequence_index = 0
+    latest_completed = latest_completed_lap(clean_log, roster)
+    if latest_completed is not None and str(latest_completed.get("runner", "")).strip() in sequence:
+        sequence_index = (sequence.index(str(latest_completed["runner"]).strip()) + 1) % len(sequence)
+
+    rows = []
+    if state.current_lap_in_progress and state.in_progress_runner in sequence:
+        sequence_index = sequence.index(str(state.in_progress_runner))
+        elapsed = float(state.in_progress_start_minute or elapsed)
+
+    for offset in range(int(forecast_laps)):
+        runner = sequence[sequence_index % len(sequence)]
+        lap_number = last_lap_number + offset + 1
+        start_minute = elapsed
+        start_time = race_start + pd.Timedelta(minutes=float(start_minute))
+        weather_row = weather_row_for_time(weather, start_time)
+        base_minutes = float(mean_lookup.get(runner, pd.Series(mean_lookup).mean() if mean_lookup else 40.0))
+        penalty_pct = weather_lap_adjustment_pct(weather_row)
+        adjusted_minutes = base_minutes * (1.0 + penalty_pct / 100.0)
+        finish_minute = start_minute + adjusted_minutes
+        finish_time = race_start + pd.Timedelta(minutes=float(finish_minute))
+        rows.append(
+            {
+                "lap_number": lap_number,
+                "runner": runner,
+                "start_time": start_time,
+                "finish_time": finish_time,
+                "base_minutes": round(base_minutes, 1),
+                "weather_adjusted_minutes": round(adjusted_minutes, 1),
+                "weather_penalty_pct": penalty_pct,
+                "pace": format_pace_min_per_km(lap_pace_min_per_km(adjusted_minutes, course)),
+                "speed": format_speed_kph(lap_speed_kph(adjusted_minutes, course)),
+                "temperature_c": None if not weather_row else weather_row.get("temperature_2m"),
+                "feels_like_c": None if not weather_row else weather_row.get("apparent_temperature"),
+                "rain_probability_pct": None if not weather_row else weather_row.get("precipitation_probability"),
+                "precipitation_mm": None if not weather_row else weather_row.get("precipitation"),
+                "wind_kph": None if not weather_row else weather_row.get("wind_speed_10m"),
+                "gust_kph": None if not weather_row else weather_row.get("wind_gusts_10m"),
+                "condition": "-" if not weather_row else weather_row.get("condition", "-"),
+            }
+        )
+        elapsed = finish_minute
+        sequence_index += 1
+
+    return pd.DataFrame(rows)
 
 
 def final_lap_probability_figure(distribution: pd.DataFrame, title: str) -> go.Figure:
@@ -2618,7 +2833,7 @@ def build_team_brief(
 
     return "\n".join(
         [
-            f"Endure24 update: {state.current_laps}/{settings.target_laps} official laps - {status}",
+            f"{TEAM_NAME} update: {state.current_laps}/{settings.target_laps} official laps - {status}",
             runner_line,
             f"Recommended next: {recommended_next}",
             last_line,
@@ -4244,6 +4459,219 @@ def save_predictions_live(
     return clean
 
 
+RUN_PLAN_SHEET_COLUMNS = ["slot", "runner", "active", "notes"]
+
+
+def _open_run_plan_sheet(secrets: Mapping[str, Any], sheet_id: str | None, worksheet_name: str):
+    try:
+        import gspread
+        from google.oauth2.service_account import Credentials
+    except Exception as exc:  # pragma: no cover - depends on cloud packages.
+        raise RuntimeError("Install gspread and google-auth to use Google Sheets sync.") from exc
+
+    service_account = _drinks_service_account_info(secrets)
+    resolved_sheet_id = sheet_id or _drinks_secret_value(secrets, "google_sheet_id", "race_log_google_sheet_id")
+    if not service_account or not resolved_sheet_id:
+        raise RuntimeError("Google Sheets sync needs google_sheet_id and gcp_service_account in Streamlit secrets.")
+
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+    credentials = Credentials.from_service_account_info(service_account, scopes=scopes)
+    client = gspread.authorize(credentials)
+    spreadsheet = client.open_by_key(str(resolved_sheet_id))
+    try:
+        return spreadsheet.worksheet(worksheet_name)
+    except Exception:
+        return spreadsheet.add_worksheet(title=worksheet_name, rows=200, cols=len(RUN_PLAN_SHEET_COLUMNS))
+
+
+def read_run_plan_from_google_sheet(
+    secrets: Mapping[str, Any],
+    sheet_id: str | None = None,
+    worksheet_name: str = "run_plan",
+) -> pd.DataFrame:
+    sheet = _open_run_plan_sheet(secrets, sheet_id, worksheet_name)
+    return pd.DataFrame(sheet.get_all_records())
+
+
+def write_run_plan_to_google_sheet(
+    run_plan: pd.DataFrame,
+    secrets: Mapping[str, Any],
+    sheet_id: str | None = None,
+    worksheet_name: str = "run_plan",
+) -> None:
+    sheet = _open_run_plan_sheet(secrets, sheet_id, worksheet_name)
+    clean = run_plan.copy()
+    for column in RUN_PLAN_SHEET_COLUMNS:
+        if column not in clean:
+            clean[column] = ""
+    clean = clean[RUN_PLAN_SHEET_COLUMNS]
+    values = [RUN_PLAN_SHEET_COLUMNS] + clean.fillna("").astype(str).values.tolist()
+    sheet.clear()
+    sheet.update(values)
+
+
+def roster_order_plan(roster: pd.DataFrame) -> pd.DataFrame:
+    runners = roster.sort_values("running_order")["runner"].astype(str).str.strip()
+    runners = runners[runners.ne("")].drop_duplicates().tolist()
+    return pd.DataFrame(
+        {
+            "slot": list(range(1, len(runners) + 1)),
+            "runner": runners,
+            "active": [True for _ in runners],
+            "notes": ["" for _ in runners],
+        },
+        columns=RUN_PLAN_SHEET_COLUMNS,
+    )
+
+
+def _plan_active_value(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"", "true", "t", "yes", "y", "1", "active"}:
+        return True
+    if text in {"false", "f", "no", "n", "0", "inactive"}:
+        return False
+    return bool(value)
+
+
+def normalise_run_plan_table(raw: pd.DataFrame, roster: pd.DataFrame) -> pd.DataFrame:
+    runners = roster.sort_values("running_order")["runner"].astype(str).str.strip()
+    runners = runners[runners.ne("")].drop_duplicates().tolist()
+    if not runners:
+        return pd.DataFrame(columns=RUN_PLAN_SHEET_COLUMNS)
+
+    current = raw.copy() if raw is not None and not raw.empty else roster_order_plan(roster)
+    column_aliases = {
+        "position": "slot",
+        "order": "slot",
+        "running_order": "slot",
+        "name": "runner",
+        "enabled": "active",
+        "use": "active",
+    }
+    current.columns = [
+        column_aliases.get(str(column).strip().lower().replace(" ", "_").replace("-", "_"), str(column).strip().lower())
+        for column in current.columns
+    ]
+    for column in RUN_PLAN_SHEET_COLUMNS:
+        if column not in current:
+            current[column] = ""
+    current["runner"] = current["runner"].fillna("").astype(str).str.strip()
+    current["slot"] = pd.to_numeric(current["slot"], errors="coerce")
+    current["active"] = current["active"].map(_plan_active_value)
+    current["notes"] = current["notes"].fillna("").astype(str)
+    current = current[current["runner"].isin(runners)].copy().reset_index(drop=True)
+    if current.empty:
+        current = roster_order_plan(roster)
+    current["slot"] = pd.to_numeric(current["slot"], errors="coerce")
+    missing_slot = current["slot"].isna()
+    current.loc[missing_slot, "slot"] = range(1, int(missing_slot.sum()) + 1)
+    current["slot"] = current["slot"].round().astype(int).clip(lower=1)
+    current = current.sort_values(["slot", "runner"], kind="stable").reset_index(drop=True)
+    current["slot"] = range(1, len(current) + 1)
+    return current[RUN_PLAN_SHEET_COLUMNS].reset_index(drop=True)
+
+
+def run_plan_digest(table: pd.DataFrame) -> str:
+    clean = table.copy() if isinstance(table, pd.DataFrame) else pd.DataFrame(columns=RUN_PLAN_SHEET_COLUMNS)
+    for column in RUN_PLAN_SHEET_COLUMNS:
+        if column not in clean:
+            clean[column] = ""
+    clean["active"] = clean["active"].map(_plan_active_value)
+    return stable_table_digest(clean[RUN_PLAN_SHEET_COLUMNS], RUN_PLAN_SHEET_COLUMNS)
+
+
+def run_plan_state_table(roster: pd.DataFrame) -> pd.DataFrame:
+    if "run_plan_tracker" not in st.session_state:
+        st.session_state["run_plan_tracker"] = roster_order_plan(roster)
+    current = normalise_run_plan_table(st.session_state["run_plan_tracker"], roster)
+    st.session_state["run_plan_tracker"] = current.copy()
+    return current
+
+
+def set_run_plan_state(table: pd.DataFrame, roster: pd.DataFrame) -> pd.DataFrame:
+    clean = normalise_run_plan_table(table, roster)
+    st.session_state["run_plan_tracker"] = clean.copy()
+    return clean
+
+
+def run_plan_sequence(table: pd.DataFrame) -> list[str]:
+    if table is None or table.empty:
+        return []
+    clean = table.copy()
+    if "active" not in clean:
+        clean["active"] = True
+    clean["active"] = clean["active"].map(_plan_active_value)
+    clean["slot"] = pd.to_numeric(clean.get("slot", pd.Series(range(1, len(clean) + 1))), errors="coerce")
+    clean = clean[clean["active"] & clean["runner"].astype(str).str.strip().ne("")].sort_values("slot")
+    return clean["runner"].astype(str).str.strip().tolist()
+
+
+def run_plan_sheet_context() -> dict[str, Any]:
+    default_sheet_id = get_streamlit_secret("google_sheet_id", "race_log_google_sheet_id") or ""
+    default_sheet_id = st.session_state.get("race_day_sheet_id", default_sheet_id)
+    st.session_state.setdefault("run_plan_sheet_id", str(default_sheet_id))
+    st.session_state.setdefault("run_plan_worksheet_name", "run_plan")
+
+    sheet_id = str(st.session_state.get("run_plan_sheet_id") or default_sheet_id).strip()
+    worksheet_name = str(st.session_state.get("run_plan_worksheet_name") or "run_plan").strip() or "run_plan"
+    return {
+        "sheet_id": sheet_id,
+        "worksheet_name": worksheet_name,
+        "configured": google_sheets_configured(st.secrets, sheet_id or None),
+    }
+
+
+def save_run_plan_live(
+    table: pd.DataFrame,
+    sync: Mapping[str, Any],
+    roster: pd.DataFrame,
+    notice: str | None = None,
+    force: bool = False,
+) -> pd.DataFrame:
+    clean = set_run_plan_state(table, roster)
+    digest = run_plan_digest(clean)
+    if not sync.get("configured"):
+        st.session_state["run_plan_save_status"] = "local"
+        st.session_state["run_plan_sheet_notice"] = "Saved locally. Google Sheets is not configured."
+        return clean
+
+    allowed = conflict_safe_write_allowed(
+        prefix="run_plan",
+        label="Run plan",
+        pending=clean,
+        pending_digest=digest,
+        read_remote=lambda: read_run_plan_from_google_sheet(
+            st.secrets,
+            sheet_id=sync.get("sheet_id") or None,
+            worksheet_name=str(sync.get("worksheet_name") or "run_plan"),
+        ),
+        remote_digest=lambda remote: run_plan_digest(normalise_run_plan_table(remote, roster)),
+        configured=bool(sync.get("configured")),
+        force=force,
+        live_reload_key="run_plan_live_sheet_enabled",
+        safe_baseline_digest=run_plan_digest(roster_order_plan(roster)),
+    )
+    if not allowed:
+        st.session_state["run_plan_sheet_notice"] = (
+            "Run plan changes kept locally. Resolve the Sheet conflict before normal saves continue."
+        )
+        return clean
+
+    write_run_plan_to_google_sheet(
+        clean,
+        st.secrets,
+        sheet_id=sync.get("sheet_id") or None,
+        worksheet_name=str(sync.get("worksheet_name") or "run_plan"),
+    )
+    saved_at = now_bst_label()
+    st.session_state["run_plan_sheet_last_saved"] = saved_at
+    mark_sheet_saved("run_plan", digest, saved_at)
+    st.session_state["run_plan_sheet_notice"] = notice or f"Run plan saved to Google Sheet at {saved_at}."
+    return clean
+
+
 def _open_drinks_sheet(secrets: Mapping[str, Any], sheet_id: str | None, worksheet_name: str):
     try:
         import gspread
@@ -5699,10 +6127,367 @@ def show_predictions_tab(roster: pd.DataFrame, log: pd.DataFrame) -> None:
         st.plotly_chart(scatter, width="stretch")
 
 
+def show_run_plan_sheet_controls(plan: pd.DataFrame, roster: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any]]:
+    sync = run_plan_sheet_context()
+    sheet_id = str(sync["sheet_id"])
+    worksheet_name = str(sync["worksheet_name"])
+    configured = bool(sync["configured"])
+
+    with st.container(border=True):
+        top_cols = st.columns([1.5, 1, 1])
+        with top_cols[0]:
+            st.markdown("#### Run Plan Sheet")
+            if configured:
+                st.caption("This is the likely running order used by the Weather tab. Auto reload is off by default.")
+            else:
+                st.caption("Google sync is not configured. Local editing and CSV download still work.")
+
+        live_reload = top_cols[1].checkbox(
+            "Auto reload",
+            value=live_reload_enabled_default("run_plan_live_sheet_enabled", configured),
+            help="Polls the run_plan worksheet while this tab is open. App saves still write immediately.",
+            key="run_plan_live_reload_checkbox",
+        )
+        refresh_seconds = top_cols[2].number_input(
+            "Reload every seconds",
+            min_value=10,
+            max_value=300,
+            value=live_refresh_seconds_default("run_plan_live_refresh_seconds"),
+            step=5,
+            key="run_plan_refresh_seconds_input",
+        )
+        st.session_state["run_plan_live_sheet_enabled"] = live_reload
+        st.session_state["run_plan_live_refresh_seconds"] = int(refresh_seconds)
+        show_sheet_cooldown("run_plan", "Run Plan Sheet")
+
+        if live_reload and sheet_cooldown_remaining_seconds("run_plan") <= 0 and st_autorefresh is not None:
+            st_autorefresh(interval=int(refresh_seconds) * 1000, key="run_plan_live_sheet_autorefresh")
+        elif live_reload and st_autorefresh is None:
+            st.warning("Live reload needs the streamlit-autorefresh package. Manual loading still works.")
+
+        action_cols = st.columns([1, 1, 1.2])
+        load_now = action_cols[0].button("Load plan", width="stretch", disabled=not configured)
+        save_now = action_cols[1].button("Save plan", width="stretch", disabled=not configured)
+        if configured:
+            action_cols[2].success(f"Worksheet: {worksheet_name}")
+        else:
+            action_cols[2].warning("Save disabled until secrets are set.")
+
+        conflict_load, conflict_force = show_sheet_conflict_actions(
+            "run_plan",
+            "Run Plan Sheet",
+            "endure24_pending_run_plan.csv",
+        )
+        load_now = load_now or conflict_load
+        if conflict_force:
+            pending = st.session_state.get("run_plan_pending_df")
+            try:
+                plan = save_run_plan_live(
+                    pending if isinstance(pending, pd.DataFrame) else plan,
+                    sync,
+                    roster,
+                    "Run plan force-saved to Google Sheet.",
+                    force=True,
+                )
+                if sheet_save_status("run_plan") == "saved":
+                    st.success("Run plan force-saved to Google Sheet.")
+                    st.rerun()
+            except Exception as exc:
+                st.error(f"Could not force-save run plan worksheet: {exc}")
+
+        if should_load_sheet_now("run_plan", load_now, live_reload, int(refresh_seconds)) and configured:
+            try:
+                loaded = read_run_plan_from_google_sheet(
+                    st.secrets,
+                    sheet_id=sheet_id or None,
+                    worksheet_name=worksheet_name,
+                )
+                before = run_plan_digest(plan)
+                plan = set_run_plan_state(loaded, roster)
+                loaded_at = now_bst_label()
+                st.session_state["run_plan_sheet_last_loaded"] = loaded_at
+                mark_sheet_loaded("run_plan", run_plan_digest(plan), loaded_at)
+                if run_plan_digest(plan) != before:
+                    st.success(f"Run plan loaded at {loaded_at}.")
+                else:
+                    st.caption(f"Run plan checked at {loaded_at}; no changes found.")
+            except Exception as exc:
+                handle_sheet_load_error("run_plan", "the run plan worksheet", exc, "run_plan_live_sheet_enabled")
+
+        if st.session_state.get("run_plan_sheet_last_loaded"):
+            st.caption(f"Last plan load: {st.session_state['run_plan_sheet_last_loaded']}.")
+        if st.session_state.get("run_plan_sheet_last_saved"):
+            st.caption(f"Last plan save: {st.session_state['run_plan_sheet_last_saved']}.")
+        if st.session_state.get("run_plan_sheet_notice"):
+            st.success(st.session_state.pop("run_plan_sheet_notice"))
+
+        if save_now and configured:
+            try:
+                plan = save_run_plan_live(plan, sync, roster, "Run plan saved to Google Sheet.")
+                if sheet_save_status("run_plan") == "saved":
+                    st.success("Run plan saved to Google Sheet.")
+                elif sheet_save_status("run_plan") in {"conflict", "quota"}:
+                    st.warning("Run plan changes kept locally. Resolve the Sheet warning above before normal saves continue.")
+            except Exception as exc:
+                st.error(f"Could not save run plan worksheet: {exc}")
+
+        with st.expander("Run Plan Sheet settings", expanded=False):
+            settings_cols = st.columns([2, 1])
+            settings_cols[0].text_input("Sheet ID", key="run_plan_sheet_id", placeholder="Google Sheet ID")
+            settings_cols[1].text_input("Worksheet", key="run_plan_worksheet_name")
+
+    return run_plan_state_table(roster), sync
+
+
+def show_run_plan_tab(roster: pd.DataFrame) -> None:
+    st.subheader("Run Plan")
+    st.caption("The likely order the team expects to follow. This is editable during the race and saved to the run_plan worksheet.")
+    plan = run_plan_state_table(roster)
+    plan, sync = show_run_plan_sheet_controls(plan, roster)
+    runners = roster.sort_values("running_order")["runner"].astype(str).str.strip().drop_duplicates().tolist()
+    if not runners:
+        st.info("Add runners in Setup before editing the run plan.")
+        return
+
+    sequence = run_plan_sequence(plan)
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Active runners", str(len(sequence)))
+    c2.metric("First runner", sequence[0] if sequence else "-")
+    c3.metric("Worksheet", str(sync.get("worksheet_name") or "run_plan"))
+
+    st.markdown("#### Likely Running Order")
+    edited = st.data_editor(
+        plan[RUN_PLAN_SHEET_COLUMNS],
+        hide_index=True,
+        width="stretch",
+        num_rows="dynamic",
+        column_config={
+            "slot": st.column_config.NumberColumn("Slot", min_value=1, max_value=100, step=1, format="%d"),
+            "runner": st.column_config.SelectboxColumn("Runner", options=runners),
+            "active": st.column_config.CheckboxColumn("Active"),
+            "notes": st.column_config.TextColumn("Notes"),
+        },
+        key=f"run_plan_editor_{run_plan_digest(plan)[:12]}",
+    )
+    edited_clean = normalise_run_plan_table(edited, roster)
+    if run_plan_digest(edited_clean) != run_plan_digest(plan):
+        try:
+            save_run_plan_live(edited_clean, sync, roster, "Run plan edit saved to Google Sheet.")
+        except Exception as exc:
+            set_run_plan_state(edited_clean, roster)
+            st.session_state["run_plan_sheet_notice"] = f"Updated locally, but could not save to Sheet: {exc}"
+        st.rerun()
+
+    action_cols = st.columns(3)
+    if action_cols[0].button("Reset to roster order", width="stretch"):
+        reset = roster_order_plan(roster)
+        try:
+            save_run_plan_live(reset, sync, roster, "Run plan reset to roster order.")
+        except Exception as exc:
+            set_run_plan_state(reset, roster)
+            st.session_state["run_plan_sheet_notice"] = f"Reset locally, but could not save to Sheet: {exc}"
+        st.rerun()
+    if action_cols[1].button("Force save to Sheet", width="stretch", disabled=not sync.get("configured")):
+        try:
+            saved = save_run_plan_live(edited_clean, sync, roster, "Run plan forced saved to Google Sheet.", force=True)
+            st.success(f"Saved {len(saved)} run-plan row(s).")
+        except Exception as exc:
+            st.error(f"Could not force-save run plan: {exc}")
+    action_cols[2].download_button(
+        "Download run plan CSV",
+        run_plan_state_table(roster).to_csv(index=False),
+        file_name="endure24_run_plan.csv",
+        mime="text/csv",
+        width="stretch",
+    )
+
+    if sequence:
+        st.info("Likely cycle: " + " -> ".join(sequence))
+
+
+def weather_forecast_plot(laps: pd.DataFrame) -> go.Figure:
+    fig = go.Figure()
+    if laps.empty:
+        return fig
+    fig.add_trace(
+        go.Bar(
+            x=laps["start_time"],
+            y=laps["weather_adjusted_minutes"],
+            name="Weather-adjusted lap",
+            marker_color="#2f6f8f",
+            customdata=laps[["runner", "lap_number", "pace", "condition"]],
+            hovertemplate=(
+                "%{customdata[0]} lap %{customdata[1]:.0f}<br>"
+                "%{y:.1f} min<br>%{customdata[2]}<br>%{customdata[3]}<extra></extra>"
+            ),
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=laps["start_time"],
+            y=laps["base_minutes"],
+            mode="lines+markers",
+            name="Base runner mean",
+            line={"color": "#7a5c00", "dash": "dash", "width": 2},
+            hovertemplate="%{y:.1f} min base<extra></extra>",
+        )
+    )
+    fig.update_layout(
+        title="Predicted runner and lap time by weather window",
+        height=420,
+        xaxis_title="Predicted lap start",
+        yaxis_title="Minutes",
+        legend={"orientation": "h", "y": -0.18},
+    )
+    return fig
+
+
+def weather_conditions_plot(laps: pd.DataFrame) -> go.Figure:
+    fig = go.Figure()
+    if laps.empty:
+        return fig
+    fig.add_trace(
+        go.Scatter(
+            x=laps["start_time"],
+            y=laps["feels_like_c"],
+            mode="lines+markers",
+            name="Feels like C",
+            line={"color": "#c47a00", "width": 2},
+            yaxis="y",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=laps["start_time"],
+            y=laps["rain_probability_pct"],
+            mode="lines+markers",
+            name="Rain chance %",
+            line={"color": "#2f6f8f", "width": 2},
+            yaxis="y2",
+        )
+    )
+    fig.update_layout(
+        title="Weather risk across predicted laps",
+        height=320,
+        xaxis_title="Predicted lap start",
+        yaxis={"title": "Feels like C"},
+        yaxis2={"title": "Rain chance %", "overlaying": "y", "side": "right", "range": [0, 100]},
+        legend={"orientation": "h", "y": -0.2},
+    )
+    return fig
+
+
+def show_weather_tab(roster: pd.DataFrame, course: CourseSettings) -> None:
+    st.subheader("Weather")
+    st.caption(
+        f"Live weather for {EVENT_LOCATION_NAME}. Forecast data is cached for {WEATHER_CACHE_SECONDS // 60} minutes."
+    )
+    current_log = normalise_race_log(st.session_state.get("race_log", empty_race_log()), roster)
+    plan = run_plan_state_table(roster)
+    sequence = run_plan_sequence(plan)
+
+    control_cols = st.columns([1, 1, 1])
+    race_date = control_cols[0].date_input(
+        "Race start date",
+        value=st.session_state.get("weather_race_start_date", default_race_start_date().date()),
+        key="weather_race_start_date",
+    )
+    forecast_laps = control_cols[1].number_input("Forecast laps", min_value=1, max_value=80, value=24, step=1)
+    control_cols[2].metric("Location", "Wasing Park", f"{EVENT_LATITUDE:.4f}, {EVENT_LONGITUDE:.4f}")
+    race_start = race_start_timestamp(race_date)
+
+    try:
+        weather, fetched_at = fetch_open_meteo_forecast(EVENT_LATITUDE, EVENT_LONGITUDE, RACE_TIMEZONE)
+    except Exception as exc:
+        st.error(f"Could not load Open-Meteo weather forecast: {exc}")
+        weather = pd.DataFrame()
+        fetched_at = "-"
+
+    st.caption(f"Weather source: Open-Meteo. Last API fetch/cache refresh: {fetched_at}.")
+    if not sequence:
+        st.warning("Set at least one active runner in the Run Plan tab to forecast weather-adjusted laps.")
+        return
+    if weather.empty:
+        st.info("Weather forecast is unavailable right now.")
+        return
+
+    laps = build_weather_lap_forecast(
+        current_log,
+        roster,
+        plan,
+        weather,
+        course,
+        race_start,
+        int(forecast_laps),
+    )
+    if laps.empty:
+        st.info("No lap forecast could be built yet.")
+        return
+
+    summary_cols = st.columns(4)
+    summary_cols[0].metric("Planned order", " -> ".join(sequence[:3]) + ("..." if len(sequence) > 3 else ""))
+    summary_cols[1].metric("Next forecast runner", str(laps.iloc[0]["runner"]))
+    summary_cols[2].metric("Next adjusted lap", f"{float(laps.iloc[0]['weather_adjusted_minutes']):.1f} min", str(laps.iloc[0]["pace"]))
+    summary_cols[3].metric("Next weather", str(laps.iloc[0]["condition"]), f"{float(laps.iloc[0]['feels_like_c']):.0f} C feels")
+
+    st.plotly_chart(weather_forecast_plot(laps), width="stretch")
+    st.plotly_chart(weather_conditions_plot(laps), width="stretch")
+
+    display = laps.copy()
+    display["start"] = display["start_time"].dt.strftime("%a %H:%M")
+    display["finish"] = display["finish_time"].dt.strftime("%a %H:%M")
+    display["temperature_c"] = pd.to_numeric(display["temperature_c"], errors="coerce").round(1)
+    display["feels_like_c"] = pd.to_numeric(display["feels_like_c"], errors="coerce").round(1)
+    display["rain_probability_pct"] = pd.to_numeric(display["rain_probability_pct"], errors="coerce").round(0)
+    display["precipitation_mm"] = pd.to_numeric(display["precipitation_mm"], errors="coerce").round(1)
+    display["wind_kph"] = pd.to_numeric(display["wind_kph"], errors="coerce").round(1)
+    st.dataframe(
+        display[
+            [
+                "lap_number",
+                "runner",
+                "start",
+                "finish",
+                "base_minutes",
+                "weather_adjusted_minutes",
+                "weather_penalty_pct",
+                "pace",
+                "condition",
+                "feels_like_c",
+                "rain_probability_pct",
+                "precipitation_mm",
+                "wind_kph",
+            ]
+        ],
+        width="stretch",
+        hide_index=True,
+        column_config={
+            "lap_number": st.column_config.NumberColumn("Lap", format="%d"),
+            "runner": "Runner",
+            "start": "Start",
+            "finish": "Finish",
+            "base_minutes": st.column_config.NumberColumn("Base min", format="%.1f"),
+            "weather_adjusted_minutes": st.column_config.NumberColumn("Weather min", format="%.1f"),
+            "weather_penalty_pct": st.column_config.NumberColumn("Weather +%", format="%.1f"),
+            "pace": "Pace",
+            "condition": "Weather",
+            "feels_like_c": st.column_config.NumberColumn("Feels C", format="%.1f"),
+            "rain_probability_pct": st.column_config.NumberColumn("Rain %", format="%.0f"),
+            "precipitation_mm": st.column_config.NumberColumn("Rain mm", format="%.1f"),
+            "wind_kph": st.column_config.NumberColumn("Wind km/h", format="%.1f"),
+        },
+    )
+
+    with st.expander("Hourly weather data", expanded=False):
+        hourly = weather.copy()
+        hourly["time_label"] = hourly["time"].dt.strftime("%a %H:%M")
+        st.dataframe(hourly.tail(24), width="stretch", hide_index=True)
+
+
 def main() -> None:
     inject_app_styles()
-    st.title("Endure24 Race Control")
-    st.caption("Race-day monitoring, live Sheet logging, forecast, optimiser, and team tracking.")
+    st.title(f"{TEAM_NAME} Race Control")
+    st.caption(f"Endure24 race-day monitoring for {EVENT_LOCATION_NAME}. Live Sheet logging, forecast, optimiser, weather, and team tracking.")
 
     with st.expander("Admin setup", expanded=False):
         st.caption("Race rule model: starts through Sunday 12:00 BST count if the lap finishes by Sunday 13:00 BST.")
@@ -5721,8 +6506,34 @@ def main() -> None:
     st.sidebar.subheader("Race Rules")
     caps_enabled = st.sidebar.checkbox("Apply max-lap caps", value=True)
 
-    race_day_tab, race_extras_tab, forecast_tab, optimiser_tab, drinks_tab, sleep_tab, predictions_tab, what_if_tab, exports_tab, setup_tab = st.tabs(
-        ["Race Day", "Race Extras", "Forecast", "Optimiser", "Drinks", "Sleep", "Predictions", "What-if", "Exports", "Setup"]
+    (
+        race_day_tab,
+        run_plan_tab,
+        weather_tab,
+        race_extras_tab,
+        forecast_tab,
+        optimiser_tab,
+        drinks_tab,
+        sleep_tab,
+        predictions_tab,
+        what_if_tab,
+        exports_tab,
+        setup_tab,
+    ) = st.tabs(
+        [
+            "Race Day",
+            "Run Plan",
+            "Weather",
+            "Race Extras",
+            "Forecast",
+            "Optimiser",
+            "Drinks",
+            "Sleep",
+            "Predictions",
+            "What-if",
+            "Exports",
+            "Setup",
+        ]
     )
 
     with setup_tab:
@@ -5815,6 +6626,12 @@ def main() -> None:
 
     with race_day_tab:
         show_race_day(roster, settings, course, caps_enabled=caps_enabled)
+
+    with run_plan_tab:
+        show_run_plan_tab(roster)
+
+    with weather_tab:
+        show_weather_tab(roster, course)
 
     with race_extras_tab:
         show_race_extras(roster, settings, course, caps_enabled=caps_enabled)
