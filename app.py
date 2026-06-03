@@ -3284,6 +3284,10 @@ def show_race_day(
     st.session_state["race_log"] = log
     race_sync = race_day_sheet_context()
 
+    st.markdown("### Live Sheet Controls")
+    st.caption("Load or save the race log here first. Race Control, Plan Assistant, forecasts, and latest laps use this state.")
+    log = show_google_sheet_controls(log, roster, caps_enabled, race_sync)
+
     warnings, errors = validate_race_log(log, roster, caps_enabled=caps_enabled)
     state = race_state_from_log(log, roster, settings.target_laps, caps_enabled=caps_enabled)
     forecast_state = st.session_state.get("race_day_forecast", {})
@@ -3344,9 +3348,6 @@ def show_race_day(
             )
         with st.expander("Backup and undo", expanded=False):
             log = show_race_log_backup(log, roster, caps_enabled, race_sync)
-
-    with st.expander("Live Sheet controls", expanded=False):
-        log = show_google_sheet_controls(log, roster, caps_enabled, race_sync)
 
     with st.expander("Forecast controls and probability plot", expanded=bool(baseline_bundle and live_bundle)):
         forecast_col, auto_col = st.columns([1.2, 1])
