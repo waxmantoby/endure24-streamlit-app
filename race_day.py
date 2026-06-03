@@ -309,7 +309,7 @@ def validate_race_log(log: pd.DataFrame, roster: pd.DataFrame, caps_enabled: boo
         clean["start_minute"].lt(0)
     ]
     if not impossible.empty:
-        errors.append(f"Start time is before Saturday 12:00 on lap(s) {_format_laps(impossible['lap_number'])}.")
+        errors.append(f"Start time is before Saturday 12:00 BST on lap(s) {_format_laps(impossible['lap_number'])}.")
 
     impossible_completed = completed[
         completed["finish_minute"].lt(0)
@@ -324,10 +324,10 @@ def validate_race_log(log: pd.DataFrame, roster: pd.DataFrame, caps_enabled: boo
 
     if clean["finish_minute"].gt(FINAL_CUTOFF_MINUTE).any():
         late_finish = clean[clean["finish_minute"].gt(FINAL_CUTOFF_MINUTE)]
-        warnings.append(f"Lap(s) {_format_laps(late_finish['lap_number'])} finish after Sunday 13:00 and will not count.")
+        warnings.append(f"Lap(s) {_format_laps(late_finish['lap_number'])} finish after Sunday 13:00 BST and will not count.")
     if clean["start_minute"].gt(LAST_START_MINUTE).any():
         late_start = clean[clean["start_minute"].gt(LAST_START_MINUTE)]
-        warnings.append(f"Lap(s) {_format_laps(late_start['lap_number'])} start after Sunday 12:00 and will not count.")
+        warnings.append(f"Lap(s) {_format_laps(late_start['lap_number'])} start after Sunday 12:00 BST and will not count.")
 
     ordered = clean.sort_values("lap_number")
     completed_ordered = ordered.dropna(subset=["start_minute", "finish_minute"])
@@ -810,7 +810,7 @@ def _format_sheet_race_clock(minute: float | int | None) -> str:
     day = "Saturday" if total_minutes < 12 * 60 else "Sunday"
     hour = clock_minutes // 60
     minute_part = clock_minutes % 60
-    return f"{day} {hour:02d}:{minute_part:02d}"
+    return f"{day} {hour:02d}:{minute_part:02d} BST"
 
 
 def _format_sheet_number(value: float | int | None) -> str:

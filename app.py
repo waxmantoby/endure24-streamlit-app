@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 import hashlib
 import html
+import importlib
 import json
 from pathlib import Path
 from typing import Any, Mapping
@@ -19,6 +20,9 @@ except Exception:  # pragma: no cover - optional dependency for live Sheet refre
 
 from data_loader import DEFAULT_DATA_PATH, load_endure_workbook, validate_roster
 from optimizer import optimize_running_orders
+import race_day as race_day_module
+
+race_day_module = importlib.reload(race_day_module)
 from race_day import (
     GOOGLE_SHEET_TEMPLATE_COLUMNS,
     append_manual_lap,
@@ -58,6 +62,8 @@ ASSUMPTION_VERSION = "zero-fatigue-midnight-night-defaults-v2"
 DEFAULT_EDITABLE_GOOGLE_SHEET_URL = (
     "https://docs.google.com/spreadsheets/d/1dKvzME6TL4EJ8u_f0-l2p7ZENBwj7TUZLt0cW0T7QHo/edit?usp=sharing"
 )
+RACE_TIMEZONE = "Europe/London"
+RACE_TIMEZONE_LABEL = "BST"
 
 
 def inject_app_styles() -> None:
@@ -185,6 +191,10 @@ def format_probability(value: float | int | None) -> str:
     return f"{float(value):.1%}"
 
 
+def now_bst_label() -> str:
+    return pd.Timestamp.now(tz=RACE_TIMEZONE).strftime("%H:%M:%S %Z")
+
+
 def format_race_clock(minute: float | int | None) -> str:
     if minute is None or pd.isna(minute):
         return "-"
@@ -193,7 +203,7 @@ def format_race_clock(minute: float | int | None) -> str:
     day = "Saturday" if total_minutes < 12 * 60 else "Sunday"
     hour = clock_minutes // 60
     minute_part = clock_minutes % 60
-    return f"{day} {hour:02d}:{minute_part:02d}"
+    return f"{day} {hour:02d}:{minute_part:02d} {RACE_TIMEZONE_LABEL}"
 
 
 def race_clock_options(step_minutes: int = 15) -> list[int]:
@@ -577,9 +587,9 @@ def show_result_metrics(summary: dict, comparison: pd.DataFrame | None = None) -
 
     row2 = st.columns(5)
     row2[0].metric("Hit reference target + 1", format_probability(summary["probability_target_plus_one_laps"]))
-    row2[1].metric("Laps by Sunday 12:00", format_minutes(summary["expected_laps_by_noon"]))
+    row2[1].metric("Laps by Sunday 12:00 BST", format_minutes(summary["expected_laps_by_noon"]))
     row2[2].metric("Final lap after noon", format_probability(summary["probability_squeezed_final_lap_after_noon"]))
-    row2[3].metric("Miss Sunday 13:00 cutoff", format_probability(summary["probability_missed_final_cutoff"]))
+    row2[3].metric("Miss Sunday 13:00 BST cutoff", format_probability(summary["probability_missed_final_cutoff"]))
     row2[4].metric("Run out of runners", format_probability(summary["probability_ran_out_of_eligible_runners"]))
 
     st.caption(f"Average final finish: {format_race_clock(summary['average_final_finish_minute'])}")
@@ -726,7 +736,7 @@ def show_charts(sim_output: dict, summary_bundle: dict, uncapped_summary: dict |
             summary_bundle["final_hour_runner_probs"],
             x="runner",
             y="probability",
-            title="Likely running between Sunday 10:30 and 12:00",
+            title="Likely running between Sunday 10:30 and 12:00 BST",
         )
         final_hour_fig.update_layout(yaxis_tickformat=".0%")
         st.plotly_chart(final_hour_fig, width="stretch")
@@ -861,10 +871,10 @@ def show_race_day_metrics(state, live_bundle: dict | None, target_laps: int) -> 
     else:
         parts = [f"Need {state.remaining_to_target} more official laps to reach {target_laps}."]
         if state.average_needed_to_target is not None:
-            parts.append(f"Average {state.average_needed_to_target:.1f} min/lap or faster by Sunday 13:00.")
+            parts.append(f"Average {state.average_needed_to_target:.1f} min/lap or faster by Sunday 13:00 BST.")
         if state.average_needed_to_start_target_lap is not None:
             parts.append(
-                f"Average {state.average_needed_to_start_target_lap:.1f} min/lap or faster before Sunday 12:00 "
+                f"Average {state.average_needed_to_start_target_lap:.1f} min/lap or faster before Sunday 12:00 BST "
                 "to start the target lap on time."
             )
         st.info(" ".join(parts))
@@ -909,7 +919,11 @@ def show_race_control_dashboard(
 
     pace_needed = state.average_needed_to_start_target_lap or state.average_needed_to_target
     pace_value = f"{pace_needed:.1f}m" if pace_needed is not None else "Hit"
-    pace_help = "Avg needed to start target lap by Sunday 12:00" if state.average_needed_to_start_target_lap else "Avg needed by Sunday 13:00"
+    pace_help = (
+        "Avg needed to start target lap by Sunday 12:00 BST"
+        if state.average_needed_to_start_target_lap
+        else "Avg needed by Sunday 13:00 BST"
+    )
     if state.remaining_to_target <= 0:
         pace_help = "Target already logged"
 
@@ -1363,8 +1377,8 @@ def prioritize_alerts(messages: list[str]) -> list[str]:
         "Start times",
         "in progress",
         "Order exception",
-        "Sunday 13:00",
-        "Sunday 12:00",
+        "Sunday 13:00 BST",
+        "Sunday 12:00 BST",
         "Pace check",
         "Cap warning",
         "Timing gap",
@@ -1415,7 +1429,7 @@ def save_race_log_live(
             sheet_id=sync.get("sheet_id") or None,
             worksheet_name=str(sync.get("worksheet_name") or "race_log"),
         )
-        saved_at = pd.Timestamp.now().strftime("%H:%M:%S")
+        saved_at = now_bst_label()
         st.session_state["race_day_sheet_last_saved"] = saved_at
         st.session_state["race_day_notice"] = notice or f"Race log saved to Google Sheet at {saved_at}."
     else:
@@ -1492,7 +1506,7 @@ def show_google_sheet_controls(
                     show_race_day_alerts(warnings, errors)
                 else:
                     log = set_race_log(loaded, roster)
-                    loaded_at = pd.Timestamp.now().strftime("%H:%M:%S")
+                    loaded_at = now_bst_label()
                     st.session_state["editable_google_sheet_last_loaded"] = loaded_at
                     if st.session_state.get("race_log_changed"):
                         st.session_state["race_day_notice"] = f"Race log loaded at {loaded_at}."
@@ -1696,7 +1710,7 @@ def show_race_log_entry(
         pasted = st.text_area(
             "Paste rows",
             height=120,
-            placeholder="runner,start_time,finish_time,lap_duration_minutes,notes\nToby,Sat 12:00,Sat 12:41,41,clean lap",
+            placeholder="runner,start_time,finish_time,lap_duration_minutes,notes\nToby,Sat 12:00 BST,Sat 12:41 BST,41,clean lap",
         )
         paste_col_1, paste_col_2 = st.columns(2)
         if paste_col_1.button("Append pasted rows", width="stretch"):
@@ -2605,7 +2619,7 @@ def save_drinks_live(table: pd.DataFrame, sync: Mapping[str, Any], notice: str |
         sheet_id=sync.get("sheet_id") or None,
         worksheet_name=str(sync.get("worksheet_name") or "drinks"),
     )
-    saved_at = pd.Timestamp.now().strftime("%H:%M:%S")
+    saved_at = now_bst_label()
     st.session_state["drinks_sheet_last_saved"] = saved_at
     st.session_state["drinks_sheet_notice"] = notice or f"Drinks saved to Google Sheet at {saved_at}."
     return clean
@@ -2667,7 +2681,7 @@ def show_drinks_sheet_controls(table: pd.DataFrame, roster: pd.DataFrame) -> tup
                 )
                 before = drinks_digest(table)
                 table = set_drinks_state(loaded)
-                loaded_at = pd.Timestamp.now().strftime("%H:%M:%S")
+                loaded_at = now_bst_label()
                 st.session_state["drinks_sheet_last_loaded"] = loaded_at
                 if drinks_digest(table) != before:
                     st.success(f"Drinks loaded at {loaded_at}.")
@@ -2859,13 +2873,441 @@ def show_drinks_tab(roster: pd.DataFrame) -> None:
     st.plotly_chart(scatter, width="stretch")
 
 
+SLEEP_SHEET_COLUMNS = ["runner", "hours", "unit", "notes"]
+
+
+def _open_sleep_sheet(secrets: Mapping[str, Any], sheet_id: str | None, worksheet_name: str):
+    try:
+        import gspread
+        from google.oauth2.service_account import Credentials
+    except Exception as exc:  # pragma: no cover - depends on cloud packages.
+        raise RuntimeError("Install gspread and google-auth to use Google Sheets sync.") from exc
+
+    service_account = _drinks_service_account_info(secrets)
+    resolved_sheet_id = sheet_id or _drinks_secret_value(secrets, "google_sheet_id", "race_log_google_sheet_id")
+    if not service_account or not resolved_sheet_id:
+        raise RuntimeError("Google Sheets sync needs google_sheet_id and gcp_service_account in Streamlit secrets.")
+
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+    credentials = Credentials.from_service_account_info(service_account, scopes=scopes)
+    client = gspread.authorize(credentials)
+    spreadsheet = client.open_by_key(str(resolved_sheet_id))
+    try:
+        return spreadsheet.worksheet(worksheet_name)
+    except Exception:
+        return spreadsheet.add_worksheet(title=worksheet_name, rows=200, cols=len(SLEEP_SHEET_COLUMNS))
+
+
+def read_sleep_from_google_sheet(
+    secrets: Mapping[str, Any],
+    sheet_id: str | None = None,
+    worksheet_name: str = "sleep",
+) -> pd.DataFrame:
+    sheet = _open_sleep_sheet(secrets, sheet_id, worksheet_name)
+    return pd.DataFrame(sheet.get_all_records())
+
+
+def write_sleep_to_google_sheet(
+    sleep: pd.DataFrame,
+    secrets: Mapping[str, Any],
+    sheet_id: str | None = None,
+    worksheet_name: str = "sleep",
+) -> None:
+    sheet = _open_sleep_sheet(secrets, sheet_id, worksheet_name)
+    clean = sleep.copy()
+    for column in SLEEP_SHEET_COLUMNS:
+        if column not in clean:
+            clean[column] = ""
+    clean = clean[SLEEP_SHEET_COLUMNS]
+    values = [SLEEP_SHEET_COLUMNS] + clean.fillna("").astype(str).values.tolist()
+    sheet.clear()
+    sheet.update(values)
+
+
+def normalise_sleep_table(raw: pd.DataFrame, roster: pd.DataFrame) -> pd.DataFrame:
+    runners = roster.sort_values("running_order")["runner"].astype(str).str.strip()
+    runners = runners[runners.ne("")].drop_duplicates().tolist()
+    current = raw.copy() if raw is not None and not raw.empty else pd.DataFrame(columns=["runner", "hours", "notes"])
+    column_aliases = {
+        "sleep": "hours",
+        "sleep_hours": "hours",
+        "hours_sleep": "hours",
+        "hours_slept": "hours",
+        "hrs": "hours",
+        "count": "hours",
+    }
+    current.columns = [
+        column_aliases.get(str(column).strip().lower().replace(" ", "_").replace("-", "_"), str(column).strip().lower())
+        for column in current.columns
+    ]
+    if "runner" not in current:
+        current["runner"] = ""
+    if "hours" not in current:
+        current["hours"] = 0.0
+    if "notes" not in current:
+        current["notes"] = ""
+    current["runner"] = current["runner"].astype(str).str.strip()
+    current["hours"] = pd.to_numeric(current["hours"], errors="coerce").fillna(0).clip(lower=0, upper=48).round(2)
+    current["notes"] = current["notes"].fillna("").astype(str)
+    current = current[current["runner"].ne("")].drop_duplicates("runner", keep="last")
+
+    existing = set(current["runner"].astype(str))
+    missing = [runner for runner in runners if runner not in existing]
+    if missing:
+        current = pd.concat(
+            [
+                current,
+                pd.DataFrame({"runner": missing, "hours": [0.0 for _ in missing], "notes": ["" for _ in missing]}),
+            ],
+            ignore_index=True,
+        )
+
+    current = current[current["runner"].isin(runners)].copy()
+    order_lookup = {runner: index for index, runner in enumerate(runners)}
+    current["_order"] = current["runner"].map(order_lookup)
+    current = current.sort_values(["_order", "runner"]).drop(columns="_order").reset_index(drop=True)
+    current["unit"] = "hours"
+    return current
+
+
+def sleep_state_table(roster: pd.DataFrame) -> pd.DataFrame:
+    if "sleep_tracker" not in st.session_state:
+        st.session_state["sleep_tracker"] = pd.DataFrame(columns=["runner", "hours", "notes"])
+    current = normalise_sleep_table(st.session_state["sleep_tracker"], roster)
+    st.session_state["sleep_tracker"] = current[["runner", "hours", "notes"]].copy()
+    return current
+
+
+def set_sleep_state(table: pd.DataFrame) -> pd.DataFrame:
+    roster = st.session_state.get("current_roster_for_sleep")
+    if not isinstance(roster, pd.DataFrame) or roster.empty:
+        roster = pd.DataFrame(
+            {
+                "runner": table["runner"].astype(str).str.strip().tolist() if "runner" in table else [],
+                "running_order": list(range(1, len(table) + 1)),
+            }
+        )
+    clean = normalise_sleep_table(table, roster)
+    st.session_state["sleep_tracker"] = clean[["runner", "hours", "notes"]].copy()
+    return clean
+
+
+def sleep_sheet_payload(table: pd.DataFrame) -> pd.DataFrame:
+    clean = table.copy()
+    clean["unit"] = "hours"
+    return clean[["runner", "hours", "unit", "notes"]]
+
+
+def sleep_digest(table: pd.DataFrame) -> str:
+    clean = table.copy()
+    clean["hours"] = pd.to_numeric(clean["hours"], errors="coerce").fillna(0).round(2)
+    return hashlib.sha256(clean[["runner", "hours", "notes"]].to_csv(index=False).encode("utf-8")).hexdigest()
+
+
+def sleep_sheet_context() -> dict[str, Any]:
+    default_sheet_id = get_streamlit_secret("google_sheet_id", "race_log_google_sheet_id") or ""
+    default_sheet_id = st.session_state.get("race_day_sheet_id", default_sheet_id)
+    st.session_state.setdefault("sleep_sheet_id", str(default_sheet_id))
+    st.session_state.setdefault("sleep_worksheet_name", "sleep")
+
+    sheet_id = str(st.session_state.get("sleep_sheet_id") or default_sheet_id).strip()
+    worksheet_name = str(st.session_state.get("sleep_worksheet_name") or "sleep").strip() or "sleep"
+    return {
+        "sheet_id": sheet_id,
+        "worksheet_name": worksheet_name,
+        "configured": google_sheets_configured(st.secrets, sheet_id or None),
+    }
+
+
+def save_sleep_live(table: pd.DataFrame, sync: Mapping[str, Any], notice: str | None = None) -> pd.DataFrame:
+    clean = set_sleep_state(table)
+    if not sync.get("configured"):
+        st.session_state["sleep_sheet_notice"] = "Saved locally. Google Sheets is not configured."
+        return clean
+
+    write_sleep_to_google_sheet(
+        sleep_sheet_payload(clean),
+        st.secrets,
+        sheet_id=sync.get("sheet_id") or None,
+        worksheet_name=str(sync.get("worksheet_name") or "sleep"),
+    )
+    saved_at = now_bst_label()
+    st.session_state["sleep_sheet_last_saved"] = saved_at
+    st.session_state["sleep_sheet_notice"] = notice or f"Sleep saved to Google Sheet at {saved_at}."
+    return clean
+
+
+def show_sleep_sheet_controls(table: pd.DataFrame, roster: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any]]:
+    sync = sleep_sheet_context()
+    sheet_id = str(sync["sheet_id"])
+    worksheet_name = str(sync["worksheet_name"])
+    configured = bool(sync["configured"])
+
+    with st.container(border=True):
+        top_cols = st.columns([1.5, 1, 1])
+        with top_cols[0]:
+            st.markdown("#### Sleep Sheet")
+            if configured:
+                st.caption("Live sync is on. Website changes save to the sleep worksheet; Sheet changes reload here.")
+            else:
+                st.caption("Google sync is not configured. Local tracking and CSV download still work.")
+
+        live_reload = top_cols[1].checkbox(
+            "Auto reload",
+            value=st.session_state.get("sleep_live_sheet_enabled", configured),
+            help="Reloads the sleep worksheet while this tab is open.",
+            key="sleep_live_reload_checkbox",
+        )
+        refresh_seconds = top_cols[2].number_input(
+            "Every seconds",
+            min_value=10,
+            max_value=300,
+            value=int(st.session_state.get("sleep_live_refresh_seconds", 15)),
+            step=5,
+            key="sleep_refresh_seconds_input",
+        )
+        st.session_state["sleep_live_sheet_enabled"] = live_reload
+        st.session_state["sleep_live_refresh_seconds"] = int(refresh_seconds)
+
+        if live_reload and st_autorefresh is not None:
+            st_autorefresh(
+                interval=int(refresh_seconds) * 1000,
+                key="sleep_live_sheet_autorefresh",
+            )
+        elif live_reload and st_autorefresh is None:
+            st.warning("Live reload needs the streamlit-autorefresh package. Manual loading still works.")
+
+        action_cols = st.columns([1, 1, 1.2])
+        load_now = action_cols[0].button("Load sleep", width="stretch", disabled=not configured, key="sleep_load_button")
+        save_now = action_cols[1].button("Save sleep", width="stretch", disabled=not configured, key="sleep_save_button")
+        if configured:
+            action_cols[2].success(f"Worksheet: {worksheet_name}")
+        else:
+            action_cols[2].warning("Save disabled until secrets are set.")
+
+        if (load_now or live_reload) and configured:
+            try:
+                loaded = read_sleep_from_google_sheet(
+                    st.secrets,
+                    sheet_id=sheet_id or None,
+                    worksheet_name=worksheet_name,
+                )
+                before = sleep_digest(table)
+                table = set_sleep_state(loaded)
+                loaded_at = now_bst_label()
+                st.session_state["sleep_sheet_last_loaded"] = loaded_at
+                if sleep_digest(table) != before:
+                    st.success(f"Sleep loaded at {loaded_at}.")
+                else:
+                    st.caption(f"Sleep checked at {loaded_at}; no changes found.")
+            except Exception as exc:
+                st.error(f"Could not load sleep worksheet: {exc}")
+
+        if st.session_state.get("sleep_sheet_last_loaded"):
+            st.caption(f"Last sleep load: {st.session_state['sleep_sheet_last_loaded']}.")
+        if st.session_state.get("sleep_sheet_last_saved"):
+            st.caption(f"Last sleep save: {st.session_state['sleep_sheet_last_saved']}.")
+        if st.session_state.get("sleep_sheet_notice"):
+            st.success(st.session_state.pop("sleep_sheet_notice"))
+
+        if save_now and configured:
+            try:
+                table = save_sleep_live(table, sync, "Sleep saved to Google Sheet.")
+                st.success("Sleep saved to Google Sheet.")
+            except Exception as exc:
+                st.error(f"Could not save sleep worksheet: {exc}")
+
+        with st.expander("Sleep Sheet settings", expanded=False):
+            settings_cols = st.columns([2, 1])
+            settings_cols[0].text_input("Sheet ID", key="sleep_sheet_id", placeholder="Google Sheet ID")
+            settings_cols[1].text_input("Worksheet", key="sleep_worksheet_name")
+
+    return sleep_state_table(roster), sync
+
+
+def show_sleep_tab(roster: pd.DataFrame) -> None:
+    st.subheader("Sleep")
+    st.caption("Track rough hours slept per runner. This does not affect race forecasts, runner order, or pacing assumptions.")
+    st.session_state["current_roster_for_sleep"] = roster.copy()
+
+    table = sleep_state_table(roster)
+    table, sleep_sync = show_sleep_sheet_controls(table, roster)
+    if table.empty:
+        st.info("Add runners in Setup before tracking sleep.")
+        return
+
+    total_sleep = float(table["hours"].sum())
+    average_sleep = float(table["hours"].mean()) if not table.empty else 0.0
+    most_rested = table.sort_values(["hours", "runner"], ascending=[False, True]).iloc[0]
+    least_rested = table.sort_values(["hours", "runner"], ascending=[True, True]).iloc[0]
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Team sleep bank", f"{total_sleep:.1f}h")
+    c2.metric("Average", f"{average_sleep:.1f}h")
+    c3.metric("Most rested", f"{most_rested['runner']} ({float(most_rested['hours']):.1f}h)")
+    c4.metric("Lowest sleep", f"{least_rested['runner']} ({float(least_rested['hours']):.1f}h)")
+
+    st.markdown("#### Quick Add")
+    quick_cols = st.columns([1.4, 1, 1])
+    runner = quick_cols[0].selectbox(
+        "Runner",
+        table["runner"].astype(str).tolist(),
+        key="sleep_quick_runner",
+    )
+    added_hours = quick_cols[1].number_input(
+        "Hours",
+        min_value=0.25,
+        max_value=12.0,
+        value=1.0,
+        step=0.25,
+        key="sleep_quick_hours",
+    )
+    if quick_cols[2].button("Add sleep", type="primary", width="stretch", key="sleep_add_button"):
+        updated = table.copy()
+        updated.loc[updated["runner"].astype(str) == str(runner), "hours"] += float(added_hours)
+        try:
+            save_sleep_live(updated, sleep_sync, f"Added {float(added_hours):.2f}h for {runner} and saved to Google Sheet.")
+        except Exception as exc:
+            set_sleep_state(updated)
+            st.session_state["sleep_sheet_notice"] = f"Updated locally, but could not save to Sheet: {exc}"
+        st.rerun()
+
+    edited = st.data_editor(
+        table[["runner", "hours", "unit", "notes"]],
+        hide_index=True,
+        width="stretch",
+        column_config={
+            "runner": st.column_config.TextColumn("Runner", disabled=True),
+            "hours": st.column_config.NumberColumn("Hours", min_value=0.0, max_value=48.0, step=0.25, format="%.2f"),
+            "unit": st.column_config.TextColumn("Unit", disabled=True),
+            "notes": st.column_config.TextColumn("Notes"),
+        },
+        key=f"sleep_tracker_editor_{sleep_digest(table)[:12]}",
+    )
+    edited_clean = normalise_sleep_table(edited, roster)
+    if sleep_digest(edited_clean) != sleep_digest(table):
+        try:
+            save_sleep_live(edited_clean, sleep_sync, "Sleep table edit saved to Google Sheet.")
+        except Exception as exc:
+            set_sleep_state(edited_clean)
+            st.session_state["sleep_sheet_notice"] = f"Updated locally, but could not save to Sheet: {exc}"
+        st.rerun()
+
+    action_cols = st.columns(3)
+    if action_cols[0].button(
+        "Force save to Sheet",
+        type="primary",
+        width="stretch",
+        disabled=not sleep_sync.get("configured"),
+        key="sleep_force_save_button",
+    ):
+        try:
+            saved = save_sleep_live(edited, sleep_sync, "Sleep forced saved to Google Sheet.")
+            st.success(f"Saved {float(saved['hours'].sum()):.1f} team sleep hours.")
+        except Exception as exc:
+            st.error(f"Could not save sleep worksheet: {exc}")
+    if action_cols[1].button("Reset sleep", width="stretch", key="sleep_reset_button"):
+        reset = table.copy()
+        reset["hours"] = 0.0
+        reset["notes"] = ""
+        try:
+            save_sleep_live(reset, sleep_sync, "Sleep reset and saved to Google Sheet.")
+        except Exception as exc:
+            set_sleep_state(reset)
+            st.session_state["sleep_sheet_notice"] = f"Reset locally, but could not save to Sheet: {exc}"
+        st.rerun()
+    action_cols[2].download_button(
+        "Download sleep CSV",
+        sleep_state_table(roster).to_csv(index=False),
+        file_name="endure24_sleep_tracker.csv",
+        mime="text/csv",
+        width="stretch",
+        key="sleep_download_csv",
+    )
+
+    st.markdown("#### Sleep Graphs")
+    chart_table = sleep_state_table(roster)
+    chart_table["hours_label"] = chart_table["hours"].map(lambda value: f"{float(value):.1f}")
+    bar = px.bar(
+        chart_table.sort_values("hours", ascending=False),
+        x="runner",
+        y="hours",
+        color="runner",
+        text="hours_label",
+        title="Sleep Bank Leaderboard",
+    )
+    bar.update_layout(showlegend=False, yaxis_title="Hours slept", xaxis_title="")
+    st.plotly_chart(bar, width="stretch")
+
+    target_cols = st.columns([1, 2])
+    sleep_target = target_cols[0].slider("Sleep target hours", min_value=0.0, max_value=10.0, value=4.0, step=0.25)
+    target_cols[1].caption("Used only for the sleep debt chart below.")
+    chart_table["sleep_debt"] = (float(sleep_target) - chart_table["hours"]).clip(lower=0)
+    chart_table["sleep_debt_label"] = chart_table["sleep_debt"].map(lambda value: f"{float(value):.1f}")
+
+    left, right = st.columns(2)
+    with left:
+        debt = px.bar(
+            chart_table.sort_values("sleep_debt", ascending=False),
+            x="runner",
+            y="sleep_debt",
+            color="runner",
+            text="sleep_debt_label",
+            title=f"Sleep Debt to {float(sleep_target):.1f}h Target",
+        )
+        debt.update_layout(showlegend=False, yaxis_title="Hours short", xaxis_title="")
+        st.plotly_chart(debt, width="stretch")
+
+    with right:
+        gauge_max = max(8.0, average_sleep + 2.0, float(chart_table["hours"].max()) + 1.0)
+        gauge = go.Figure(
+            go.Indicator(
+                mode="gauge+number",
+                value=average_sleep,
+                title={"text": "Average team sleep"},
+                number={"suffix": "h"},
+                gauge={
+                    "axis": {"range": [0, gauge_max]},
+                    "bar": {"color": "#356d8f"},
+                    "steps": [
+                        {"range": [0, min(2, gauge_max)], "color": "#ffe2e2"},
+                        {"range": [min(2, gauge_max), min(4, gauge_max)], "color": "#fff4d6"},
+                        {"range": [min(4, gauge_max), gauge_max], "color": "#e9f5ee"},
+                    ],
+                },
+            )
+        )
+        gauge.update_layout(height=320, margin={"l": 20, "r": 20, "t": 50, "b": 20})
+        st.plotly_chart(gauge, width="stretch")
+
+    matrix = chart_table.copy()
+    order_lookup = (
+        roster.assign(runner=roster["runner"].astype(str).str.strip())
+        .set_index("runner")["running_order"]
+        .to_dict()
+    )
+    matrix["running_order"] = matrix["runner"].map(order_lookup)
+    matrix["bubble_size"] = matrix["hours"].clip(lower=0.5)
+    scatter = px.scatter(
+        matrix,
+        x="running_order",
+        y="hours",
+        size="bubble_size",
+        color="runner",
+        hover_data=["notes"],
+        title="Sleep vs Running Order",
+    )
+    scatter.update_layout(xaxis_title="Running order", yaxis_title="Hours slept", showlegend=False)
+    st.plotly_chart(scatter, width="stretch")
+
+
 def main() -> None:
     inject_app_styles()
     st.title("Endure24 Race Control")
     st.caption("Race-day monitoring, live Sheet logging, forecast, optimiser, and team tracking.")
 
     with st.expander("Admin setup", expanded=False):
-        st.caption("Race rule model: starts through Sunday 12:00 count if the lap finishes by Sunday 13:00.")
+        st.caption("Race rule model: starts through Sunday 12:00 BST count if the lap finishes by Sunday 13:00 BST.")
         uploaded = st.file_uploader("Upload Endure24 workbook", type=["xlsx", "xls"])
         if uploaded is not None:
             workbook_bytes = uploaded.getvalue()
@@ -2880,8 +3322,8 @@ def main() -> None:
     st.sidebar.subheader("Race Rules")
     caps_enabled = st.sidebar.checkbox("Apply max-lap caps", value=True)
 
-    race_day_tab, forecast_tab, optimiser_tab, drinks_tab, what_if_tab, exports_tab, setup_tab = st.tabs(
-        ["Race Day", "Forecast", "Optimiser", "Drinks", "What-if", "Exports", "Setup"]
+    race_day_tab, forecast_tab, optimiser_tab, drinks_tab, sleep_tab, what_if_tab, exports_tab, setup_tab = st.tabs(
+        ["Race Day", "Forecast", "Optimiser", "Drinks", "Sleep", "What-if", "Exports", "Setup"]
     )
 
     with setup_tab:
@@ -2968,6 +3410,9 @@ def main() -> None:
 
     with drinks_tab:
         show_drinks_tab(roster)
+
+    with sleep_tab:
+        show_sleep_tab(roster)
 
     with what_if_tab:
         show_what_if_pace_override(roster, settings)
